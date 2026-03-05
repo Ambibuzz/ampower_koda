@@ -1,0 +1,167 @@
+{
+    "actions": [],
+    "autoname": "format:AGENT-{####}",
+    "creation": "2026-03-05 12:00:00.000000",
+    "doctype": "DocType",
+    "engine": "InnoDB",
+    "field_order": [
+        "request_section",
+        "request_title",
+        "request_type",
+        "user_message",
+        "status",
+        "column_break_request",
+        "details_section",
+        "branch_name",
+        "pr_url",
+        "pr_number",
+        "tokens_used",
+        "cost_estimate",
+        "logs_section",
+        "stage_log",
+        "conversation_log",
+        "agent_plan",
+        "files_changed",
+        "error_log"
+    ],
+    "fields": [
+        {
+            "fieldname": "request_section",
+            "fieldtype": "Section Break",
+            "label": "Request"
+        },
+        {
+            "fieldname": "request_title",
+            "fieldtype": "Data",
+            "in_list_view": 1,
+            "label": "Title",
+            "reqd": 1
+        },
+        {
+            "fieldname": "request_type",
+            "fieldtype": "Select",
+            "in_list_view": 1,
+            "in_standard_filter": 1,
+            "label": "Type",
+            "options": "Bug Fix\nFeature Request\nImprovement",
+            "reqd": 1
+        },
+        {
+            "fieldname": "user_message",
+            "fieldtype": "Text Editor",
+            "label": "User Message",
+            "reqd": 1
+        },
+        {
+            "default": "Queued",
+            "fieldname": "status",
+            "fieldtype": "Select",
+            "in_list_view": 1,
+            "in_standard_filter": 1,
+            "label": "Status",
+            "options": "Queued\nUnderstanding\nPlanning\nImplementing\nReviewing\nPushing\nCompleted\nFailed\nCancelled",
+            "read_only": 1
+        },
+        {
+            "fieldname": "column_break_request",
+            "fieldtype": "Column Break"
+        },
+        {
+            "fieldname": "details_section",
+            "fieldtype": "Section Break",
+            "label": "Result"
+        },
+        {
+            "fieldname": "branch_name",
+            "fieldtype": "Data",
+            "label": "Branch Name",
+            "read_only": 1
+        },
+        {
+            "fieldname": "pr_url",
+            "fieldtype": "Data",
+            "label": "PR URL",
+            "options": "URL",
+            "read_only": 1
+        },
+        {
+            "fieldname": "pr_number",
+            "fieldtype": "Int",
+            "label": "PR Number",
+            "read_only": 1
+        },
+        {
+            "fieldname": "tokens_used",
+            "fieldtype": "Int",
+            "label": "Tokens Used",
+            "read_only": 1
+        },
+        {
+            "fieldname": "cost_estimate",
+            "fieldtype": "Currency",
+            "label": "Cost Estimate",
+            "read_only": 1
+        },
+        {
+            "fieldname": "logs_section",
+            "fieldtype": "Section Break",
+            "label": "Agent Logs"
+        },
+        {
+            "fieldname": "stage_log",
+            "fieldtype": "Long Text",
+            "label": "Stage-wise Progress",
+            "read_only": 1,
+            "description": "Records what was done in each stage of the agent workflow"
+        },
+        {
+            "fieldname": "conversation_log",
+            "fieldtype": "Long Text",
+            "label": "Conversation Log",
+            "read_only": 1
+        },
+        {
+            "fieldname": "agent_plan",
+            "fieldtype": "Long Text",
+            "label": "Agent Plan",
+            "read_only": 1
+        },
+        {
+            "fieldname": "files_changed",
+            "fieldtype": "Long Text",
+            "label": "Files Changed",
+            "read_only": 1
+        },
+        {
+            "fieldname": "error_log",
+            "fieldtype": "Long Text",
+            "label": "Error Log",
+            "read_only": 1
+        }
+    ],
+    "index_web_pages_for_search": 0,
+    "links": [],
+    "modified": "2026-03-05 12:00:00.000000",
+    "modified_by": "Administrator",
+    "module": "AI Agents",
+    "name": "AI Agent Request",
+    "naming_rule": "Expression",
+    "owner": "Administrator",
+    "permissions": [
+        {
+            "create": 1,
+            "delete": 1,
+            "email": 1,
+            "print": 1,
+            "read": 1,
+            "report": 1,
+            "role": "System Manager",
+            "share": 1,
+            "write": 1
+        }
+    ],
+    "sort_field": "modified",
+    "sort_order": "DESC",
+    "states": [],
+    "track_changes": 1
+}

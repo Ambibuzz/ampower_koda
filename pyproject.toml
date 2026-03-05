@@ -1,0 +1,20 @@
+[project]
+name = "ampower_ai_agents"
+authors = [
+    { name = "Ambibuzz Technologies LLP", email = "buzz@ambibuzz.com" }
+]
+description = "AI Coding Agent for Frappe apps — reads codebase, implements changes, and raises PRs"
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["version"]
+dependencies = [
+    "langgraph>=0.2.0",
+    "langchain-openai>=0.2.0",
+    "langchain-core>=0.3.0",
+]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.bench.dev-dependencies]

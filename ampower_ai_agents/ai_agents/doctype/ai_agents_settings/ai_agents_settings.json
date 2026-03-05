@@ -1,0 +1,135 @@
+{
+    "actions": [],
+    "creation": "2026-03-05 12:00:00.000000",
+    "doctype": "DocType",
+    "engine": "InnoDB",
+    "field_order": [
+        "general_section",
+        "enable_ai_agent",
+        "target_app_name",
+        "openai_api_key",
+        "ai_model",
+        "github_section",
+        "github_repo_url",
+        "github_token",
+        "column_break_github",
+        "agent_branch_prefix",
+        "base_branch",
+        "git_section",
+        "git_user_name",
+        "git_user_email"
+    ],
+    "fields": [
+        {
+            "fieldname": "general_section",
+            "fieldtype": "Section Break",
+            "label": "General"
+        },
+        {
+            "default": "0",
+            "fieldname": "enable_ai_agent",
+            "fieldtype": "Check",
+            "label": "Enable AI Agent"
+        },
+        {
+            "depends_on": "enable_ai_agent",
+            "fieldname": "target_app_name",
+            "fieldtype": "Data",
+            "label": "Target App Name",
+            "description": "The Frappe app the agent will read/write (e.g. ampower_task_manager)",
+            "reqd": 0
+        },
+        {
+            "depends_on": "enable_ai_agent",
+            "fieldname": "openai_api_key",
+            "fieldtype": "Password",
+            "label": "OpenAI API Key"
+        },
+        {
+            "depends_on": "enable_ai_agent",
+            "fieldname": "ai_model",
+            "fieldtype": "Select",
+            "label": "AI Model",
+            "options": "gpt-4o-mini\ngpt-5-mini",
+            "default": "gpt-4o-mini"
+        },
+        {
+            "fieldname": "github_section",
+            "fieldtype": "Section Break",
+            "label": "GitHub",
+            "depends_on": "enable_ai_agent"
+        },
+        {
+            "fieldname": "github_repo_url",
+            "fieldtype": "Data",
+            "label": "GitHub Repo URL",
+            "description": "e.g. https://github.com/org/repo"
+        },
+        {
+            "fieldname": "github_token",
+            "fieldtype": "Password",
+            "label": "GitHub Token",
+            "description": "Personal Access Token with repo scope"
+        },
+        {
+            "fieldname": "column_break_github",
+            "fieldtype": "Column Break"
+        },
+        {
+            "default": "ai-agent/",
+            "fieldname": "agent_branch_prefix",
+            "fieldtype": "Data",
+            "label": "Branch Prefix",
+            "description": "Prefix for agent-created branches"
+        },
+        {
+            "default": "main",
+            "fieldname": "base_branch",
+            "fieldtype": "Data",
+            "label": "Base Branch",
+            "description": "Branch to create agent branches from"
+        },
+        {
+            "fieldname": "git_section",
+            "fieldtype": "Section Break",
+            "label": "Git Identity",
+            "depends_on": "enable_ai_agent"
+        },
+        {
+            "fieldname": "git_user_name",
+            "fieldtype": "Data",
+            "label": "Git User Name",
+            "description": "Name used for git commits (e.g. AI Agent)"
+        },
+        {
+            "fieldname": "git_user_email",
+            "fieldtype": "Data",
+            "label": "Git User Email",
+            "options": "Email",
+            "description": "Email used for git commits"
+        }
+    ],
+    "issingle": 1,
+    "links": [],
+    "modified": "2026-03-05 12:00:00.000000",
+    "modified_by": "Administrator",
+    "module": "AI Agents",
+    "name": "AI Agents Settings",
+    "owner": "Administrator",
+    "permissions": [
+        {
+            "create": 1,
+            "delete": 1,
+            "email": 1,
+            "print": 1,
+            "read": 1,
+            "role": "System Manager",
+            "share": 1,
+            "write": 1
+        }
+    ],
+    "sort_field": "modified",
+    "sort_order": "DESC",
+    "states": [],
+    "track_changes": 1
+}

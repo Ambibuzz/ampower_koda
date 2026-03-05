@@ -1,0 +1,84 @@
+{
+    "charts": [],
+    "content": "[{\"id\":\"shortcut-section\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"AI Coding Agent\",\"col\":12}},{\"id\":\"shortcut-section-2\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"AI Agent Request\",\"col\":12}},{\"id\":\"shortcut-section-3\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"AI Agents Settings\",\"col\":12}}]",
+    "creation": "2026-03-05 12:00:00.000000",
+    "custom_blocks": [],
+    "docstatus": 0,
+    "doctype": "Workspace",
+    "for_user": "",
+    "hide_custom": 0,
+    "icon": "robot",
+    "idx": 0,
+    "is_hidden": 0,
+    "label": "AI Agents",
+    "links": [
+        {
+            "hidden": 0,
+            "is_query_report": 0,
+            "label": "AI Coding Agent",
+            "link_count": 0,
+            "link_to": "ai-agent",
+            "link_type": "Page",
+            "onboard": 1,
+            "type": "Link"
+        },
+        {
+            "hidden": 0,
+            "is_query_report": 0,
+            "label": "AI Agent Request",
+            "link_count": 0,
+            "link_to": "AI Agent Request",
+            "link_type": "DocType",
+            "onboard": 0,
+            "type": "Link"
+        },
+        {
+            "hidden": 0,
+            "is_query_report": 0,
+            "label": "Settings",
+            "link_count": 0,
+            "link_to": "AI Agents Settings",
+            "link_type": "DocType",
+            "onboard": 0,
+            "type": "Link"
+        }
+    ],
+    "modified": "2026-03-05 12:00:00.000000",
+    "modified_by": "Administrator",
+    "module": "AI Agents",
+    "name": "AI Agents",
+    "number_cards": [],
+    "owner": "Administrator",
+    "parent_page": "",
+    "public": 1,
+    "restrict_to_domain": "",
+    "roles": [],
+    "sequence_id": 1,
+    "shortcuts": [
+        {
+            "color": "Blue",
+            "doc_view": "",
+            "label": "AI Coding Agent",
+            "link_to": "ai-agent",
+            "stats_filter": "",
+            "type": "Page"
+        },
+        {
+            "color": "Grey",
+            "doc_view": "List",
+            "label": "AI Agent Request",
+            "link_to": "AI Agent Request",
+            "stats_filter": "",
+            "type": "DocType"
+        },
+        {
+            "color": "Grey",
+            "doc_view": "",
+            "label": "AI Agents Settings",
+            "link_to": "AI Agents Settings",
+            "stats_filter": "",
+            "type": "DocType"
+        }
+    ],
+    "title": "AI Agents"
+}
