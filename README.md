@@ -113,22 +113,6 @@ Gemini (Google AI Studio):
 Claude (Anthropic):
 - claude-sonnet-4, claude-3-5-sonnet, claude-3-5-haiku
 
-
-## Troubleshooting
-
-bench build fails with Node version error:
-The system detects nvm-managed Node.js automatically. Make sure Node v18+ is installed via nvm. The agent prepends the correct nvm path to the subprocess environment.
-
-bench migrate fails:
-Check the bench log on the request document. Common causes are malformed JSON files or missing required fields in DocType/Report definitions.
-
-Agent produces no changes:
-The agent may have failed silently during implementation. Check the stage log and error log fields. Re-run the agent with a more capable model (e.g. claude-sonnet-4 or gpt-4o).
-
-Report or DocType not visible after agent creates it:
-Run bench migrate manually using the Run Bench Commands button, or approve bench commands when prompted. New Frappe artifacts need migrate to sync into the database.
-
-
 ## License
 
 MIT
