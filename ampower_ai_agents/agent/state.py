@@ -12,6 +12,17 @@ class AgentState(TypedDict, total=False):
     request_type: str
     request_name: str
 
+    # Per-request configuration
+    target_app_name: str
+    ai_provider: str
+    ai_model: str
+    github_repo_url: str
+    github_token: str
+    base_branch: str
+    branch_prefix: str
+    git_user_name: str
+    git_user_email: str
+
     # Understanding phase
     understanding_summary: str
     explored_paths: list
@@ -30,7 +41,11 @@ class AgentState(TypedDict, total=False):
     review_notes: str
     review_attempts: int
 
-    # Deploy phase (filled by executor after graph)
+    # Bench commands
+    bench_log: str
+    pending_bench_commands: str
+
+    # Deploy phase
     branch_name: str
     pr_url: str
     pr_number: int
@@ -39,11 +54,12 @@ class AgentState(TypedDict, total=False):
     messages: list
     intermediate_steps: list
 
-    # Model selection
-    ai_model: str
+    # Output
+    patch_diff: str
 
     # Control
     current_stage: str
     error: str
+    error_log: str
     tokens_used: int
     stage_log: list  # [{"stage": str, "status": str, "summary": str, "timestamp": str}]

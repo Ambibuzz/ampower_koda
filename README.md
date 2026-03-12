@@ -1,26 +1,133 @@
 # AmPower AI Agents
 
-AI Coding Agent for Frappe apps. Users describe a bug fix or feature request, and the agent reads the target app's codebase, creates a branch, implements the changes, and opens a pull request.
+AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improvement -- the agent reads the target app codebase, creates a plan, implements the changes, and opens a pull request on GitHub.
+
 
 ## Installation
 
-```bash
-cd frappe-bench
-bench get-app ampower_ai_agents
-bench --site [sitename] install-app ampower_ai_agents
-```
+    cd frappe-bench
+    bench get-app ampower_ai_agents
+    bench --site your-site install-app ampower_ai_agents
+    bench migrate
+    bench restart
 
-## Configuration
 
-1. Go to **AI Agents Settings**
-2. Enable the AI agent
-3. Set the **Target App Name** (the Frappe app the agent will work on)
-4. Provide your **OpenAI API Key**, **GitHub Repo URL**, and **GitHub Token**
-5. Configure git identity and branch settings
+## Requirements
 
-## Usage
+- Frappe v14 or later
+- Python 3.10+
+- One of: OpenAI API key, Google AI Studio (Gemini) API key, or Anthropic (Claude) API key
+- GitHub personal access token with repo scope
+- Node.js v18+ (managed via nvm recommended)
 
-Navigate to the **AI Coding Agent** page from the AI Agents workspace. Submit a request describing a bug fix, feature, or improvement. The agent will process it in the background and create a PR when done.
+Python dependencies (installed automatically):
+
+- langchain, langchain-openai, langchain-google-genai, langchain-anthropic
+- langgraph
+
+
+## Setup
+
+1. Open AI Agents Settings from the search bar.
+2. Check Enable AI Agent.
+3. Enter your API key for the provider you want to use (OpenAI, Gemini, or Claude).
+4. Optionally set a default provider and model.
+5. Save.
+
+
+## How It Works
+
+Each request goes through a multi-step pipeline with human approval gates:
+
+    1. Explore    -- agent reads the target app codebase
+    2. Plan       -- agent creates a detailed implementation plan
+    3. Review     -- you review and optionally edit the plan, then approve
+    4. Implement  -- agent writes the code changes
+    5. Verify     -- agent reviews its own implementation
+    6. Bench      -- you see the exact bench commands and approve them
+    7. Push       -- you review branch details and approve the push
+    8. Done       -- pull request is created on GitHub
+
+
+## Creating a Request
+
+1. Go to AI Agent Request list (search for it or find it under the AI Agents module).
+2. Click New.
+3. Fill in:
+   - Title -- short summary of what you need.
+   - Type -- Bug Fix, Feature Request, or Improvement.
+   - Description -- detailed explanation of the change.
+   - Provider and Model -- pick your AI provider and model.
+   - Target App Name -- the Frappe app directory name (e.g. ampower_task_manager).
+   - GitHub Repo URL -- full URL of the repository.
+   - GitHub Token -- personal access token.
+   - Base Branch -- the branch to base changes on (e.g. develop or main).
+4. Save the document.
+5. Click Start Agent.
+
+
+## Approval Steps
+
+Plan Approval:
+After the agent explores the codebase and creates a plan, the status changes to Awaiting Approval. Read the plan in the Agent Plan section. You can edit it directly -- it is a Markdown editor. Click Approve Plan to proceed, or Reject Plan to cancel.
+
+Bench Command Approval:
+After implementation and code review, the agent computes which bench commands are needed (migrate, build, clear-cache, restart). The status changes to Awaiting Bench Approval. Each command is shown as an editable checklist -- uncheck commands you want to skip, or edit them. Click Approve Bench Commands.
+
+Push Approval:
+After bench commands run and changes are committed to a branch, the status changes to Awaiting Push Approval. You can test the changes on your instance first. Click Approve Push to push the branch and create the pull request.
+
+
+## Buttons Available at All Times
+
+These buttons appear in the Actions dropdown whenever the agent is not actively running:
+
+- Checkout Base Branch -- switch back to the base branch and discard uncommitted changes.
+- Run Bench Commands -- manually run migrate, build, clear-cache, and restart.
+- Re-run Agent -- start over from scratch (explore, plan, implement).
+- Execute Existing Plan -- skip exploration and use the existing plan.
+
+
+## Configuration Fields
+
+Each request carries its own configuration:
+
+- Target App Name -- directory name of the Frappe app to modify.
+- GitHub Repo URL -- https://github.com/org/repo format.
+- GitHub Token -- personal access token (stored encrypted).
+- Base Branch -- branch to base changes on.
+- Branch Prefix -- prefix for agent-created branches (default: ai-agent/).
+- Git User Name / Email -- identity for commits.
+
+These fields are remembered across requests using user settings.
+
+
+## Supported AI Providers
+
+OpenAI:
+- gpt-4o-mini, gpt-4o, gpt-5-mini, o3-mini
+
+Gemini (Google AI Studio):
+- gemini-2.0-flash, gemini-2.5-pro
+
+Claude (Anthropic):
+- claude-sonnet-4, claude-3-5-sonnet, claude-3-5-haiku
+
+
+## Troubleshooting
+
+bench build fails with Node version error:
+The system detects nvm-managed Node.js automatically. Make sure Node v18+ is installed via nvm. The agent prepends the correct nvm path to the subprocess environment.
+
+bench migrate fails:
+Check the bench log on the request document. Common causes are malformed JSON files or missing required fields in DocType/Report definitions.
+
+Agent produces no changes:
+The agent may have failed silently during implementation. Check the stage log and error log fields. Re-run the agent with a more capable model (e.g. claude-sonnet-4 or gpt-4o).
+
+Report or DocType not visible after agent creates it:
+Run bench migrate manually using the Run Bench Commands button, or approve bench commands when prompted. New Frappe artifacts need migrate to sync into the database.
+
 
 ## License
 

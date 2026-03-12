@@ -6,18 +6,16 @@
     "field_order": [
         "general_section",
         "enable_ai_agent",
-        "target_app_name",
+        "defaults_section",
+        "default_ai_provider",
+        "column_break_defaults",
+        "default_ai_model",
+        "openai_section",
         "openai_api_key",
-        "ai_model",
-        "github_section",
-        "github_repo_url",
-        "github_token",
-        "column_break_github",
-        "agent_branch_prefix",
-        "base_branch",
-        "git_section",
-        "git_user_name",
-        "git_user_email"
+        "gemini_section",
+        "google_api_key",
+        "claude_section",
+        "anthropic_api_key"
     ],
     "fields": [
         {
@@ -32,86 +30,78 @@
             "label": "Enable AI Agent"
         },
         {
-            "depends_on": "enable_ai_agent",
-            "fieldname": "target_app_name",
-            "fieldtype": "Data",
-            "label": "Target App Name",
-            "description": "The Frappe app the agent will read/write (e.g. ampower_task_manager)",
+            "fieldname": "defaults_section",
+            "fieldtype": "Section Break",
+            "label": "Defaults",
+            "depends_on": "enable_ai_agent"
+        },
+        {
+            "fieldname": "default_ai_provider",
+            "fieldtype": "Select",
+            "label": "Default AI Provider",
+            "options": "OpenAI\nGemini\nClaude",
+            "default": "OpenAI",
             "reqd": 0
         },
         {
-            "depends_on": "enable_ai_agent",
-            "fieldname": "openai_api_key",
-            "fieldtype": "Password",
-            "label": "OpenAI API Key"
-        },
-        {
-            "depends_on": "enable_ai_agent",
-            "fieldname": "ai_model",
-            "fieldtype": "Select",
-            "label": "AI Model",
-            "options": "gpt-4o-mini\ngpt-5-mini",
-            "default": "gpt-4o-mini"
-        },
-        {
-            "fieldname": "github_section",
-            "fieldtype": "Section Break",
-            "label": "GitHub",
-            "depends_on": "enable_ai_agent"
-        },
-        {
-            "fieldname": "github_repo_url",
-            "fieldtype": "Data",
-            "label": "GitHub Repo URL",
-            "description": "e.g. https://github.com/org/repo"
-        },
-        {
-            "fieldname": "github_token",
-            "fieldtype": "Password",
-            "label": "GitHub Token",
-            "description": "Personal Access Token with repo scope"
-        },
-        {
-            "fieldname": "column_break_github",
+            "fieldname": "column_break_defaults",
             "fieldtype": "Column Break"
         },
         {
-            "default": "ai-agent/",
-            "fieldname": "agent_branch_prefix",
+            "fieldname": "default_ai_model",
             "fieldtype": "Data",
-            "label": "Branch Prefix",
-            "description": "Prefix for agent-created branches"
+            "label": "Default AI Model",
+            "default": "gpt-4o-mini",
+            "description": "Default model for new requests. Changes with provider selection."
         },
         {
-            "default": "main",
-            "fieldname": "base_branch",
-            "fieldtype": "Data",
-            "label": "Base Branch",
-            "description": "Branch to create agent branches from"
-        },
-        {
-            "fieldname": "git_section",
+            "fieldname": "openai_section",
             "fieldtype": "Section Break",
-            "label": "Git Identity",
-            "depends_on": "enable_ai_agent"
+            "label": "OpenAI",
+            "depends_on": "enable_ai_agent",
+            "collapsible": 1,
+            "collapsible_depends_on": "eval:doc.default_ai_provider !== 'OpenAI'"
         },
         {
-            "fieldname": "git_user_name",
-            "fieldtype": "Data",
-            "label": "Git User Name",
-            "description": "Name used for git commits (e.g. AI Agent)"
+            "fieldname": "openai_api_key",
+            "fieldtype": "Password",
+            "label": "OpenAI API Key",
+            "mandatory_depends_on": "eval:doc.default_ai_provider === 'OpenAI'"
         },
         {
-            "fieldname": "git_user_email",
-            "fieldtype": "Data",
-            "label": "Git User Email",
-            "options": "Email",
-            "description": "Email used for git commits"
+            "fieldname": "gemini_section",
+            "fieldtype": "Section Break",
+            "label": "Google Gemini",
+            "depends_on": "enable_ai_agent",
+            "collapsible": 1,
+            "collapsible_depends_on": "eval:doc.default_ai_provider !== 'Gemini'"
+        },
+        {
+            "fieldname": "google_api_key",
+            "fieldtype": "Password",
+            "label": "Google API Key",
+            "description": "API key from Google AI Studio",
+            "mandatory_depends_on": "eval:doc.default_ai_provider === 'Gemini'"
+        },
+        {
+            "fieldname": "claude_section",
+            "fieldtype": "Section Break",
+            "label": "Claude (Anthropic)",
+            "depends_on": "enable_ai_agent",
+            "collapsible": 1,
+            "collapsible_depends_on": "eval:doc.default_ai_provider !== 'Claude'"
+        },
+        {
+            "fieldname": "anthropic_api_key",
+            "fieldtype": "Password",
+            "label": "Anthropic API Key",
+            "description": "API key from Anthropic console",
+            "mandatory_depends_on": "eval:doc.default_ai_provider === 'Claude'"
         }
     ],
     "issingle": 1,
     "links": [],
-    "modified": "2026-03-05 12:00:00.000000",
+    "modified": "2026-03-11 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "AI Agents",
     "name": "AI Agents Settings",

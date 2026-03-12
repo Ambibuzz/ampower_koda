@@ -6,6 +6,6 @@ app_email = "buzz@ambibuzz.com"
 app_license = "MIT"
 required_apps = ["frappe"]
 
-page_js = {
-    "ai-agent": "ai_agents/page/ai_agent/ai_agent.js",
+doctype_js = {
+    "AI Agent Request": "ai_agents/doctype/ai_agent_request/ai_agent_request.js",
 }

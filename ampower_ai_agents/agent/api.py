@@ -1,46 +1,326 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# Whitelisted API for the AI Agent page
+# Whitelisted API for the AI Agent
+
+import os
+import subprocess
 
 import frappe
+
+from ampower_ai_agents.agent.git_ops import checkout_base
+from ampower_ai_agents.agent.graph import _get_bench_env
 
 DOCTYPE_NAME = "AI Agent Request"
 
 
-@frappe.whitelist()
-def create_agent_request(message: str, request_type: str = "Improvement", title: str = ""):
-    """Create an AI Agent Request and enqueue the agent. Returns request name."""
-    if not message or not message.strip():
-        frappe.throw("Message is required")
-    request_type = (request_type or "Improvement").strip()
-    if request_type not in ("Bug Fix", "Feature Request", "Improvement"):
-        request_type = "Improvement"
-    title = (title or "").strip() or message[:80]
-
+def _validate_provider_key(doc):
+    """Check that the AI provider key is configured."""
     settings = frappe.get_single("AI Agents Settings")
     if not settings.enable_ai_agent:
         frappe.throw("AI Coding Agent is disabled in settings")
-    if not settings.openai_api_key:
-        frappe.throw("OpenAI API key is not set in settings")
+    provider = (doc.ai_provider or settings.default_ai_provider or "OpenAI").strip()
+    key_checks = {
+        "OpenAI": ("openai_api_key", "OpenAI API key"),
+        "Gemini": ("google_api_key", "Google API key"),
+        "Claude": ("anthropic_api_key", "Anthropic API key"),
+    }
+    field, label = key_checks.get(provider, key_checks["OpenAI"])
+    if not getattr(settings, field, None):
+        frappe.throw(f"{label} is not set in AI Agents Settings")
 
-    doc = frappe.get_doc(
-        {
-            "doctype": DOCTYPE_NAME,
-            "request_title": title,
-            "request_type": request_type,
-            "user_message": message,
-            "status": "Queued",
-        }
-    )
-    doc.insert(ignore_permissions=True)
+
+@frappe.whitelist()
+def start_agent(request_name: str):
+    """Start from scratch: explore codebase → create plan → await approval."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    restartable = ("Queued", "Failed", "Cancelled", "Completed", "Awaiting Approval", "Awaiting Push Approval")
+    if doc.status not in restartable:
+        frappe.throw(f"Cannot start agent — status is '{doc.status}'. Agent is currently running.")
+
+    _validate_provider_key(doc)
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        "status": "Queued",
+        "error_log": "",
+        "stage_log": "",
+        "agent_plan": "",
+        "bench_log": "",
+        "patch_diff": "",
+        "conversation_log": "",
+    })
     frappe.db.commit()
 
     frappe.enqueue(
-        "ampower_ai_agents.agent.executor.run_agent",
+        "ampower_ai_agents.agent.executor.run_planning_phase",
         queue="default",
         timeout=1800,
-        request_name=doc.name,
+        request_name=request_name,
     )
-    return doc.name
+    return {"status": "ok", "message": "Planning phase started"}
+
+
+@frappe.whitelist()
+def execute_existing_plan(request_name: str):
+    """Skip explore+plan — go straight to execution using the existing plan as checkpoint."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    if not (doc.agent_plan or "").strip():
+        frappe.throw("No plan exists on this request. Use 'Start Agent' to create one first.")
+
+    allowed = ("Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval")
+    if doc.status not in allowed:
+        frappe.throw(f"Cannot execute — status is '{doc.status}'. Agent is currently running.")
+
+    _validate_provider_key(doc)
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        "status": "Implementing",
+        "error_log": "",
+        "bench_log": "",
+        "patch_diff": "",
+    })
+    frappe.db.commit()
+
+    frappe.enqueue(
+        "ampower_ai_agents.agent.executor.run_execution_phase",
+        queue="default",
+        timeout=1800,
+        request_name=request_name,
+    )
+    return {"status": "ok", "message": "Executing existing plan (skipping explore & plan)"}
+
+
+@frappe.whitelist()
+def approve_plan(request_name: str, edited_plan: str = None):
+    """Approve the plan and enqueue the execution phase."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    if doc.status != "Awaiting Approval":
+        frappe.throw(f"Cannot approve — status is '{doc.status}'.")
+
+    if edited_plan is not None and edited_plan.strip():
+        frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", edited_plan.strip()[:50000])
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        "status": "Implementing",
+        "patch_diff": "",
+    })
+    frappe.db.commit()
+
+    frappe.enqueue(
+        "ampower_ai_agents.agent.executor.run_execution_phase",
+        queue="default",
+        timeout=1800,
+        request_name=request_name,
+    )
+    return {"status": "ok", "message": "Execution phase started"}
+
+
+@frappe.whitelist()
+def reject_plan(request_name: str):
+    """Reject the plan and set status to Cancelled."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    if doc.status != "Awaiting Approval":
+        frappe.throw(f"Cannot reject — status is '{doc.status}'.")
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Cancelled")
+    frappe.db.commit()
+
+    frappe.publish_realtime("agent_progress", {
+        "request_name": request_name,
+        "status": "Cancelled",
+        "message": "Plan rejected by user",
+    }, user=doc.owner)
+
+    return {"status": "ok", "message": "Plan rejected"}
+
+
+@frappe.whitelist()
+def approve_bench(request_name: str, commands: str = None):
+    """Approve running bench commands, then branch+commit.
+    commands is an optional JSON array of edited/filtered commands from the UI."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    if doc.status != "Awaiting Bench Approval":
+        frappe.throw(f"Cannot approve bench — status is '{doc.status}'.")
+
+    if commands:
+        import json as _json
+        try:
+            cmd_list = _json.loads(commands)
+            if isinstance(cmd_list, list) and cmd_list:
+                frappe.db.set_value(DOCTYPE_NAME, request_name,
+                    "pending_bench_commands", _json.dumps(cmd_list))
+        except (ValueError, TypeError):
+            pass
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Building")
+    frappe.db.commit()
+
+    frappe.enqueue(
+        "ampower_ai_agents.agent.executor.run_bench_and_commit",
+        queue="default",
+        timeout=1800,
+        request_name=request_name,
+    )
+
+    cmds = []
+    try:
+        import json as _json
+        cmds = _json.loads(
+            frappe.db.get_value(DOCTYPE_NAME, request_name, "pending_bench_commands") or "[]"
+        )
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "message": f"Running {len(cmds)} bench commands...",
+    }
+
+
+@frappe.whitelist()
+def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
+    """Approve pushing the branch and/or creating a PR.
+    push_branch=1 pushes the branch to remote. create_pr=1 creates a pull request."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    if doc.status != "Awaiting Push Approval":
+        frappe.throw(f"Cannot push — status is '{doc.status}'.")
+
+    push_branch = int(push_branch or 0)
+    create_pr = int(create_pr or 0)
+    if not push_branch and not create_pr:
+        frappe.throw("Select at least one action (push branch or create PR).")
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
+    frappe.db.commit()
+
+    frappe.enqueue(
+        "ampower_ai_agents.agent.executor.run_deploy_phase",
+        queue="default",
+        timeout=600,
+        request_name=request_name,
+        do_push=bool(push_branch),
+        do_pr=bool(create_pr),
+    )
+
+    actions = []
+    if push_branch:
+        actions.append(f"pushing branch {doc.branch_name}")
+    if create_pr:
+        actions.append("creating PR")
+    msg = " and ".join(actions) + "..."
+    return {"status": "ok", "message": msg.capitalize()}
+
+
+@frappe.whitelist()
+def checkout_base_branch(request_name: str):
+    """Manually checkout the base branch for the target app."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    app_name = (doc.target_app_name or "").strip()
+    base_branch = (doc.base_branch or "main").strip()
+
+    if not app_name:
+        frappe.throw("Target App Name is not set on this request")
+
+    ok, msg = checkout_base(app_name, base_branch)
+    if not ok:
+        frappe.throw(f"Failed to checkout base branch: {msg}")
+
+    frappe.publish_realtime("agent_progress", {
+        "request_name": request_name,
+        "status": doc.status,
+        "message": f"Checked out {base_branch}: {msg}",
+    }, user=doc.owner)
+
+    return {"status": "ok", "message": msg}
+
+
+@frappe.whitelist()
+def get_default_bench_commands(request_name: str):
+    """Return the default bench commands for a request's target app."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    app_name = (doc.target_app_name or "").strip()
+    site_name = frappe.local.site
+
+    cmds = []
+    if app_name:
+        cmds = [
+            f"bench --site {site_name} migrate",
+            f"bench build --app {app_name}",
+            f"bench --site {site_name} clear-cache",
+            "supervisorctl restart all",
+        ]
+    return {"commands": cmds}
+
+
+@frappe.whitelist()
+def run_selected_bench_commands(request_name: str, commands: str = None):
+    """Run user-selected bench commands. commands is a JSON array of command strings."""
+    if not request_name:
+        frappe.throw("Request name is required")
+
+    import json as _json
+    cmds = []
+    if commands:
+        try:
+            cmds = _json.loads(commands)
+        except (ValueError, TypeError):
+            frappe.throw("Invalid commands format")
+
+    if not cmds or not isinstance(cmds, list):
+        frappe.throw("No commands provided")
+
+    bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
+    bench_root = os.path.normpath(bench_root)
+    bench_env = _get_bench_env()
+
+    output_parts = []
+    for cmd in cmds:
+        if not isinstance(cmd, str) or not cmd.strip():
+            continue
+        try:
+            result = subprocess.run(
+                cmd.strip().split(),
+                cwd=bench_root,
+                capture_output=True,
+                text=True,
+                timeout=900,
+                env=bench_env,
+            )
+            out = (result.stdout or "") + (result.stderr or "")
+            status_str = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
+            output_parts.append(f"$ {cmd}\n{status_str}\n{out.strip()}\n")
+        except subprocess.TimeoutExpired:
+            output_parts.append(f"$ {cmd}\nTIMEOUT after 900s\n")
+        except Exception as e:
+            output_parts.append(f"$ {cmd}\nERROR: {e}\n")
+
+    bench_log = "\n".join(output_parts)
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "bench_log", bench_log[:50000])
+    frappe.db.commit()
+
+    return {"status": "ok", "log": bench_log}
 
 
 @frappe.whitelist()
@@ -49,31 +329,18 @@ def get_agent_status(request_name: str):
     if not request_name:
         return None
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    if not doc:
-        return None
     return {
         "name": doc.name,
         "status": doc.status,
         "branch_name": doc.branch_name,
         "pr_url": doc.pr_url,
         "pr_number": doc.pr_number,
-        "conversation_log": doc.conversation_log,
         "agent_plan": doc.agent_plan,
         "error_log": doc.error_log,
+        "stage_log": doc.stage_log,
+        "bench_log": doc.bench_log,
+        "patch_diff": doc.patch_diff,
     }
-
-
-@frappe.whitelist()
-def get_agent_history(limit: int = 20):
-    """Return recent agent requests for the current user."""
-    limit = min(int(limit or 20), 50)
-    return frappe.get_all(
-        DOCTYPE_NAME,
-        filters={"owner": frappe.session.user},
-        fields=["name", "request_title", "request_type", "status", "creation", "pr_url", "branch_name"],
-        order_by="creation desc",
-        limit_page_length=limit,
-    )
 
 
 @frappe.whitelist()
