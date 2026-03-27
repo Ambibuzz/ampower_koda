@@ -4,6 +4,7 @@
     "doctype": "DocType",
     "engine": "InnoDB",
     "field_order": [
+        "settings_tab",
         "general_section",
         "enable_ai_agent",
         "defaults_section",
@@ -15,9 +16,17 @@
         "gemini_section",
         "google_api_key",
         "claude_section",
-        "anthropic_api_key"
+        "anthropic_api_key",
+        "prompts_tab",
+        "prompts_section",
+        "prompts"
     ],
     "fields": [
+        {
+            "fieldname": "settings_tab",
+            "fieldtype": "Tab Break",
+            "label": "AI Provider Settings"
+        },
         {
             "fieldname": "general_section",
             "fieldtype": "Section Break",
@@ -97,11 +106,28 @@
             "label": "Anthropic API Key",
             "description": "API key from Anthropic console",
             "mandatory_depends_on": "eval:doc.default_ai_provider === 'Claude'"
+        },
+        {
+            "fieldname": "prompts_tab",
+            "fieldtype": "Tab Break",
+            "label": "Global Prompt Configuration"
+        },
+        {
+            "fieldname": "prompts_section",
+            "fieldtype": "Section Break",
+            "label": "Global Prompt Overrides",
+            "collapsible": 1
+        },
+        {
+            "fieldname": "prompts",
+            "fieldtype": "Table",
+            "label": "Prompts",
+            "options": "AI Agent Prompt Configuration"
         }
     ],
     "issingle": 1,
     "links": [],
-    "modified": "2026-03-11 12:00:00.000000",
+    "modified": "2026-03-27 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "AI Agents",
     "name": "AI Agents Settings",
