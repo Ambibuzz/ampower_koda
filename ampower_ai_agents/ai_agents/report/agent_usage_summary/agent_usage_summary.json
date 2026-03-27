@@ -1,0 +1,17 @@
+{
+    "doctype": "Report",
+    "name": "Agent Usage Summary",
+    "report_name": "Agent Usage Summary",
+    "module": "AI Agents",
+    "ref_doctype": "AI Agent Request",
+    "report_type": "Script Report",
+    "is_standard": "Yes",
+    "disabled": 0,
+    "docstatus": 0,
+    "idx": 0,
+    "owner": "Administrator",
+    "modified_by": "Administrator",
+    "creation": "2023-10-01T00:00:00.000Z",
+    "modified": "2023-10-01T00:00:00.000Z",
+    "roles": [{"role": "System Manager"}]
+}

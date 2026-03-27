@@ -23,11 +23,12 @@ class AIAgentRequest(Document):
             pass
 
     def validate(self):
-        if not self.target_app_name or not self.target_app_name.strip():
-            frappe.throw("Target App Name is required")
-        if not self.github_repo_url or not self.github_repo_url.strip():
-            frappe.throw("GitHub Repo URL is required")
-
+        if not self.ai_provider:
+            frappe.throw(_("AI Provider is required"))
+        if not self.tokens_used:
+            self.tokens_used = 0  # Default value for tokens used
+        if not self.cost_per_request:
+            self.cost_per_request = 0.0  # Default value for cost per request
         # Password fields need get_password() for value check on existing docs;
         # on new docs the value is in self.github_token directly
         token = self.github_token
