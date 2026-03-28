@@ -110,12 +110,12 @@
         {
             "fieldname": "prompts_tab",
             "fieldtype": "Tab Break",
-            "label": "Global Prompt Configuration"
+            "label": "Prompt Configuration"
         },
         {
             "fieldname": "prompts_section",
             "fieldtype": "Section Break",
-            "label": "Global Prompt Overrides",
+            "label": "Prompt Configuration",
             "collapsible": 1
         },
         {
