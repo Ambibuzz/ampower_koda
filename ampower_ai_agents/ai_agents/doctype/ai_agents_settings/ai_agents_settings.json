@@ -16,10 +16,7 @@
         "gemini_section",
         "google_api_key",
         "claude_section",
-        "anthropic_api_key",
-        "prompts_tab",
-        "prompts_section",
-        "prompts"
+        "anthropic_api_key"
     ],
     "fields": [
         {
@@ -106,23 +103,6 @@
             "label": "Anthropic API Key",
             "description": "API key from Anthropic console",
             "mandatory_depends_on": "eval:doc.default_ai_provider === 'Claude'"
-        },
-        {
-            "fieldname": "prompts_tab",
-            "fieldtype": "Tab Break",
-            "label": "Prompt Configuration"
-        },
-        {
-            "fieldname": "prompts_section",
-            "fieldtype": "Section Break",
-            "label": "Prompt Configuration",
-            "collapsible": 1
-        },
-        {
-            "fieldname": "prompts",
-            "fieldtype": "Table",
-            "label": "Prompts",
-            "options": "AI Agent Prompt Configuration"
         }
     ],
     "issingle": 1,

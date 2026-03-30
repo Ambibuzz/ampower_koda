@@ -303,7 +303,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 
         tools = _make_tools(app_name, read_only=read_only_tools)
         llm = _get_llm(provider=provider, model=model)
-        system_prompt = get_system_prompt(app_name or "target_app")
+        system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
         full_prompt = f"{system_prompt}\n\n{prompt}"
         content, tool_edited_paths = _run_tool_calling_loop(
             llm, tools, full_prompt, request_name=request_name, max_rounds=max_rounds
@@ -341,6 +341,7 @@ def understand_node(state: dict) -> dict:
     prompt = get_understand_prompt(
         state.get("user_message", ""),
         state.get("request_type", "Improvement"),
+        request_name=state.get("request_name"),
     )
     updates = _run_agent_turn(state, "Understanding", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_PLANNING)
     if updates.get("error"):
@@ -376,8 +377,8 @@ def plan_node(state: dict) -> dict:
             return {"error": "Understanding phase produced no output", "stage_log": logs}
 
         llm = _get_llm(provider=provider, model=model)
-        system_prompt = get_system_prompt(app_name)
-        plan_prompt = get_plan_prompt(understanding, user_message)
+        system_prompt = get_system_prompt(app_name, request_name=request_name)
+        plan_prompt = get_plan_prompt(understanding, user_message, request_name=request_name)
         full_prompt = f"{system_prompt}\n\n{plan_prompt}"
 
         _publish_agent_log(request_name, "llm_response",
@@ -440,6 +441,7 @@ def implement_node(state: dict) -> dict:
         state.get("understanding_summary", ""),
         state.get("user_message", ""),
         file_contents,
+        request_name=state.get("request_name"),
     )
 
     review_notes = state.get("review_notes", "")
@@ -486,7 +488,7 @@ def review_node(state: dict) -> dict:
         return {"error": state["error"]}
     logs = _log_stage(state, "Reviewing", "started", "Reviewing implemented changes")
     edits = state.get("edits_made", [])
-    prompt = get_review_prompt(edits, state.get("user_message", ""))
+    prompt = get_review_prompt(edits, state.get("user_message", ""), request_name=state.get("request_name"))
     updates = _run_agent_turn(state, "Reviewing", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_REVIEW)
     if updates.get("error"):
         logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "failed", updates["error"][:200])

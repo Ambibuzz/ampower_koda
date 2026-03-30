@@ -44,7 +44,10 @@
         "conversation_log",
         "files_changed",
         "tokens_used",
-        "cost_estimate"
+        "cost_estimate",
+        "prompts_tab",
+        "prompts_section",
+        "prompts"
     ],
     "fields": [
         {
@@ -297,6 +300,23 @@
             "fieldtype": "Currency",
             "label": "Cost Estimate",
             "read_only": 1
+        },
+        {
+            "fieldname": "prompts_tab",
+            "fieldtype": "Tab Break",
+            "label": "Prompts"
+        },
+        {
+            "fieldname": "prompts_section",
+            "fieldtype": "Section Break",
+            "label": "Custom Prompts",
+            "collapsible": 1
+        },
+        {
+            "fieldname": "prompts",
+            "fieldtype": "Table",
+            "label": "Prompts",
+            "options": "AI Agent Prompt Configuration"
         }
     ],
     "index_web_pages_for_search": 0,
