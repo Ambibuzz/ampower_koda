@@ -15,31 +15,39 @@ PROMPT_LABEL_MAP = {
 
 def get_config_prompt(fieldname: str, default_template: str, request_name: str = None) -> str:
     """Fetch prompt from AI Agent Request (per-request),
-    otherwise fallback to hard-coded default.
+    otherwise fallback to AI Agents Settings (global),
+    then finally fallback to hard-coded default.
     """
-    if not request_name:
-        return default_template
-
     # Map machine-readable fieldname to user-friendly label used in Child Table
     prompt_label = PROMPT_LABEL_MAP.get(fieldname, fieldname)
 
-    # Check request (Child Table)
+    # 1. Check per-request override (Child Table in AI Agent Request)
+    if request_name:
+        try:
+            overrides = frappe.get_all("AI Agent Prompt Configuration",
+                                       filters={"parent": request_name, "parenttype": "AI Agent Request", "prompt_key": prompt_label},
+                                       fields=["content"])
+            if overrides and overrides[0].content:
+                return overrides[0].content
+        except Exception:
+            pass
+
+    # 2. Check global override (Child Table in AI Agents Settings)
     try:
-        overrides = frappe.get_all("AI Agent Prompt Configuration", 
-                                   filters={"parent": request_name, "parenttype": "AI Agent Request", "prompt_key": prompt_label},
-                                   fields=["content"])
-        if overrides and overrides[0].content:
-            return overrides[0].content
+        global_overrides = frappe.get_all("AI Agent Prompt Configuration",
+                                          filters={"parent": "AI Agents Settings", "parenttype": "AI Agents Settings", "prompt_key": prompt_label},
+                                          fields=["content"])
+        if global_overrides and global_overrides[0].content:
+            return global_overrides[0].content
     except Exception:
-        # Fallback if DocType doesn't exist yet (e.g. during migration)
         pass
 
-    # Fallback to hard-coded
+    # 3. Fallback to hard-coded default
     return default_template
 
 
 def get_system_prompt(app_name: str, request_name: str = None) -> str:
-    default = f"""You are an expert Frappe Framework developer and senior software architect.
+    default = """You are an expert Frappe Framework developer and senior software architect.
 You write clean, correct, production-ready code. You NEVER guess — you verify everything by reading the actual code first.
 
 ## ABSOLUTE RULES — VIOLATION CAUSES IMMEDIATE FAILURE
@@ -73,7 +81,7 @@ You write clean, correct, production-ready code. You NEVER guess — you verify 
 - Python: from frappe.model.document import Document; @frappe.whitelist() for API endpoints
 - Data: frappe.get_doc, frappe.db.get_value, frappe.db.set_value, frappe.db.get_all
 - DocType name in code uses spaces: "Sales Order", not "sales_order"
-- Client JS: frappe.ui.form.on("Sales Order", {{{{ refresh(frm) {{{{ ... }}}} }}}})
+- Client JS: frappe.ui.form.on("Sales Order", {{ refresh(frm) {{ ... }} }})
 - Pages: frappe.pages['page-name'] = function(wrapper) {{{{ ... }}}}
 - DocType JSON fields array defines the schema (fieldname, fieldtype, options, label)
 - Child tables are separate DocTypes with istable=1
@@ -87,7 +95,7 @@ When creating ANY new .json file for a Frappe artifact, you MUST read an existin
 - "is_standard": "Yes", "disabled": 0, "docstatus": 0, "idx": 0
 - "owner": "Administrator", "modified_by": "Administrator"
 - "creation": "<timestamp>", "modified": "<timestamp>"
-- "roles": [[{{"role": "System Manager"}}]]
+- "roles": [{{"role": "System Manager"}}]
 
 **DocType JSON** (in <module>/doctype/<doctype_name>/<doctype_name>.json) MUST have:
 - "doctype": "DocType", "name": "<DocType Name>", "module": "<Module Name>"
@@ -116,11 +124,12 @@ When creating ANY new .json file for a Frappe artifact, you MUST read an existin
 - **edit_file(path, old_string, new_string)** — ONLY for small unique strings (<5 lines).
 - **write_file(path, content)** — ONLY for creating NEW files.
 """
-    return get_config_prompt("system_prompt", default, request_name=request_name).format(app_name=app_name)
+    template = get_config_prompt("system_prompt", default, request_name=request_name)
+    return template.replace("{app_name}", app_name)
 
 
 def get_understand_prompt(user_message: str, request_type: str, request_name: str = None) -> str:
-    default = f"""## USER REQUEST
+    default = """## USER REQUEST
 **Type:** {request_type}
 **Description:**
 {user_message}
@@ -219,12 +228,19 @@ For EVERY file relevant to the request:
 Quote the EXACT code sections (with line numbers) that will need to be modified. This is critical — the planner needs to see the real code to write accurate instructions.
 
 **IMPORTANT**: Read MORE rather than less. Read FULL files when in doubt. The #1 cause of bad plans is insufficient exploration. If you haven't read a file that's relevant, read it NOW."""
-    return get_config_prompt("understand_prompt", default, request_name=request_name).format(user_message=user_message, request_type=request_type)
+    template = get_config_prompt("understand_prompt", default, request_name=request_name)
+    result = template.replace("{user_message}", user_message).replace("{request_type}", request_type)
+    if template != default:
+        if "{user_message}" not in template:
+            result += f"\n\n## USER REQUEST\n{user_message}"
+        if "{request_type}" not in template:
+            result += f"\n\n**Type:** {request_type}"
+    return result
 
 
 def get_plan_prompt(understanding_summary: str, user_message: str = "", request_name: str = None) -> str:
     user_section = f"## USER REQUEST\n{user_message}\n\n" if user_message else ""
-    default = f"""{user_section}## CODEBASE ANALYSIS
+    default = """{user_section}## CODEBASE ANALYSIS
 {understanding_summary}
 
 ## YOUR TASK: Create a Production-Ready Implementation Plan
@@ -302,11 +318,18 @@ You are writing this plan for an AI agent that will execute it step-by-step. The
 - **Always include error handling** in new code
 - **When creating new Frappe artifacts** (Reports, DocTypes, Pages, Print Formats): the plan MUST include ALL required JSON fields. Find an existing artifact of the same type in the codebase analysis, copy its COMPLETE JSON structure, and only change the name/module/content-specific fields. A report JSON with missing `doctype`, `name`, or `module` fields will break `bench migrate`.
 """
-    return get_config_prompt("plan_prompt", default, request_name=request_name).format(understanding_summary=understanding_summary, user_message=user_message)
+    template = get_config_prompt("plan_prompt", default, request_name=request_name)
+    result = template.replace("{user_section}", user_section).replace("{understanding_summary}", understanding_summary).replace("{user_message}", user_message)
+    if template != default:
+        if "{understanding_summary}" not in template:
+            result += f"\n\n## CODEBASE ANALYSIS\n{understanding_summary}"
+        if "{user_message}" not in template and "{user_section}" not in template:
+            result += f"\n\n## USER REQUEST\n{user_message}"
+    return result
 
 
 def get_implement_prompt(plan: str, understanding_summary: str, user_message: str, file_contents: str, request_name: str = None) -> str:
-    default = f"""## ORIGINAL USER REQUEST
+    default = """## ORIGINAL USER REQUEST
 {user_message}
 
 ## APPROVED PLAN TO EXECUTE
@@ -361,15 +384,24 @@ Before writing any edit:
 - Can't find the target location → Use search_code to find it
 - Line numbers don't match → The file may have been edited already. Re-read it.
 """
-    return get_config_prompt("implement_prompt", default, request_name=request_name).format(plan=plan, understanding_summary=understanding_summary, user_message=user_message, file_contents=file_contents)
+    template = get_config_prompt("implement_prompt", default, request_name=request_name)
+    result = template.replace("{plan}", plan).replace("{understanding_summary}", understanding_summary).replace("{user_message}", user_message).replace("{file_contents}", file_contents)
+    if template != default:
+        if "{plan}" not in template:
+            result += f"\n\n## APPROVED PLAN TO EXECUTE\n{plan}"
+        if "{file_contents}" not in template:
+            result += f"\n\n## PRE-LOADED FILE CONTENTS\n{file_contents}"
+        if "{user_message}" not in template:
+            result += f"\n\n## ORIGINAL USER REQUEST\n{user_message}"
+    return result
 
 
 def get_review_prompt(edits_made: list[dict], user_message: str, request_name: str = None) -> str:
     paths = [e.get("path", "") for e in edits_made if e.get("path")]
     paths_list = "\n".join(f"- {p}" for p in paths) if paths else "(no specific paths recorded)"
 
-    default = f"""## USER REQUEST
-{user_message[:800]}
+    default = """## USER REQUEST
+{user_message_short}
 
 ## FILES MODIFIED
 {paths_list}
@@ -395,4 +427,12 @@ After reading ALL files, give your verdict IMMEDIATELY. Do NOT re-read files.
 - All good: `REVIEW_PASSED=yes`
 - Issues found: `REVIEW_PASSED=no` then list each issue:
   - File: path — Issue: description — Fix: what to change"""
-    return get_config_prompt("review_prompt", default, request_name=request_name).format(user_message=user_message, paths_list=paths_list)
+    template = get_config_prompt("review_prompt", default, request_name=request_name)
+    user_message_short = user_message[:800] if user_message else ""
+    result = template.replace("{user_message_short}", user_message_short).replace("{paths_list}", paths_list).replace("{user_message}", user_message)
+    if template != default:
+        if "{user_message}" not in template and "{user_message_short}" not in template:
+            result += f"\n\n## USER REQUEST\n{user_message_short}"
+        if "{paths_list}" not in template:
+            result += f"\n\n## FILES MODIFIED\n{paths_list}"
+    return result
