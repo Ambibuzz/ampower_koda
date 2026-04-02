@@ -14,35 +14,26 @@ PROMPT_LABEL_MAP = {
 
 
 def get_config_prompt(fieldname: str, default_template: str, request_name: str = None) -> str:
-    """Fetch prompt from AI Agent Request (per-request),
-    otherwise fallback to AI Agents Settings (global),
-    then finally fallback to hard-coded default.
-    """
-    # Map machine-readable fieldname to user-friendly label used in Child Table
     prompt_label = PROMPT_LABEL_MAP.get(fieldname, fieldname)
 
-    # 1. Check per-request override (Child Table in AI Agent Request)
+    # Only request-level override
     if request_name:
         try:
-            overrides = frappe.get_all("AI Agent Prompt Configuration",
-                                       filters={"parent": request_name, "parenttype": "AI Agent Request", "prompt_key": prompt_label},
-                                       fields=["content"])
-            if overrides and overrides[0].content:
+            overrides = frappe.get_all(
+                "AI Agent Prompt Configuration",
+                filters={
+                    "parent": request_name,
+                    "parenttype": "AI Agent Request",
+                    "prompt_key": prompt_label
+                },
+                fields=["content"]
+            )
+            if overrides and overrides[0].content and overrides[0].content.strip():
                 return overrides[0].content
-        except Exception:
-            pass
+        except Exception as e:
+            frappe.log_error(f"Request prompt fetch failed: {str(e)}")
 
-    # 2. Check global override (Child Table in AI Agents Settings)
-    try:
-        global_overrides = frappe.get_all("AI Agent Prompt Configuration",
-                                          filters={"parent": "AI Agents Settings", "parenttype": "AI Agents Settings", "prompt_key": prompt_label},
-                                          fields=["content"])
-        if global_overrides and global_overrides[0].content:
-            return global_overrides[0].content
-    except Exception:
-        pass
-
-    # 3. Fallback to hard-coded default
+    # Always fallback
     return default_template
 
 
