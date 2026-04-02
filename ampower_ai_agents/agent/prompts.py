@@ -19,6 +19,14 @@ def get_config_prompt(fieldname: str, default_template: str, request_name: str =
     # Only request-level override
     if request_name:
         try:
+            #Fetch parent doc first
+            doc = frappe.get_doc("AI Agent Request", request_name)
+
+            #If "Use Default Prompts" is enabled → skip overrides completely
+            if doc.use_default_prompts:
+                return default_template
+
+            # Otherwise check for custom overrides
             overrides = frappe.get_all(
                 "AI Agent Prompt Configuration",
                 filters={
@@ -28,8 +36,10 @@ def get_config_prompt(fieldname: str, default_template: str, request_name: str =
                 },
                 fields=["content"]
             )
+
             if overrides and overrides[0].content and overrides[0].content.strip():
                 return overrides[0].content
+
         except Exception as e:
             frappe.log_error(f"Request prompt fetch failed: {str(e)}")
 

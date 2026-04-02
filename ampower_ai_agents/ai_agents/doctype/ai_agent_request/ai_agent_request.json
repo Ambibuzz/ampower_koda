@@ -46,6 +46,7 @@
         "tokens_used",
         "cost_estimate",
         "prompts_tab",
+        "use_default_prompts",
         "prompts_section",
         "prompts"
     ],
@@ -307,16 +308,25 @@
             "label": "Prompts"
         },
         {
+            "fieldname": "use_default_prompts",
+            "fieldtype": "Check",
+            "label": "Use Default Prompts",
+            "default": 1,
+            "description": "If enabled, system default prompts will be used. Disable to provide custom prompts."
+        },
+        {
             "fieldname": "prompts_section",
             "fieldtype": "Section Break",
             "label": "Custom Prompts",
-            "collapsible": 1
+            "collapsible": 1,
+            "depends_on": "eval:!doc.use_default_prompts"
         },
         {
             "fieldname": "prompts",
             "fieldtype": "Table",
             "label": "Prompts",
-            "options": "AI Agent Prompt Configuration"
+            "options": "AI Agent Prompt Configuration",
+            "depends_on": "eval:!doc.use_default_prompts"
         }
     ],
     "index_web_pages_for_search": 0,

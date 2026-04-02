@@ -14,7 +14,8 @@
             "in_list_view": 1,
             "label": "Prompt Type",
             "options": "System Prompt\nUnderstand Prompt\nPlan Prompt\nImplement Prompt\nReview Prompt",
-            "reqd": 1
+            "reqd": 1,
+            "description": "Each prompt type should be added only once."
         },
         {
             "fieldname": "content",
