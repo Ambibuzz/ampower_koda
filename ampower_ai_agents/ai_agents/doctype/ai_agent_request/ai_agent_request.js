@@ -3,19 +3,19 @@
 
 var PROVIDER_MODELS = {
     'OpenAI': [
-        { value: 'gpt-4o-mini',  label: 'GPT-4o Mini — fast, cost-effective' },
-        { value: 'gpt-4o',       label: 'GPT-4o — best overall' },
-        { value: 'gpt-5-mini',   label: 'GPT-5 Mini — next-gen, efficient' },
-        { value: 'o3-mini',      label: 'o3-mini — reasoning model' }
+        { value: 'gpt-4o-mini', label: 'GPT-4o Mini — fast, cost-effective' },
+        { value: 'gpt-4o', label: 'GPT-4o — best overall' },
+        { value: 'gpt-5-mini', label: 'GPT-5 Mini — next-gen, efficient' },
+        { value: 'o3-mini', label: 'o3-mini — reasoning model' }
     ],
     'Gemini': [
         { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash — fast, multimodal' },
-        { value: 'gemini-2.5-pro',   label: 'Gemini 2.5 Pro — most capable' }
+        { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — most capable' }
     ],
     'Claude': [
-        { value: 'claude-sonnet-4-20250514',    label: 'Claude Sonnet 4 — balanced' },
-        { value: 'claude-3-5-sonnet-20241022',  label: 'Claude 3.5 Sonnet — proven' },
-        { value: 'claude-3-5-haiku-20241022',   label: 'Claude 3.5 Haiku — fast, light' }
+        { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4 — balanced' },
+        { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet — proven' },
+        { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku — fast, light' }
     ]
 };
 
@@ -32,23 +32,23 @@ var STATUS_FLOW = [
 ];
 
 var STATUS_META = {
-    'Queued':                  { color: 'grey',   label: 'Queued' },
-    'Understanding':           { color: 'blue',   label: 'Exploring Codebase' },
-    'Planning':                { color: 'blue',   label: 'Creating Plan' },
-    'Awaiting Approval':       { color: 'orange', label: 'Review Plan' },
-    'Implementing':            { color: 'yellow', label: 'Implementing Changes' },
-    'Reviewing':               { color: 'yellow', label: 'Reviewing Code' },
+    'Queued': { color: 'grey', label: 'Queued' },
+    'Understanding': { color: 'blue', label: 'Exploring Codebase' },
+    'Planning': { color: 'blue', label: 'Creating Plan' },
+    'Awaiting Approval': { color: 'orange', label: 'Review Plan' },
+    'Implementing': { color: 'yellow', label: 'Implementing Changes' },
+    'Reviewing': { color: 'yellow', label: 'Reviewing Code' },
     'Awaiting Bench Approval': { color: 'orange', label: 'Approve Bench Commands' },
-    'Building':                { color: 'purple', label: 'Running Bench Commands' },
-    'Awaiting Push Approval':  { color: 'orange', label: 'Approve Push to GitHub' },
-    'Pushing':                 { color: 'purple', label: 'Creating Pull Request' },
-    'Completed':               { color: 'green',  label: 'Completed' },
-    'Failed':                  { color: 'red',    label: 'Failed' },
-    'Cancelled':               { color: 'grey',   label: 'Cancelled' }
+    'Building': { color: 'purple', label: 'Running Bench Commands' },
+    'Awaiting Push Approval': { color: 'orange', label: 'Approve Push to GitHub' },
+    'Pushing': { color: 'purple', label: 'Creating Pull Request' },
+    'Completed': { color: 'green', label: 'Completed' },
+    'Failed': { color: 'red', label: 'Failed' },
+    'Cancelled': { color: 'grey', label: 'Cancelled' }
 };
 
 frappe.ui.form.on('AI Agent Request', {
-    refresh: function(frm) {
+    refresh: function (frm) {
         render_status_dashboard(frm);
         setup_action_buttons(frm);
         setup_realtime_listeners(frm);
@@ -59,19 +59,19 @@ frappe.ui.form.on('AI Agent Request', {
         style_form(frm);
     },
 
-    ai_provider: function(frm) {
+    ai_provider: function (frm) {
         var provider = frm.doc.ai_provider || 'OpenAI';
         set_model_options_for_provider(frm);
         frm.set_value('ai_model', DEFAULT_MODELS[provider] || DEFAULT_MODELS['OpenAI']);
     },
 
-    before_save: function(frm) {
+    before_save: function (frm) {
         if (frm.is_new()) {
             save_user_defaults(frm);
         }
     },
 
-    onload: function(frm) {
+    onload: function (frm) {
         if (frm.is_new()) {
             load_user_defaults(frm);
             set_model_options_for_provider(frm);
@@ -98,15 +98,15 @@ function render_status_dashboard(frm) {
     if (current_idx === -1 && status === 'Cancelled') current_idx = -2;
 
     var display_steps = [
-        { key: 'Queued',                  short: 'Queued' },
-        { key: 'Understanding',           short: 'Explore' },
-        { key: 'Planning',               short: 'Plan' },
-        { key: 'Awaiting Approval',       short: 'Review' },
-        { key: 'Implementing',            short: 'Build' },
-        { key: 'Reviewing',              short: 'Verify' },
+        { key: 'Queued', short: 'Queued' },
+        { key: 'Understanding', short: 'Explore' },
+        { key: 'Planning', short: 'Plan' },
+        { key: 'Awaiting Approval', short: 'Review' },
+        { key: 'Implementing', short: 'Build' },
+        { key: 'Reviewing', short: 'Verify' },
         { key: 'Awaiting Bench Approval', short: 'Bench' },
-        { key: 'Awaiting Push Approval',  short: 'Push' },
-        { key: 'Completed',              short: 'Done' }
+        { key: 'Awaiting Push Approval', short: 'Push' },
+        { key: 'Completed', short: 'Done' }
     ];
 
     for (var i = 0; i < display_steps.length; i++) {
@@ -139,9 +139,9 @@ function render_status_dashboard(frm) {
     var bench_info_html = '';
     if (status === 'Awaiting Bench Approval') {
         var cmds = [];
-        try { cmds = JSON.parse(frm.doc.pending_bench_commands || '[]'); } catch(e) {}
+        try { cmds = JSON.parse(frm.doc.pending_bench_commands || '[]'); } catch (e) { }
         if (cmds.length) {
-            var cmds_html = cmds.map(function(c, i) {
+            var cmds_html = cmds.map(function (c, i) {
                 return '<div style="display:flex;align-items:center;gap:8px;margin:4px 0;">'
                     + '<input type="checkbox" checked class="bench-cmd-check" data-idx="' + i + '" style="margin:0;">'
                     + '<input type="text" class="bench-cmd-input input-xs" data-idx="' + i + '" value="' + frappe.utils.escape_html(c) + '"'
@@ -367,7 +367,7 @@ function style_form(frm) {
 function set_model_options_for_provider(frm) {
     var provider = frm.doc.ai_provider || 'OpenAI';
     var entries = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
-    var model_ids = entries.map(function(m) { return m.value; });
+    var model_ids = entries.map(function (m) { return m.value; });
     var options_str = model_ids.join('\n');
 
     frm.set_df_property('ai_model', 'options', options_str);
@@ -378,7 +378,7 @@ function set_model_options_for_provider(frm) {
         frm.set_value('ai_model', model_ids[0]);
     }
 
-    var desc = entries.map(function(m) {
+    var desc = entries.map(function (m) {
         return '<b>' + m.value + '</b> — ' + m.label.split(' — ')[1];
     }).join(' &nbsp;|&nbsp; ');
     frm.set_df_property('ai_model', 'description', desc);
@@ -395,7 +395,7 @@ function toggle_config_readonly(frm) {
         'base_branch', 'branch_prefix', 'git_user_name', 'git_user_email',
         'ai_provider', 'ai_model', 'request_type', 'user_message', 'request_title'
     ];
-    config_fields.forEach(function(f) {
+    config_fields.forEach(function (f) {
         frm.set_df_property(f, 'read_only', editable ? 0 : 1);
     });
 }
@@ -415,80 +415,80 @@ function setup_action_buttons(frm) {
         || status === 'Awaiting Bench Approval' || status === 'Awaiting Push Approval';
 
     if (can_start) {
-        frm.add_custom_button(__('Start Agent'), function() {
+        frm.add_custom_button(__('Start Agent'), function () {
             start_agent(frm);
         }).addClass('btn-primary-dark');
         frm.change_custom_button_type(__('Start Agent'), null, 'primary');
     }
 
     if (can_restart) {
-        frm.add_custom_button(__('Re-run Agent'), function() {
+        frm.add_custom_button(__('Re-run Agent'), function () {
             frappe.confirm(
                 __('This will restart the agent from scratch (Explore → Plan → Review). Continue?'),
-                function() { start_agent(frm); }
+                function () { start_agent(frm); }
             );
         }).addClass('btn-primary-dark');
         frm.change_custom_button_type(__('Re-run Agent'), null, 'primary');
     }
 
     if (status === 'Awaiting Approval') {
-        frm.add_custom_button(__('Approve Plan'), function() {
+        frm.add_custom_button(__('Approve Plan'), function () {
             approve_plan(frm);
         }, __('Actions'));
 
-        frm.add_custom_button(__('Execute Existing Plan'), function() {
+        frm.add_custom_button(__('Execute Existing Plan'), function () {
             execute_existing_plan(frm);
         }, __('Actions'));
 
-        frm.add_custom_button(__('Reject Plan'), function() {
+        frm.add_custom_button(__('Reject Plan'), function () {
             reject_plan(frm);
         }, __('Actions'));
     }
 
     var has_plan = !!(frm.doc.agent_plan || '').trim();
     if (has_plan && ['Failed', 'Cancelled', 'Completed', 'Awaiting Push Approval'].indexOf(status) !== -1) {
-        frm.add_custom_button(__('Execute Existing Plan'), function() {
+        frm.add_custom_button(__('Execute Existing Plan'), function () {
             execute_existing_plan(frm);
         }, __('Actions'));
     }
 
     if (status === 'Awaiting Bench Approval') {
-        frm.add_custom_button(__('Approve Bench Commands'), function() {
+        frm.add_custom_button(__('Approve Bench Commands'), function () {
             approve_bench(frm);
         }).addClass('btn-primary-dark');
         frm.change_custom_button_type(__('Approve Bench Commands'), null, 'primary');
 
-        frm.add_custom_button(__('Reject'), function() {
+        frm.add_custom_button(__('Reject'), function () {
             frappe.confirm(
                 __('Reject bench commands? The request will be cancelled.'),
-                function() { cancel_request(frm); }
+                function () { cancel_request(frm); }
             );
         }, __('Actions'));
     }
 
     if (status === 'Awaiting Push Approval') {
-        frm.add_custom_button(__('Approve Push'), function() {
+        frm.add_custom_button(__('Approve Push'), function () {
             approve_push(frm);
         }).addClass('btn-primary-dark');
         frm.change_custom_button_type(__('Approve Push'), null, 'primary');
 
-        frm.add_custom_button(__('Reject Push'), function() {
+        frm.add_custom_button(__('Reject Push'), function () {
             frappe.confirm(
                 __('Cancel this push? You can re-run the agent later.'),
-                function() { cancel_request(frm); }
+                function () { cancel_request(frm); }
             );
         }, __('Actions'));
     }
 
     var non_running = running.indexOf(status) === -1 && !frm.is_new();
     if (non_running) {
-        frm.add_custom_button(__('Checkout Base Branch'), function() {
+        frm.add_custom_button(__('Checkout Base Branch'), function () {
             checkout_base_branch(frm);
         }, __('Actions'));
     }
 
     if (running.indexOf(status) !== -1) {
-        frm.add_custom_button(__('Cancel'), function() {
+        frm.add_custom_button(__('Cancel'), function () {
             cancel_request(frm);
         }, __('Actions'));
     }
@@ -501,7 +501,7 @@ function start_agent(frm) {
             args: { request_name: frm.doc.name },
             freeze: true,
             freeze_message: __('Starting agent...'),
-            callback: function(r) {
+            callback: function (r) {
                 if (r.message && r.message.status === 'ok') {
                     frappe.show_alert({
                         message: __('Agent started — exploring codebase...'),
@@ -523,14 +523,14 @@ function start_agent(frm) {
 function execute_existing_plan(frm) {
     frappe.confirm(
         __('Skip exploration & planning — execute the existing plan directly?<br><br>The agent will implement the plan, run bench commands, and ask for push approval.'),
-        function() {
+        function () {
             function do_execute() {
                 frappe.call({
                     method: 'ampower_ai_agents.agent.api.execute_existing_plan',
                     args: { request_name: frm.doc.name },
                     freeze: true,
                     freeze_message: __('Starting execution from existing plan...'),
-                    callback: function(r) {
+                    callback: function (r) {
                         if (r.message && r.message.status === 'ok') {
                             frappe.show_alert({
                                 message: __('Executing existing plan — implementation in progress...'),
@@ -553,7 +553,7 @@ function execute_existing_plan(frm) {
 function approve_plan(frm) {
     frappe.confirm(
         __('Approve this plan and start execution?<br><br>The agent will implement the changes, run bench commands, and create a Pull Request.'),
-        function() {
+        function () {
             var edited_plan = frm.doc.agent_plan || '';
             frappe.call({
                 method: 'ampower_ai_agents.agent.api.approve_plan',
@@ -563,7 +563,7 @@ function approve_plan(frm) {
                 },
                 freeze: true,
                 freeze_message: __('Starting execution...'),
-                callback: function(r) {
+                callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
                             message: __('Plan approved — execution in progress...'),
@@ -580,11 +580,11 @@ function approve_plan(frm) {
 function reject_plan(frm) {
     frappe.confirm(
         __('Reject this plan? The request will be cancelled.'),
-        function() {
+        function () {
             frappe.call({
                 method: 'ampower_ai_agents.agent.api.reject_plan',
                 args: { request_name: frm.doc.name },
-                callback: function(r) {
+                callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
                             message: __('Plan rejected.'),
@@ -602,7 +602,7 @@ function approve_bench(frm) {
     var selected_cmds = [];
     var $list = $(frm.wrapper).find('#bench-cmd-list');
     if ($list.length) {
-        $list.find('.bench-cmd-input').each(function() {
+        $list.find('.bench-cmd-input').each(function () {
             var $input = $(this);
             var $check = $list.find('.bench-cmd-check[data-idx="' + $input.data('idx') + '"]');
             if ($check.is(':checked') && $input.val().trim()) {
@@ -612,7 +612,7 @@ function approve_bench(frm) {
     }
     if (!selected_cmds.length) {
         var fallback = [];
-        try { fallback = JSON.parse(frm.doc.pending_bench_commands || '[]'); } catch(e) {}
+        try { fallback = JSON.parse(frm.doc.pending_bench_commands || '[]'); } catch (e) { }
         selected_cmds = fallback;
     }
 
@@ -621,14 +621,14 @@ function approve_bench(frm) {
         return;
     }
 
-    var preview = selected_cmds.map(function(c) {
+    var preview = selected_cmds.map(function (c) {
         return '<code style="display:block;padding:3px 8px;margin:2px 0;background:var(--gray-100);border-radius:3px;font-size:12px;">$ '
             + frappe.utils.escape_html(c) + '</code>';
     }).join('');
 
     frappe.confirm(
         __('Run these commands?') + '<div style="margin:10px 0;">' + preview + '</div>',
-        function() {
+        function () {
             frappe.call({
                 method: 'ampower_ai_agents.agent.api.approve_bench',
                 args: {
@@ -637,7 +637,7 @@ function approve_bench(frm) {
                 },
                 freeze: true,
                 freeze_message: __('Running bench commands...'),
-                callback: function(r) {
+                callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
                             message: __('Bench commands approved — running...'),
@@ -681,7 +681,7 @@ function approve_push(frm) {
             options: info_html + checklist_html
         }],
         primary_action_label: __('Proceed'),
-        primary_action: function() {
+        primary_action: function () {
             var do_push = d.$wrapper.find('#push-opt-push').is(':checked');
             var do_pr = d.$wrapper.find('#push-opt-pr').is(':checked');
             if (!do_push && !do_pr) {
@@ -698,7 +698,7 @@ function approve_push(frm) {
                 },
                 freeze: true,
                 freeze_message: __('Processing...'),
-                callback: function(r) {
+                callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
                             message: r.message.message || __('Done'),
@@ -716,13 +716,13 @@ function approve_push(frm) {
 function checkout_base_branch(frm) {
     frappe.confirm(
         __('Switch back to the base branch? Uncommitted changes will be discarded.'),
-        function() {
+        function () {
             frappe.call({
                 method: 'ampower_ai_agents.agent.api.checkout_base_branch',
                 args: { request_name: frm.doc.name },
                 freeze: true,
                 freeze_message: __('Checking out base branch...'),
-                callback: function(r) {
+                callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
                             message: r.message.message,
@@ -752,11 +752,11 @@ function show_post_checkout_bench_dialog(frm) {
     frappe.call({
         method: 'ampower_ai_agents.agent.api.get_default_bench_commands',
         args: { request_name: frm.doc.name },
-        callback: function(r) {
+        callback: function (r) {
             var cmds = (r.message && r.message.commands) ? r.message.commands : default_cmds;
             if (!cmds.length) return;
 
-            var rows_html = cmds.map(function(c, i) {
+            var rows_html = cmds.map(function (c, i) {
                 return '<div style="display:flex;align-items:center;gap:8px;margin:4px 0;">'
                     + '<input type="checkbox" checked class="checkout-bench-check" data-idx="' + i + '" style="margin:0;">'
                     + '<input type="text" class="checkout-bench-input form-control input-xs" data-idx="' + i + '" value="' + frappe.utils.escape_html(c) + '"'
@@ -772,9 +772,9 @@ function show_post_checkout_bench_dialog(frm) {
                         + '<div id="checkout-bench-list">' + rows_html + '</div>'
                 }],
                 primary_action_label: __('Run Selected'),
-                primary_action: function() {
+                primary_action: function () {
                     var selected = [];
-                    d.$wrapper.find('.checkout-bench-input').each(function() {
+                    d.$wrapper.find('.checkout-bench-input').each(function () {
                         var $input = $(this);
                         var idx = $input.data('idx');
                         var $check = d.$wrapper.find('.checkout-bench-check[data-idx="' + idx + '"]');
@@ -795,7 +795,7 @@ function show_post_checkout_bench_dialog(frm) {
                         },
                         freeze: true,
                         freeze_message: __('Running bench commands...'),
-                        callback: function(r2) {
+                        callback: function (r2) {
                             if (r2.message && r2.message.status === 'ok') {
                                 frappe.msgprint({
                                     title: __('Bench Commands Output'),
@@ -811,7 +811,7 @@ function show_post_checkout_bench_dialog(frm) {
                     });
                 },
                 secondary_action_label: __('Skip'),
-                secondary_action: function() { d.hide(); }
+                secondary_action: function () { d.hide(); }
             });
             d.show();
         }
@@ -821,11 +821,11 @@ function show_post_checkout_bench_dialog(frm) {
 function cancel_request(frm) {
     frappe.confirm(
         __('Cancel this agent request?'),
-        function() {
+        function () {
             frappe.call({
                 method: 'ampower_ai_agents.agent.api.cancel_agent_request',
                 args: { request_name: frm.doc.name },
-                callback: function() {
+                callback: function () {
                     frm.reload_doc();
                 }
             });
@@ -841,7 +841,7 @@ function setup_realtime_listeners(frm) {
     if (frm._realtime_bound) return;
     frm._realtime_bound = true;
 
-    frappe.realtime.on('agent_progress', function(data) {
+    frappe.realtime.on('agent_progress', function (data) {
         if (!data || data.request_name !== frm.doc.name) return;
         frm.reload_doc();
     });
@@ -860,7 +860,7 @@ function setup_status_polling(frm) {
 
     var poll_interval = (frm.doc.status === 'Building' || frm.doc.status === 'Pushing') ? 5000 : 10000;
 
-    frm._poll_timer = setInterval(function() {
+    frm._poll_timer = setInterval(function () {
         if (!frm.doc || !frm.doc.name) {
             clearInterval(frm._poll_timer);
             frm._poll_timer = null;
@@ -871,7 +871,7 @@ function setup_status_polling(frm) {
             args: { request_name: frm.doc.name },
             async: true,
             silent: true,
-            callback: function(r) {
+            callback: function (r) {
                 if (r.message && r.message.status && r.message.status !== frm.doc.status) {
                     clearInterval(frm._poll_timer);
                     frm._poll_timer = null;
@@ -888,7 +888,7 @@ function setup_status_polling(frm) {
 
 function setup_live_log_panel(frm) {
     var status = frm.doc.status;
-    var active_statuses = ['Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing'];
+    var active_statuses = ['Queued', 'Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing'];
 
     if (active_statuses.indexOf(status) === -1) {
         if (frm._log_panel) frm._log_panel.hide();
@@ -917,7 +917,7 @@ function setup_live_log_panel(frm) {
         frm._log_container = $panel.find('.agent-log-container');
         frm._log_status = $panel.find('.agent-log-status');
 
-        frappe.realtime.on('agent_log', function(data) {
+        frappe.realtime.on('agent_log', function (data) {
             if (!data || data.request_name !== frm.doc.name) return;
             append_log_entry(frm, data);
         });
@@ -940,7 +940,7 @@ function append_log_entry(frm, data) {
             try {
                 args_str = typeof data.tool_args === 'string' ? data.tool_args : JSON.stringify(data.tool_args);
                 if (args_str.length > 120) args_str = args_str.substring(0, 120) + '\u2026';
-            } catch(e) { args_str = ''; }
+            } catch (e) { args_str = ''; }
         }
         html = '<div style="color:var(--blue-500);margin-bottom:3px;">'
             + ts + '<b>\u25B6 ' + frappe.utils.escape_html(data.tool_name || '') + '</b>'
@@ -984,9 +984,9 @@ function append_log_entry(frm, data) {
 
 function save_user_defaults(frm) {
     var fields = ['target_app_name', 'github_repo_url', 'base_branch', 'branch_prefix',
-                  'git_user_name', 'git_user_email', 'ai_provider', 'ai_model'];
+        'git_user_name', 'git_user_email', 'ai_provider', 'ai_model'];
     var vals = {};
-    fields.forEach(function(f) {
+    fields.forEach(function (f) {
         if (frm.doc[f]) {
             vals['ai_agent_' + f] = frm.doc[f];
         }
@@ -1008,18 +1008,18 @@ function load_user_defaults(frm) {
     try {
         var raw = frappe.get_user_settings('AI Agent Request');
         if (raw && typeof raw === 'object') stored = raw;
-    } catch(e) { /* no saved settings */ }
+    } catch (e) { /* no saved settings */ }
 
     var fields = ['target_app_name', 'github_repo_url', 'base_branch', 'branch_prefix',
-                  'git_user_name', 'git_user_email', 'ai_provider'];
-    fields.forEach(function(f) {
+        'git_user_name', 'git_user_email', 'ai_provider'];
+    fields.forEach(function (f) {
         var val = stored['ai_agent_' + f];
         if (val && !frm.doc[f]) {
             frm.set_value(f, val);
         }
     });
 
-    setTimeout(function() {
+    setTimeout(function () {
         set_model_options_for_provider(frm);
         var saved_model = stored['ai_agent_ai_model'];
         if (saved_model && !frm.doc.ai_model) {
