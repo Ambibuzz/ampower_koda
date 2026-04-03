@@ -90,14 +90,30 @@ def commit_changes(app_name: str, message: str, git_user_name: str = "AI Agent",
 
 
 def push_branch(app_name: str, branch_name: str, repo_url: str, token: str) -> tuple[bool, str]:
-    """Push branch to origin using explicit credentials."""
-    if not repo_url or not token:
-        return False, "GitHub URL or token not provided"
+    """Push branch to origin using explicit credentials from the request."""
+    if not repo_url:
+        return False, "GitHub URL not provided"
+    
+    clean_token = (token or "").strip()
+    
+    if not clean_token:
+        return False, "GitHub token not provided in the AI Agent Request"
+
+    # Safety check: if it looks like a URL, it's definitely not a token
+    if clean_token.startswith("http"):
+        # Help the user by pointing out the likely mistake
+        return False, (
+            f"Invalid GitHub token: The token field seems to contain a URL ('{clean_token[:30]}...'). "
+            "Please ensure you enter a valid Personal Access Token (PAT) in the 'GitHub Token' field."
+        )
+
     parsed = _parse_github_repo(repo_url)
     if not parsed:
         return False, f"Invalid GitHub URL: {repo_url}"
     owner, repo = parsed
-    remote = f"https://{token}@github.com/{owner}/{repo}.git"
+    
+    # Construct authenticated remote URL
+    remote = f"https://{clean_token}@github.com/{owner}/{repo}.git"
     root = get_repo_root(app_name)
     ok, out = run_git(["push", remote, branch_name], cwd=root)
     return ok, out

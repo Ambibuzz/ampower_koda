@@ -1,0 +1,32 @@
+{
+    "actions": [],
+    "creation": "2026-03-27 13:25:00.000000",
+    "doctype": "DocType",
+    "engine": "InnoDB",
+    "field_order": [
+        "prompt_key",
+        "content"
+    ],
+    "fields": [
+        {
+            "fieldname": "prompt_key",
+            "fieldtype": "Select",
+            "in_list_view": 1,
+            "label": "Prompt Type",
+            "options": "System Prompt\nUnderstand Prompt\nPlan Prompt\nImplement Prompt\nReview Prompt",
+            "reqd": 1,
+            "description": "Each prompt type should be added only once."
+        },
+        {
+            "fieldname": "content",
+            "fieldtype": "Text Editor",
+            "in_list_view": 1,
+            "label": "Custom Prompt Content",
+            "reqd": 1
+        }
+    ],
+    "istable": 1,
+    "module": "AI Agents",
+    "name": "AI Agent Prompt Configuration",
+    "owner": "Administrator"
+}

@@ -35,3 +35,11 @@ class AIAgentRequest(Document):
             token = self.get_password("github_token", raise_exception=False)
         if not token:
             frappe.throw("GitHub Token is required")
+
+        # Prevent duplicate prompt types
+        if not self.use_default_prompts:
+            seen = set()
+            for row in self.prompts:
+                if row.prompt_key in seen:
+                    frappe.throw(f"Duplicate prompt type not allowed: {row.prompt_key}")
+                seen.add(row.prompt_key)

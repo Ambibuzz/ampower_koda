@@ -4,6 +4,7 @@
     "doctype": "DocType",
     "engine": "InnoDB",
     "field_order": [
+        "settings_tab",
         "general_section",
         "enable_ai_agent",
         "defaults_section",
@@ -18,6 +19,11 @@
         "anthropic_api_key"
     ],
     "fields": [
+        {
+            "fieldname": "settings_tab",
+            "fieldtype": "Tab Break",
+            "label": "AI Provider Settings"
+        },
         {
             "fieldname": "general_section",
             "fieldtype": "Section Break",
@@ -101,7 +107,7 @@
     ],
     "issingle": 1,
     "links": [],
-    "modified": "2026-03-11 12:00:00.000000",
+    "modified": "2026-03-27 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "AI Agents",
     "name": "AI Agents Settings",
