@@ -102,6 +102,23 @@ Each request carries its own configuration:
 These fields are remembered across requests using user settings.
 
 
+## Custom Prompt Configuration
+
+For advanced use cases, you can override the agent's default logic on a per-request basis:
+
+1. Open an **AI Agent Request**.
+2. Go to the **Prompts** tab.
+3. Uncheck **Use Default Prompts**.
+4. In the **Custom Prompts** table, add one or more overrides:
+   - **System Prompt**: Global identity and constraints.
+   - **Understand Prompt**: How the agent explores the codebase.
+   - **Plan Prompt**: How the agent synthesizes findings into a task list.
+   - **Implement Prompt**: Instructions for the file-editing phase.
+   - **Review Prompt**: Criteria for self-review and verification.
+
+If a prompt type is not explicitly added to the table, the agent will fall back to its internal system default for that phase.
+
+
 ## Supported AI Providers
 
 OpenAI:
