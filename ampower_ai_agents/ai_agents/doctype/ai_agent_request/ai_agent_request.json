@@ -243,6 +243,7 @@
             "fieldtype": "Section Break",
             "label": "Logs",
             "collapsible": 1,
+            "collapsible_depends_on": "eval:1",
             "depends_on": "eval:doc.stage_log || doc.bench_log || doc.error_log"
         },
         {

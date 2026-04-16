@@ -199,7 +199,13 @@ def _make_tools(app_name: str, read_only: bool = False):
         Much cheaper than reading the whole file. Use to understand structure before reading specific sections."""
         return agent_tools.get_file_outline(app_name, path)
 
-    out = [find_files, list_directory, read_file, search_code, read_doctype_schema, get_file_outline]
+    @tool
+    def validate_code(path: str) -> str:
+        """Check for syntax errors in a .py or .js file. Path relative to app root.
+        ALWAYS call this after editing a file to ensure you didn't break anything."""
+        return agent_tools.validate_code(app_name, path)
+
+    out = [find_files, list_directory, read_file, search_code, read_doctype_schema, get_file_outline, validate_code]
     if not read_only:
         @tool
         def write_file(path: str, content: str) -> str:
@@ -247,7 +253,7 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
         response_text = getattr(response, "content", "") or ""
         if response_text:
             _publish_agent_log(request_name, "llm_response",
-                preview=response_text[:500],
+                preview=response_text[:4000],
                 round=round_num + 1,
             )
 

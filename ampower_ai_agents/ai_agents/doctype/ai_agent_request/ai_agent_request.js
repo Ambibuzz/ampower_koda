@@ -345,6 +345,7 @@ function style_form(frm) {
         font-size: 13px;
     }
     .agent-log-container {
+        min-height: 120px;
         max-height: 400px;
         overflow-y: auto;
         background: var(--control-bg);
@@ -888,29 +889,40 @@ function setup_status_polling(frm) {
 
 function setup_live_log_panel(frm) {
     var status = frm.doc.status;
-    var active_statuses = ['Queued', 'Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing'];
+    var visible_statuses = [
+        'Queued', 'Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing',
+        'Awaiting Approval', 'Awaiting Bench Approval', 'Awaiting Push Approval', 'Failed', 'Completed'
+    ];
 
-    if (active_statuses.indexOf(status) === -1) {
+    if (visible_statuses.indexOf(status) === -1) {
         if (frm._log_panel) frm._log_panel.hide();
         return;
     }
 
-    if (!frm._log_panel) {
-        var $panel = $(`
-            <div class="agent-live-log-panel">
-                <div class="agent-log-header">
-                    <span class="agent-log-title">Live Agent Log</span>
-                    <span class="agent-log-status indicator-pill whitespace-nowrap yellow" style="font-size: 11px;"></span>
-                </div>
-                <div class="agent-log-container"></div>
-            </div>
-        `);
+    // Anchor: Preference is before stage_log, fallback is after the status dashboard
+    var target = frm.fields_dict.stage_log;
+    var $anchor = (target && target.$wrapper && target.$wrapper.length) ? target.$wrapper : null;
+    if (!$anchor) {
+        var dash = frm.fields_dict.status_dashboard_html;
+        $anchor = (dash && dash.$wrapper && dash.$wrapper.length) ? dash.$wrapper : null;
+    }
 
-        var target = frm.fields_dict.stage_log;
-        if (target && target.$wrapper) {
-            target.$wrapper.before($panel);
+    if (!frm._log_panel) {
+        var html = '<div class="agent-live-log-panel">'
+            + '<div class="agent-log-header">'
+            + '<span class="agent-log-title">Live Agent Log</span>'
+            + '<span class="agent-log-status indicator-pill whitespace-nowrap yellow" style="font-size: 11px;"></span>'
+            + '</div>'
+            + '<div class="agent-log-container"></div>'
+            + '</div>';
+        
+        var $panel = $(html);
+
+        if ($anchor) {
+            $anchor.before($panel);
         } else {
-            frm.layout.wrapper.find('.form-layout').append($panel);
+            // Last resort: main wrapper
+            $(frm.wrapper).find('.form-body').append($panel);
         }
 
         frm._log_panel = $panel;
@@ -921,13 +933,42 @@ function setup_live_log_panel(frm) {
             if (!data || data.request_name !== frm.doc.name) return;
             append_log_entry(frm, data);
         });
+    } else {
+        // Re-attach if the DOM was wiped during reload_doc
+        if (!$.contains(document.documentElement, frm._log_panel[0])) {
+            if ($anchor) {
+                $anchor.before(frm._log_panel);
+            }
+        }
     }
 
     frm._log_panel.show();
     frm._log_status.text(status);
+
+    // Re-populate from history if panel was just re-attached or refreshed
+    if (frm._log_history && frm._log_history.length && frm._log_container.is(':empty')) {
+        frm._log_history.forEach(function (data) {
+            // We temporarily bypass the deduplication check in append_log_entry for this re-population
+            var old_ids = frm._last_entry_ids;
+            frm._last_entry_ids = []; 
+            append_log_entry(frm, data);
+            frm._last_entry_ids = old_ids;
+        });
+    }
 }
 
 function append_log_entry(frm, data) {
+    if (!frm._log_history) frm._log_history = [];
+    
+    // Check if this specific log entry is already in history to avoid duplicates after reload
+    var entry_id = (data.timestamp || '') + (data.type || '') + (data.tool_name || '') + (data.preview || '').substring(0, 50);
+    if (frm._last_entry_ids && frm._last_entry_ids.indexOf(entry_id) !== -1) return;
+    
+    frm._log_history.push(data);
+    if (!frm._last_entry_ids) frm._last_entry_ids = [];
+    frm._last_entry_ids.push(entry_id);
+    if (frm._last_entry_ids.length > 50) frm._last_entry_ids.shift();
+
     if (!frm._log_container) return;
 
     var time = data.timestamp ? data.timestamp.split(' ')[1] : '';

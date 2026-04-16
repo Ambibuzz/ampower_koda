@@ -124,6 +124,7 @@ def _get_doc_config(request_name: str) -> dict:
         "branch_prefix": (doc.branch_prefix or "ai-agent/").strip(),
         "git_user_name": (doc.git_user_name or "AI Agent").strip(),
         "git_user_email": (doc.git_user_email or "ai-agent@ampower.com").strip(),
+        "api_key": api_key,
     }
 
 

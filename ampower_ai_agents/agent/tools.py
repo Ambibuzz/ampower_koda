@@ -352,3 +352,64 @@ def read_doctype_schema(app_name: str, doctype_name: str) -> str:
         return f"DocType schema not found: {doctype_name}"
     except Exception as ex:
         return f"Error: {ex}"
+
+
+def validate_code(app_name: str, path: str) -> str:
+    """Check for syntax errors in a .py or .js file. Returns 'VALID' or detailed error."""
+    try:
+        full = _resolve_path(app_name, path)
+        if not os.path.isfile(full):
+            return f"VALIDATION_FAILED: Not a file: {path}"
+
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        if path.endswith(".py"):
+            try:
+                import ast
+                ast.parse(content)
+                return f"VALID: {path} has no syntax errors."
+            except SyntaxError as e:
+                return (
+                    f"SYNTAX_ERROR in {path} at line {e.lineno}, col {e.offset}: "
+                    f"{e.msg}\nLine content: {e.text.strip() if e.text else 'N/A'}"
+                )
+            except Exception as e:
+                return f"VALIDATION_ERROR: {e}"
+
+        elif path.endswith(".js"):
+            # Use node --check for reliable JS syntax validation in Linux
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ["node", "--check", full],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    return f"VALID: {path} has no syntax errors."
+                else:
+                    return f"SYNTAX_ERROR in {path}:\n{result.stderr.strip() or result.stdout.strip()}"
+            except FileNotFoundError:
+                # Basic bracket check if node is missing
+                stack = []
+                for i, char in enumerate(content):
+                    if char in "({[":
+                        stack.append((char, i))
+                    elif char in ")}]":
+                        if not stack:
+                            return f"SYNTAX_ERROR in {path}: Unmatched closing {char} near char {i}"
+                        top, _ = stack.pop()
+                        if (top == "(" and char != ")") or (top == "{" and char != "}") or (top == "[" and char != "]"):
+                            return f"SYNTAX_ERROR in {path}: Mismatched {top} and {char} near char {i}"
+                if stack:
+                    char, i = stack.pop()
+                    return f"SYNTAX_ERROR in {path}: Unclosed {char} starting at char {i}"
+                return f"VALID: {path} (basic check: brackets balanced)"
+            except Exception as e:
+                return f"VALIDATION_ERROR: {e}"
+
+        return f"SKIP: Validation not supported for this file type: {path}"
+    except Exception as ex:
+        return f"VALIDATION_FAILED: Error: {ex}"
