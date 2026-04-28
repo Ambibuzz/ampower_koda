@@ -46,7 +46,10 @@ DOCTYPE_NAME = "AI Agent Request"
 # ---------------------------------------------------------------------------
 
 def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
-    """Create LLM instance based on provider."""
+    """
+    Factory function to initialize the appropriate Large Language Model (LLM) 
+    based on the user's preferred provider and model.
+    """
     provider = (provider or "OpenAI").strip()
     model = (model or "gpt-4o-mini").strip()
     if provider == "Gemini":
@@ -341,6 +344,11 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 # ---------------------------------------------------------------------------
 
 def understand_node(state: dict) -> dict:
+    """
+    The 'Understanding' node. Here, the agent explores the codebase to build 
+     a comprehensive mental model of the relevant files and logic before 
+     attempting any planning.
+    """
     if state.get("error"):
         return {"error": state["error"]}
     logs = _log_stage(state, "Understanding", "started", "Exploring codebase to understand the request")
@@ -349,6 +357,7 @@ def understand_node(state: dict) -> dict:
         state.get("request_type", "Improvement"),
         request_name=state.get("request_name"),
     )
+    # The agent is given read-only tools for this phase to ensure a safe exploration.
     updates = _run_agent_turn(state, "Understanding", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_PLANNING)
     if updates.get("error"):
         logs = _log_stage({**state, "stage_log": logs}, "Understanding", "failed", updates["error"][:200])
@@ -363,7 +372,10 @@ def understand_node(state: dict) -> dict:
 
 
 def plan_node(state: dict) -> dict:
-    """Generate the implementation plan. NO tools — pure LLM synthesis from the understanding summary."""
+    """
+    The 'Planning' node. The agent synthesizes its discoveries from the 
+    Understanding phase into a concrete, step-by-step implementation plan.
+    """
     if state.get("error"):
         return {"error": state["error"]}
 
@@ -428,6 +440,10 @@ def plan_node(state: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def implement_node(state: dict) -> dict:
+    """
+    The 'Implementing' node. In this phase, the agent applies the approved plan 
+    by writing code and creating new files as needed.
+    """
     if state.get("error"):
         return {"error": state["error"]}
     attempt = (state.get("review_attempts") or 0) + 1
@@ -490,6 +506,10 @@ You MUST fix ALL of these issues in this attempt. Read the affected files first 
 
 
 def review_node(state: dict) -> dict:
+    """
+    The 'Reviewing' node. The agent takes an adversarial look at its own 
+    implementation to identify potential bugs, syntax errors, or missed requirements.
+    """
     if state.get("error"):
         return {"error": state["error"]}
     logs = _log_stage(state, "Reviewing", "started", "Reviewing implemented changes")
@@ -558,7 +578,10 @@ def _get_bench_env() -> dict:
 
 
 def bench_node(state: dict) -> dict:
-    """Run bench commands: migrate (if doctypes changed), build, clear-cache, supervisorctl restart."""
+    """
+    The 'Building' node. This node executes the necessary bench commands 
+    (like migrations or asset builds) to integrate the changes into the site.
+    """
     if state.get("error"):
         return {"error": state["error"]}
     logs = _log_stage(state, "Building", "started", "Running bench commands to apply changes")
@@ -640,7 +663,10 @@ def bench_node(state: dict) -> dict:
 
 
 def deploy_node(state: dict) -> dict:
-    """Create branch, commit, push, open PR."""
+    """
+    The 'Pushing' node. Finalizes the work by committing the changes to a branch, 
+    pushing to the remote repository, and optionally opening a pull request.
+    """
     if state.get("error"):
         return {"error": state["error"]}
     logs = _log_stage(state, "Pushing", "started", "Creating branch, committing, pushing and opening PR")
@@ -739,7 +765,10 @@ def should_retry_implement(state: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def build_planning_graph():
-    """Build the planning-phase graph: understand -> plan -> END."""
+    """
+    Constructs the state machine for the Planning Phase.
+    Flow: Understand the code → Draft a Plan.
+    """
     workflow = StateGraph(AgentState)
     workflow.add_node("understand", understand_node)
     workflow.add_node("plan", plan_node)
@@ -752,8 +781,10 @@ def build_planning_graph():
 
 
 def build_execution_graph():
-    """Build the execution-phase graph: implement -> review -> (retry?) -> END.
-    Bench commands and deploy happen separately after user approval."""
+    """
+    Constructs the state machine for the Implementation Phase.
+    Flow: Implement Changes → Review Work → (Retry if needed).
+    """
     workflow = StateGraph(AgentState)
     workflow.add_node("implement", implement_node)
     workflow.add_node("review", review_node)

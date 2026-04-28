@@ -9,7 +9,10 @@ import frappe
 
 
 def get_repo_root(app_name: str) -> str:
-    """Return the git repository root for the given app."""
+    """
+    Identifies the root directory of the Git repository for a given app. 
+    This is the base path for all Git operations.
+    """
     if not app_name:
         frappe.throw("Target App Name is required")
     app_path = frappe.get_app_path(app_name)
@@ -17,7 +20,10 @@ def get_repo_root(app_name: str) -> str:
 
 
 def run_git(cmd: list[str], cwd: str | None = None) -> tuple[bool, str]:
-    """Run a git command. Returns (success, output)."""
+    """
+    Executes a Git command in the specified directory. 
+    Returns a success flag and the combined output of the command.
+    """
     try:
         result = subprocess.run(
             ["git"] + cmd,
@@ -50,7 +56,10 @@ def configure_git_identity(
     git_user_name: str = "AI Agent",
     git_user_email: str = "ai-agent@ampower.com",
 ) -> tuple[bool, str]:
-    """Set git user.name and user.email at repo-level config."""
+    """
+    Configures the local Git identity for the repository. 
+    This ensures that all commits made by the agent are clearly attributed.
+    """
     name = (git_user_name or "AI Agent").strip()
     email = (git_user_email or "ai-agent@ampower.com").strip()
     root = get_repo_root(app_name)
@@ -62,7 +71,10 @@ def configure_git_identity(
 
 
 def create_branch(app_name: str, branch_name: str, base_branch: str = "main") -> tuple[bool, str]:
-    """Create and checkout a new branch from base_branch."""
+    """
+    Creates and switches to a new working branch starting from the base branch.
+    This provides a safe sandbox for the agent's changes.
+    """
     root = get_repo_root(app_name)
     run_git(["fetch", "origin", base_branch], cwd=root)
     ok, out = run_git(["checkout", "-b", branch_name, base_branch], cwd=root)
@@ -72,7 +84,10 @@ def create_branch(app_name: str, branch_name: str, base_branch: str = "main") ->
 
 
 def commit_changes(app_name: str, message: str, git_user_name: str = "AI Agent", git_user_email: str = "ai-agent@ampower.com") -> tuple[bool, str]:
-    """Stage all changes and commit."""
+    """
+    Stages all modified and new files and records them in a new commit.
+    This finalizes the implementation phase on the local machine.
+    """
     root = get_repo_root(app_name)
 
     ok, out = configure_git_identity(app_name, git_user_name, git_user_email)
@@ -90,7 +105,10 @@ def commit_changes(app_name: str, message: str, git_user_name: str = "AI Agent",
 
 
 def push_branch(app_name: str, branch_name: str, repo_url: str, token: str) -> tuple[bool, str]:
-    """Push branch to origin using explicit credentials from the request."""
+    """
+    Uploads the local branch to the remote GitHub repository 
+    using the provided credentials.
+    """
     if not repo_url:
         return False, "GitHub URL not provided"
     
@@ -127,7 +145,10 @@ def create_pull_request(
     token: str,
     base_branch: str = "main",
 ) -> tuple[bool, str, str | None, int | None]:
-    """Create a PR via GitHub API. Returns (success, message, pr_url, pr_number)."""
+    """
+    Uses the GitHub API to create a new Pull Request for the pushed branch. 
+    This is the final step in the agent's collaborative workflow.
+    """
     import requests as http_requests
 
     if not token or not repo_url:
@@ -162,9 +183,10 @@ def create_pull_request(
 
 
 def generate_branch_name(request_name: str, branch_prefix: str = "ai-agent/", app_name: str = "") -> str:
-    """Generate a safe, unique branch name from request name.
-    When app_name is provided, checks existing local branches and appends
-    _v0, _v1, ... if the base name is already taken."""
+    """
+    Generates a unique and safe Git branch name based on the request.
+    If the name is already taken, it appends a version suffix to avoid conflicts.
+    """
     prefix = (branch_prefix or "ai-agent/").strip()
     safe = re.sub(r"[^a-zA-Z0-9-]", "-", request_name).strip("-")
     base_name = f"{prefix}{safe}"
@@ -194,15 +216,19 @@ def generate_branch_name(request_name: str, branch_prefix: str = "ai-agent/", ap
 
 
 def get_current_branch(app_name: str) -> str:
-    """Return the name of the currently checked-out branch, or empty string."""
+    """
+    Identifies the name of the branch that is currently active in the repository.
+    """
     root = get_repo_root(app_name)
     ok, out = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
     return out.strip() if ok else ""
 
 
 def checkout_base(app_name: str, base_branch: str = "main") -> tuple[bool, str]:
-    """Discard uncommitted changes and checkout the base branch.
-    This is the manual checkout function — only called explicitly by the user."""
+    """
+    Discards all uncommitted changes and returns the repository to its 
+    base branch. This is the primary 'reset' tool for the user.
+    """
     root = get_repo_root(app_name)
 
     run_git(["reset", "--hard", "HEAD"], cwd=root)

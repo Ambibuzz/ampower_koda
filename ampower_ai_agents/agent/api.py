@@ -13,10 +13,13 @@ DOCTYPE_NAME = "AI Agent Request"
 
 
 def _validate_provider_key(doc):
-    """Check that the AI provider key is configured."""
+    """
+    Verifies that the AI provider and its API key are correctly configured in settings.
+    This check ensures the agent has its 'brain' ready before it attempts any work.
+    """
     settings = frappe.get_single("AI Agents Settings")
     if not settings.enable_ai_agent:
-        frappe.throw("AI Coding Agent is disabled in settings")
+        frappe.throw("The AI Coding Agent is currently disabled in your settings. Please enable it to proceed.")
     provider = (doc.ai_provider or settings.default_ai_provider or "OpenAI").strip()
     key_checks = {
         "OpenAI": ("openai_api_key", "OpenAI API key"),
@@ -25,19 +28,29 @@ def _validate_provider_key(doc):
     }
     field, label = key_checks.get(provider, key_checks["OpenAI"])
     if not getattr(settings, field, None):
-        frappe.throw(f"{label} is not set in AI Agents Settings")
+        frappe.throw(f"It looks like the {label} hasn't been set in the AI Agents Settings. Please provide a valid key to continue.")
 
+
+# --- Core Workflow Management ---
+# The following functions manage the high-level transitions of the agent's lifecycle.
 
 @frappe.whitelist()
 def start_agent(request_name: str):
-    """Start from scratch: explore codebase → create plan → await approval."""
+    """
+    Initiates the full workflow from scratch. 
+    This guides the agent through exploring the codebase and drafting a detailed plan 
+    for your review before any implementation begins.
+    """
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw("A valid Request name is required to begin the agent's work.")
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    
+    # We only allow starting the agent if it is currently idle or in a terminal state.
+    # This prevents accidental overlapping runs on the same request.
     restartable = ("Queued", "Failed", "Cancelled", "Completed", "Awaiting Approval", "Awaiting Push Approval")
     if doc.status not in restartable:
-        frappe.throw(f"Cannot start agent — status is '{doc.status}'. Agent is currently running.")
+        frappe.throw(f"The agent is already busy (status: '{doc.status}'). Please wait for the current task to finish before starting over.")
 
     _validate_provider_key(doc)
 
@@ -58,22 +71,26 @@ def start_agent(request_name: str):
         timeout=1800,
         request_name=request_name,
     )
-    return {"status": "ok", "message": "Planning phase started"}
+    return {"status": "ok", "message": "I've started the planning phase for you. I'll let you know once the plan is ready for review."}
 
 
 @frappe.whitelist()
 def execute_existing_plan(request_name: str):
-    """Skip explore+plan — go straight to execution using the existing plan as checkpoint."""
+    """
+    Skips the exploration and planning phases to go straight to implementation.
+    This is useful if you have a pre-saved plan on the request that you want to execute immediately.
+    """
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw("A valid Request name is required to execute the plan.")
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if not (doc.agent_plan or "").strip():
-        frappe.throw("No plan exists on this request. Use 'Start Agent' to create one first.")
+        frappe.throw("I couldn't find a plan to execute for this request. Please use 'Start Agent' to create one first.")
 
+    # Implementation can only start if we are at the approval stage or have finished a previous run.
     allowed = ("Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval")
     if doc.status not in allowed:
-        frappe.throw(f"Cannot execute — status is '{doc.status}'. Agent is currently running.")
+        frappe.throw(f"I can't execute the plan right now because the agent is currently '{doc.status}'.")
 
     _validate_provider_key(doc)
 
@@ -91,18 +108,21 @@ def execute_existing_plan(request_name: str):
         timeout=1800,
         request_name=request_name,
     )
-    return {"status": "ok", "message": "Executing existing plan (skipping explore & plan)"}
+    return {"status": "ok", "message": "I'm starting the implementation phase using the existing plan. I'll keep you updated on the progress."}
 
 
 @frappe.whitelist()
 def approve_plan(request_name: str, edited_plan: str = None):
-    """Approve the plan and enqueue the execution phase."""
+    """
+    Confirms the plan and begins the implementation phase.
+    You can optionally provide an edited version of the plan if you made manual adjustments.
+    """
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw("A valid Request name is required to approve the plan.")
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status != "Awaiting Approval":
-        frappe.throw(f"Cannot approve — status is '{doc.status}'.")
+        frappe.throw(f"I can't approve this plan because the request is currently in '{doc.status}' status, not 'Awaiting Approval'.")
 
     if edited_plan is not None and edited_plan.strip():
         frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", edited_plan.strip()[:50000])
@@ -119,7 +139,7 @@ def approve_plan(request_name: str, edited_plan: str = None):
         timeout=1800,
         request_name=request_name,
     )
-    return {"status": "ok", "message": "Execution phase started"}
+    return {"status": "ok", "message": "Plan approved! I'm now moving on to the implementation phase."}
 
 
 @frappe.whitelist()
