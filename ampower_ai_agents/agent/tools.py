@@ -24,10 +24,10 @@ def _resolve_path(app_name: str, relative_path: str) -> str:
 
 
 def list_directory(app_name: str, path: str) -> str:
-    """
-    Lists the files and subdirectories at a specific path. 
-    This is useful for drilling down into a folder once you've identified 
-    it as relevant.
+    """List files and directories at path (relative to app root).
+
+    - Directories are prefixed with [DIR] in the output.
+    - Files are listed with their names.
     """
     try:
         full = _resolve_path(app_name, path)
@@ -51,10 +51,13 @@ IGNORE_DIRS = {
 
 
 def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
-    """
-    Recursively scans the app's directory tree to find files matching a pattern.
-    This provides a high-level overview of the codebase structure, helping 
-    you locate relevant modules or DocTypes.
+    """Recursively list the app directory tree. Returns an indented tree view.
+
+    - path: relative to app root.
+    - pattern: optional filename glob filter (e.g. '*.py', '*.json').
+    - max_depth: depth of recursion (defaults to 6).
+
+    Call this FIRST to map the codebase structure before reading individual files.
     """
     try:
         import fnmatch
@@ -95,10 +98,13 @@ def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
 
 
 def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0) -> str:
-    """
-    Reads the content of a file, optionally within a specific line range.
-    Line numbers are included to ensure precise references when planning or 
-    applying edits.
+    """Read a file (path relative to app root) with line numbers.
+
+    - If start_line and end_line are both > 0, reads only that range (1-indexed, inclusive).
+    - Otherwise reads the full file.
+
+    Returns numbered lines (format: '    1 | content') so that line numbers can be used 
+    directly with replace_lines / insert_lines.
     """
     try:
         full = _resolve_path(app_name, path)
@@ -127,10 +133,12 @@ def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0) 
 
 
 def search_code(app_name: str, pattern: str, path: str = "") -> str:
-    """
-    Searches the codebase for a specific text pattern or regular expression.
-    This is the primary tool for finding where functions are defined or 
-    where specific logic is used across the app.
+    """Search for a regex pattern in the codebase.
+
+    - pattern: A standard regex pattern to search for.
+    - path: Optional directory filter (relative to app root).
+
+    Returns matches with 3 lines of surrounding context and line numbers.
     """
     try:
         root = _resolve_path(app_name, path) if path else _app_root(app_name)
@@ -176,9 +184,10 @@ def search_code(app_name: str, pattern: str, path: str = "") -> str:
 
 
 def write_file(app_name: str, path: str, content: str) -> str:
-    """
-    Creates a new file or completely overwrites an existing one.
-    Use this sparingly for existing files; prefer 'replace_lines' for targeted edits.
+    """Write or overwrite a file at the given relative path.
+
+    - Automatically creates parent directories if they don't exist.
+    - Only use this for creating NEW files or completely replacing content.
     """
     try:
         full = _resolve_path(app_name, path)
@@ -191,9 +200,12 @@ def write_file(app_name: str, path: str, content: str) -> str:
 
 
 def edit_file(app_name: str, path: str, old_string: str, new_string: str) -> str:
-    """
-    Replaces a specific block of text with a new version.
-    This requires an exact match for the 'old_string', including whitespace.
+    """Replace the FIRST occurrence of old_string with new_string in a file.
+
+    - path: relative to app root.
+    - old_string: Must match EXACTLY, including whitespace and indentation.
+
+    For multi-line edits or replacing specific ranges, use replace_lines instead.
     """
     try:
         full = _resolve_path(app_name, path)
@@ -220,10 +232,12 @@ def edit_file(app_name: str, path: str, old_string: str, new_string: str) -> str
 
 
 def replace_lines(app_name: str, path: str, start_line: int, end_line: int, new_content: str) -> str:
-    """
-    Replaces a specific range of lines in a file with new content.
-    This is the most reliable way to edit large files, as it targets 
-    precise line numbers discovered during the reading phase.
+    """Replace lines start_line through end_line (1-indexed, inclusive) with new_content.
+
+    - Path: relative to app root.
+    - Use read_file first to identify the exact line range.
+
+    This is the PREFERRED tool for multi-line modifications.
     """
     try:
         full = _resolve_path(app_name, path)
@@ -267,9 +281,11 @@ def replace_lines(app_name: str, path: str, start_line: int, end_line: int, new_
 
 
 def insert_lines(app_name: str, path: str, after_line: int, new_content: str) -> str:
-    """
-    Inserts new lines into a file immediately after the specified line number.
-    Perfect for adding new functions or imports without disturbing existing code.
+    """Insert new_content AFTER the specified 1-indexed line number.
+
+    - path: relative to app root.
+    - after_line: 1-indexed line number.
+    - Use after_line=0 to insert at the very beginning of the file.
     """
     try:
         full = _resolve_path(app_name, path)
@@ -300,9 +316,8 @@ def insert_lines(app_name: str, path: str, after_line: int, new_content: str) ->
 
 def get_file_outline(app_name: str, path: str) -> str:
     """
-    Extracts a high-level summary of a file's structure, showing only 
-    class and function definitions. Use this to quickly navigate 
-    large files without reading every line.
+    Extracts class and function definitions from a file (.py, .js, .ts).
+    Includes line numbers for quick navigation.
     """
     try:
         full = _resolve_path(app_name, path)
@@ -363,9 +378,8 @@ def get_file_outline(app_name: str, path: str) -> str:
 
 def read_doctype_schema(app_name: str, doctype_name: str) -> str:
     """
-    Reads the underlying JSON schema of a Frappe DocType.
-    This is essential for understanding field names, types, and 
-    database relationships.
+    Reads the JSON schema file for a Frappe DocType. 
+    Useful for identifying fieldnames and properties.
     """
     try:
         app_root = _app_root(app_name)
@@ -382,10 +396,12 @@ def read_doctype_schema(app_name: str, doctype_name: str) -> str:
 
 
 def validate_code(app_name: str, path: str) -> str:
-    """
-    Performs a syntax check on a Python or JavaScript file.
-    Always run this after an edit to catch any accidental typos or 
-    broken indentation before they cause runtime errors.
+    """Check for syntax errors in a .py or .js file (path relative to app root).
+
+    - Returns 'VALID' if no syntax errors are found.
+    - Returns detailed error message with line numbers if syntax is invalid.
+    
+    ALWAYS call this after any edit to verify that the file remains functional.
     """
     try:
         full = _resolve_path(app_name, path)

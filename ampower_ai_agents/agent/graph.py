@@ -168,68 +168,70 @@ def _make_tools(app_name: str, read_only: bool = False):
 
     @tool
     def find_files(pattern: str = "", max_depth: int = 6) -> str:
-        """Recursively list the entire app directory tree. Returns an indented tree view.
-        Use pattern to filter by filename glob (e.g. '*.py', '*.json').
+        """Recursively list the app directory tree using a glob-style pattern.
+        Returns an indented tree view. max_depth defaults to 6.
         Call this FIRST to map the codebase structure before reading individual files."""
         return agent_tools.find_files(app_name, pattern, max_depth)
 
     @tool
     def list_directory(path: str) -> str:
-        """List files and directories at path (relative to app root)."""
+        """List files and directories at path (relative to app root). 
+        Directories are prefixed with [DIR] in the output."""
         return agent_tools.list_directory(app_name, path)
 
     @tool
     def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
-        """Read file with line numbers. Path relative to app root.
-        Optionally pass start_line and end_line (1-indexed, inclusive) to read a specific range.
+        """Read a file (path relative to app root) with line numbers.
+        - If start_line and end_line are both > 0, reads only that range (1-indexed, inclusive).
+        - Otherwise reads the full file.
         ALWAYS use this to see exact line numbers before editing."""
         return agent_tools.read_file(app_name, path, start_line, end_line)
 
     @tool
     def search_code(pattern: str, path: str = "") -> str:
-        """Search for regex pattern in codebase with line numbers and context.
-        Returns matches with 2 lines of surrounding context. path is optional directory filter."""
+        """Search for a regex pattern in the codebase. 
+        Returns matches with 3 lines of surrounding context. path is optional directory filter."""
         return agent_tools.search_code(app_name, pattern, path)
 
     @tool
     def read_doctype_schema(doctype_name: str) -> str:
-        """Read DocType JSON schema. doctype_name e.g. 'Sales Order'."""
+        """Read DocType JSON schema file. doctype_name e.g. 'Sales Order'."""
         return agent_tools.read_doctype_schema(app_name, doctype_name)
 
     @tool
     def get_file_outline(path: str) -> str:
-        """Get lightweight outline of a Python/JS file — class/function signatures with line numbers.
+        """Get lightweight outline of a Python/JS/TS file — class/function signatures with line numbers.
         Much cheaper than reading the whole file. Use to understand structure before reading specific sections."""
         return agent_tools.get_file_outline(app_name, path)
 
     @tool
     def validate_code(path: str) -> str:
         """Check for syntax errors in a .py or .js file. Path relative to app root.
-        ALWAYS call this after editing a file to ensure you didn't break anything."""
+        ALWAYS call this after editing to verify that no syntax errors were introduced."""
         return agent_tools.validate_code(app_name, path)
 
     out = [find_files, list_directory, read_file, search_code, read_doctype_schema, get_file_outline, validate_code]
     if not read_only:
         @tool
         def write_file(path: str, content: str) -> str:
-            """Write or overwrite a file. Path relative to app root."""
+            """Write or overwrite a file at the given relative path. Parent directories are created if needed."""
             return agent_tools.write_file(app_name, path, content)
 
         @tool
         def edit_file(path: str, old_string: str, new_string: str) -> str:
-            """Replace old_string with new_string in file (first occurrence).
-            old_string must match EXACTLY. For large files, prefer replace_lines instead."""
+            """Replace FIRST occurrence of old_string with new_string in file.
+            Requires EXACT match including whitespace. For large files, prefer replace_lines."""
             return agent_tools.edit_file(app_name, path, old_string, new_string)
 
         @tool
         def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
             """Replace lines start_line through end_line (1-indexed, inclusive) with new_content.
-            PREFERRED for large files. Use read_file first to see exact line numbers."""
+            The most reliable tool for editing. Use read_file first to identify the exact line range."""
             return agent_tools.replace_lines(app_name, path, start_line, end_line, new_content)
 
         @tool
         def insert_lines(path: str, after_line: int, new_content: str) -> str:
-            """Insert new_content AFTER the specified line number.
+            """Insert new_content AFTER the specified 1-indexed line number.
             Use after_line=0 to insert at the beginning of the file."""
             return agent_tools.insert_lines(app_name, path, after_line, new_content)
 

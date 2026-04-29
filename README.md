@@ -73,7 +73,7 @@ Each request goes through a multi-step pipeline with human approval gates. You c
 5. Click Start Agent.
 
 ### Persistence
-The app automatically remembers your most used configuration (Target App Name, GitHub Repo URL, GitHub Token, AI Provider) and fills them in for every new request you create.
+The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in AI Agents Settings as the encrypted default).
 
 
 ## Approval Steps
@@ -109,7 +109,7 @@ Each request carries its own configuration:
 - Branch Prefix -- prefix for agent-created branches (default: ai-agent/).
 - Git User Name / Email -- identity for commits.
 
-These fields are remembered across requests using user settings.
+These fields (except the GitHub Token) are remembered across requests using user settings.
 
 
 ## Custom Prompt Configuration

@@ -5,6 +5,7 @@ import os
 import subprocess
 
 import frappe
+from frappe import _
 
 from ampower_ai_agents.agent.git_ops import checkout_base
 from ampower_ai_agents.agent.graph import _get_bench_env
@@ -19,7 +20,7 @@ def _validate_provider_key(doc):
     """
     settings = frappe.get_single("AI Agents Settings")
     if not settings.enable_ai_agent:
-        frappe.throw("The AI Coding Agent is currently disabled in your settings. Please enable it to proceed.")
+        frappe.throw(_("AI Coding Agent is disabled in AI Agents Settings."))
     provider = (doc.ai_provider or settings.default_ai_provider or "OpenAI").strip()
     key_checks = {
         "OpenAI": ("openai_api_key", "OpenAI API key"),
@@ -28,7 +29,7 @@ def _validate_provider_key(doc):
     }
     field, label = key_checks.get(provider, key_checks["OpenAI"])
     if not getattr(settings, field, None):
-        frappe.throw(f"It looks like the {label} hasn't been set in the AI Agents Settings. Please provide a valid key to continue.")
+        frappe.throw(_("{0} is not set in AI Agents Settings.").format(label))
 
 
 # --- Core Workflow Management ---
@@ -42,7 +43,7 @@ def start_agent(request_name: str):
     for your review before any implementation begins.
     """
     if not request_name:
-        frappe.throw("A valid Request name is required to begin the agent's work.")
+        frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     
@@ -50,7 +51,7 @@ def start_agent(request_name: str):
     # This prevents accidental overlapping runs on the same request.
     restartable = ("Queued", "Failed", "Cancelled", "Completed", "Awaiting Approval", "Awaiting Push Approval")
     if doc.status not in restartable:
-        frappe.throw(f"The agent is already busy (status: '{doc.status}'). Please wait for the current task to finish before starting over.")
+        frappe.throw(_("Agent is already busy (status: {0}).").format(doc.status))
 
     _validate_provider_key(doc)
 
@@ -71,7 +72,7 @@ def start_agent(request_name: str):
         timeout=1800,
         request_name=request_name,
     )
-    return {"status": "ok", "message": "I've started the planning phase for you. I'll let you know once the plan is ready for review."}
+    return {"status": "ok", "message": _("Planning phase started.")}
 
 
 @frappe.whitelist()
@@ -81,16 +82,16 @@ def execute_existing_plan(request_name: str):
     This is useful if you have a pre-saved plan on the request that you want to execute immediately.
     """
     if not request_name:
-        frappe.throw("A valid Request name is required to execute the plan.")
+        frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if not (doc.agent_plan or "").strip():
-        frappe.throw("I couldn't find a plan to execute for this request. Please use 'Start Agent' to create one first.")
+        frappe.throw(_("No plan found for this request."))
 
     # Implementation can only start if we are at the approval stage or have finished a previous run.
     allowed = ("Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval")
     if doc.status not in allowed:
-        frappe.throw(f"I can't execute the plan right now because the agent is currently '{doc.status}'.")
+        frappe.throw(_("Cannot execute plan. Agent status is {0}.").format(doc.status))
 
     _validate_provider_key(doc)
 
@@ -108,7 +109,7 @@ def execute_existing_plan(request_name: str):
         timeout=1800,
         request_name=request_name,
     )
-    return {"status": "ok", "message": "I'm starting the implementation phase using the existing plan. I'll keep you updated on the progress."}
+    return {"status": "ok", "message": _("Implementation phase started.")}
 
 
 @frappe.whitelist()
@@ -118,11 +119,11 @@ def approve_plan(request_name: str, edited_plan: str = None):
     You can optionally provide an edited version of the plan if you made manual adjustments.
     """
     if not request_name:
-        frappe.throw("A valid Request name is required to approve the plan.")
+        frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status != "Awaiting Approval":
-        frappe.throw(f"I can't approve this plan because the request is currently in '{doc.status}' status, not 'Awaiting Approval'.")
+        frappe.throw(_("Cannot approve plan. Agent status is {0}.").format(doc.status))
 
     if edited_plan is not None and edited_plan.strip():
         frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", edited_plan.strip()[:50000])
@@ -139,18 +140,18 @@ def approve_plan(request_name: str, edited_plan: str = None):
         timeout=1800,
         request_name=request_name,
     )
-    return {"status": "ok", "message": "Plan approved! I'm now moving on to the implementation phase."}
+    return {"status": "ok", "message": _("Plan approved. Starting implementation.")}
 
 
 @frappe.whitelist()
 def reject_plan(request_name: str):
     """Reject the plan and set status to Cancelled."""
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status != "Awaiting Approval":
-        frappe.throw(f"Cannot reject — status is '{doc.status}'.")
+        frappe.throw(_("Cannot reject. Agent status is {0}.").format(doc.status))
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Cancelled")
     frappe.db.commit()
@@ -158,10 +159,10 @@ def reject_plan(request_name: str):
     frappe.publish_realtime("agent_progress", {
         "request_name": request_name,
         "status": "Cancelled",
-        "message": "Plan rejected by user",
+        "message": _("Plan rejected by user"),
     }, user=doc.owner)
 
-    return {"status": "ok", "message": "Plan rejected"}
+    return {"status": "ok", "message": _("Plan rejected.")}
 
 
 @frappe.whitelist()
@@ -169,11 +170,11 @@ def approve_bench(request_name: str, commands: str = None):
     """Approve running bench commands, then branch+commit.
     commands is an optional JSON array of edited/filtered commands from the UI."""
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status != "Awaiting Bench Approval":
-        frappe.throw(f"Cannot approve bench — status is '{doc.status}'.")
+        frappe.throw(_("Cannot approve bench. Agent status is {0}.").format(doc.status))
 
     if commands:
         import json as _json
@@ -206,7 +207,7 @@ def approve_bench(request_name: str, commands: str = None):
 
     return {
         "status": "ok",
-        "message": f"Running {len(cmds)} bench commands...",
+        "message": _("Running {0} bench commands...").format(len(cmds)),
     }
 
 
@@ -215,16 +216,16 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     """Approve pushing the branch and/or creating a PR.
     push_branch=1 pushes the branch to remote. create_pr=1 creates a pull request."""
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status != "Awaiting Push Approval":
-        frappe.throw(f"Cannot push — status is '{doc.status}'.")
+        frappe.throw(_("Cannot push. Agent status is {0}.").format(doc.status))
 
     push_branch = int(push_branch or 0)
     create_pr = int(create_pr or 0)
     if not push_branch and not create_pr:
-        frappe.throw("Select at least one action (push branch or create PR).")
+        frappe.throw(_("Select at least one action (push branch or create PR)."))
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
     frappe.db.commit()
@@ -238,36 +239,36 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         do_pr=bool(create_pr),
     )
 
-    actions = []
-    if push_branch:
-        actions.append(f"pushing branch {doc.branch_name}")
-    if create_pr:
-        actions.append("creating PR")
-    msg = " and ".join(actions) + "..."
-    return {"status": "ok", "message": msg.capitalize()}
+    if push_branch and create_pr:
+        msg = _("Pushing branch and creating PR...")
+    elif push_branch:
+        msg = _("Pushing branch {0}...").format(doc.branch_name)
+    else:
+        msg = _("Creating PR...")
+    return {"status": "ok", "message": msg}
 
 
 @frappe.whitelist()
 def checkout_base_branch(request_name: str):
     """Manually checkout the base branch for the target app."""
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     app_name = (doc.target_app_name or "").strip()
     base_branch = (doc.base_branch or "main").strip()
 
     if not app_name:
-        frappe.throw("Target App Name is not set on this request")
+        frappe.throw(_("Target App Name is not set."))
 
     ok, msg = checkout_base(app_name, base_branch)
     if not ok:
-        frappe.throw(f"Failed to checkout base branch: {msg}")
+        frappe.throw(_("Failed to checkout base branch: {0}").format(msg))
 
     frappe.publish_realtime("agent_progress", {
         "request_name": request_name,
         "status": doc.status,
-        "message": f"Checked out {base_branch}: {msg}",
+        "message": _("Checked out {0}: {1}").format(base_branch, msg),
     }, user=doc.owner)
 
     return {"status": "ok", "message": msg}
@@ -277,7 +278,7 @@ def checkout_base_branch(request_name: str):
 def get_default_bench_commands(request_name: str):
     """Return the default bench commands for a request's target app."""
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     app_name = (doc.target_app_name or "").strip()
@@ -298,7 +299,7 @@ def get_default_bench_commands(request_name: str):
 def run_selected_bench_commands(request_name: str, commands: str = None):
     """Run user-selected bench commands. commands is a JSON array of command strings."""
     if not request_name:
-        frappe.throw("Request name is required")
+        frappe.throw(_("Request name is required."))
 
     import json as _json
     cmds = []
@@ -306,10 +307,10 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
         try:
             cmds = _json.loads(commands)
         except (ValueError, TypeError):
-            frappe.throw("Invalid commands format")
+            frappe.throw(_("Invalid commands format."))
 
     if not cmds or not isinstance(cmds, list):
-        frappe.throw("No commands provided")
+        frappe.throw(_("No commands provided."))
 
     bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
     bench_root = os.path.normpath(bench_root)
@@ -368,7 +369,7 @@ def cancel_agent_request(request_name: str):
     """Cancel a queued or running request (best-effort)."""
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status in ("Completed", "Failed", "Cancelled"):
-        frappe.msgprint("Request already finished.")
+        frappe.msgprint(_("Request already finished."))
         return
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Cancelled")
     frappe.db.commit()
