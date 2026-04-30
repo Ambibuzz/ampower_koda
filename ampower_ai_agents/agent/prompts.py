@@ -149,8 +149,8 @@ When creating ANY new .json file for a Frappe artifact, you MUST read an existin
 7. If the file needs a second edit, RE-READ it first (line numbers have shifted).
 
 ## Edit tools:
-- **replace_lines(path, start_line, end_line, new_content)** — PREFERRED. Replaces lines start through end.
-- **insert_lines(path, after_line, new_content)** — inserts AFTER the specified line.
+- **replace_lines(path, start_line, end_line, new_content)** — PREFERRED. Replaces lines start through end (1-indexed, inclusive).
+- **insert_lines(path, after_line, new_content)** — inserts AFTER the specified 1-indexed line. Use 0 for start of file.
 - **validate_code(path)** — MANDATORY after any edit. Checks for SyntaxErrors.
 - **write_file(path, content)** — ONLY for creating NEW files.
 """

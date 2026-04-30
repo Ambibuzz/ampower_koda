@@ -1,6 +1,13 @@
-# AmPower AI Agents
-
 AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improvement -- the agent reads the target app codebase, creates a plan, implements the changes, and opens a pull request on GitHub.
+
+
+## Key Features
+
+- **Live Monitoring**: Track agent progress in real-time with an auto-scrolling log console and visual status dashboard.
+- **Human-in-the-loop**: Full control over every phase. Review and edit implementation plans and bench commands before they run.
+- **Smart Exploration**: Powered by LangGraph, the agent performs deep codebase analysis to minimize hallucinations.
+- **Git Native**: Automatically manages branches and creates clean Pull Requests on GitHub.
+- **Multi-Model Support**: Choose between OpenAI, Google Gemini, or Anthropic Claude.
 
 
 ## Installation
@@ -37,7 +44,7 @@ Python dependencies (installed automatically):
 
 ## How It Works
 
-Each request goes through a multi-step pipeline with human approval gates:
+Each request goes through a multi-step pipeline with human approval gates. You can monitor the progress in real-time via the **Live Log Panel** and the visual **Status Dashboard** at the top of each request.
 
     1. Explore    -- agent reads the target app codebase
     2. Plan       -- agent creates a detailed implementation plan
@@ -65,6 +72,9 @@ Each request goes through a multi-step pipeline with human approval gates:
 4. Save the document.
 5. Click Start Agent.
 
+### Persistence
+The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in AI Agents Settings as the encrypted default).
+
 
 ## Approval Steps
 
@@ -72,10 +82,10 @@ Plan Approval:
 After the agent explores the codebase and creates a plan, the status changes to Awaiting Approval. Read the plan in the Agent Plan section. You can edit it directly -- it is a Markdown editor. Click Approve Plan to proceed, or Reject Plan to cancel.
 
 Bench Command Approval:
-After implementation and code review, the agent computes which bench commands are needed (migrate, build, clear-cache, restart). The status changes to Awaiting Bench Approval. Each command is shown as an editable checklist -- uncheck commands you want to skip, or edit them. Click Approve Bench Commands.
+After implementation and code review, the agent computes which bench commands are needed (migrate, build, clear-cache, restart). The status changes to Awaiting Bench Approval. Each command is shown as an **editable checklist** -- you can uncheck commands you want to skip, or edit the command strings directly before approving them.
 
 Push Approval:
-After bench commands run and changes are committed to a branch, the status changes to Awaiting Push Approval. You can test the changes on your instance first. Click Approve Push to push the branch and create the pull request.
+After bench commands run and changes are committed to a branch, the status changes to Awaiting Push Approval. You can test the changes on your instance first. Review the branch and repository details, then click Approve Push to commit, push, and create the pull request.
 
 
 ## Buttons Available at All Times
@@ -99,7 +109,7 @@ Each request carries its own configuration:
 - Branch Prefix -- prefix for agent-created branches (default: ai-agent/).
 - Git User Name / Email -- identity for commits.
 
-These fields are remembered across requests using user settings.
+These fields (except the GitHub Token) are remembered across requests using user settings.
 
 
 ## Custom Prompt Configuration
@@ -129,6 +139,20 @@ Gemini (Google AI Studio):
 
 Claude (Anthropic):
 - claude-sonnet-4, claude-3-5-sonnet, claude-3-5-haiku
+
+
+## Troubleshooting
+
+- **No changes produced**: If the agent finishes but no diff is visible, try a more capable model (e.g., GPT-4o or Claude 3.5 Sonnet) or provide more detail in the description.
+- **Build failures**: Ensure Node.js v18+ is installed on your server. Using `nvm` is highly recommended.
+- **Migration errors**: Check the "Bench Commands" log for specific SQL or JSON schema errors.
+- **Token Issues**: Ensure your GitHub PAT has the `repo` scope and is not expired.
+
+
+## In-App Help
+
+For more detailed guidance and tips, search for **AI Agents Help** in your Frappe search bar.
+
 
 ## License
 

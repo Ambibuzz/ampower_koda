@@ -129,7 +129,11 @@ def _get_doc_config(request_name: str) -> dict:
 
 
 def _update_status(request_name: str, user: str, status: str, message: str = "", **kwargs):
-    """Update request status, persist fields, and publish realtime event."""
+    """
+    Updates the request's status and persists key fields to the database.
+    This function also broadcasts the progress via realtime events, acting as the
+    primary 'voice' of the agent for the end-user.
+    """
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", status)
     allowed_fields = [
         "branch_name", "pr_url", "pr_number", "conversation_log",
@@ -147,11 +151,15 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Planning — Understand + Plan, then pause for approval
+# Phase 1: Planning (Understand + Plan)
 # ---------------------------------------------------------------------------
 
 def run_planning_phase(request_name: str) -> None:
-    """Run understand and plan nodes, then set status to Awaiting Approval."""
+    """
+    Executes the initial discovery phase of the agent's work.
+    This phase involves building a mental model of the codebase (Understanding)
+    and drafting a proposed path forward (Planning).
+    """
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
@@ -176,6 +184,8 @@ def run_planning_phase(request_name: str) -> None:
 
         _update_status(request_name, user, "Understanding", "Exploring codebase...")
 
+        # We build the planning graph which defines the agent's thought process
+        # for discovering relevant files and drafting the solution.
         graph = build_planning_graph()
         initial = {
             "user_message": doc.user_message or "",
@@ -220,11 +230,15 @@ def run_planning_phase(request_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Execution — Implement + Review + Bench + Deploy
+# Phase 2: Execution (Implement + Review)
 # ---------------------------------------------------------------------------
 
 def run_execution_phase(request_name: str) -> None:
-    """Run implement, review, bench commands, and deploy nodes."""
+    """
+    Carries out the implementation of the approved plan.
+    This phase creates a working branch, applies code changes, and performs
+    an automated review to ensure quality and correctness.
+    """
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
@@ -261,6 +275,8 @@ def run_execution_phase(request_name: str) -> None:
 
         plan = doc.agent_plan or ""
 
+        # We parse the existing log to ensure the execution graph has full context
+        # of what was discovered during the planning phase.
         prev_stage_log = _parse_stage_log(doc.stage_log or "")
 
         graph = build_execution_graph()
@@ -377,11 +393,11 @@ def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
 
 
 def run_bench_and_commit(request_name: str) -> None:
-    """Run approved bench commands, then set status to Awaiting Push Approval.
-    Branch was already created at the start of execution phase.
-    Commit happens only when the user approves the push.
-    supervisorctl restart is deferred to run AFTER the status update so
-    the worker is not killed before the critical DB writes complete."""
+    """
+    Executes the approved bench commands to apply schema and asset changes.
+    Once complete, it updates the status to allow the user to review the
+    running application before finalizing the commit.
+    """
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
@@ -481,12 +497,14 @@ def run_bench_and_commit(request_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Deploy — Push branch and create PR (after user approval)
+# Phase 3: Deployment (Push + Pull Request)
 # ---------------------------------------------------------------------------
 
 def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True) -> None:
-    """Commit changes, push the branch, and/or create a PR. Called after user approves push.
-    Commit happens here so that changes are only committed on explicit user approval."""
+    """
+    Finalizes the task by committing the changes and pushing them to GitHub.
+    Depending on the user's choice, it can also automatically create a Pull Request.
+    """
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
