@@ -14,16 +14,16 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langchain_openai import ChatOpenAI
 
-from ampower_ai_agents.agent.state import AgentState
-from ampower_ai_agents.agent import tools as agent_tools
-from ampower_ai_agents.agent.prompts import (
+from ampower_koda.agent.state import AgentState
+from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent.prompts import (
     get_system_prompt,
     get_understand_prompt,
     get_plan_prompt,
     get_implement_prompt,
     get_review_prompt,
 )
-from ampower_ai_agents.agent.git_ops import (
+from ampower_koda.agent.git_ops import (
     create_branch,
     commit_changes,
     push_branch,

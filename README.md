@@ -13,8 +13,8 @@ AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improve
 ## Installation
 
     cd frappe-bench
-    bench get-app ampower_ai_agents
-    bench --site your-site install-app ampower_ai_agents
+    bench get-app ampower_koda
+    bench --site your-site install-app ampower_koda
     bench migrate
     bench restart
 

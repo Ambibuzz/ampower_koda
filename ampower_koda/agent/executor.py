@@ -6,11 +6,11 @@ import os
 
 import frappe
 
-from ampower_ai_agents.agent.graph import (
+from ampower_koda.agent.graph import (
     build_planning_graph,
     build_execution_graph,
 )
-from ampower_ai_agents.agent.git_ops import (
+from ampower_koda.agent.git_ops import (
     generate_branch_name,
     get_repo_root,
     get_current_branch,
@@ -426,7 +426,7 @@ def run_bench_and_commit(request_name: str) -> None:
             cmds = _compute_bench_commands(app_name, [])
 
         import subprocess
-        from ampower_ai_agents.agent.graph import _get_bench_env
+        from ampower_koda.agent.graph import _get_bench_env
 
         bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
         bench_root = os.path.normpath(bench_root)
