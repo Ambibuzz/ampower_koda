@@ -93,7 +93,7 @@ def _revert_previous_changes(app_name: str, base_branch: str, request_name: str 
 def _get_doc_config(request_name: str) -> dict:
     """Load the AI Agent Request document and return config needed for the graph state."""
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    settings = frappe.get_single("AI Agents Settings")
+    settings = frappe.get_single("AI Agent Settings")
 
     if not settings.enable_ai_agent:
         frappe.throw("AI Agent is disabled in settings")
@@ -109,7 +109,7 @@ def _get_doc_config(request_name: str) -> dict:
     field_name, env_var, label = cfg
     api_key = settings.get_password(field_name) or ""
     if not api_key.strip():
-        frappe.throw(f"{label} not set in AI Agents Settings")
+        frappe.throw(f"{label} not set in AI Agent Settings")
     os.environ[env_var] = api_key.strip()
 
     return {
