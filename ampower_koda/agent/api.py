@@ -7,8 +7,8 @@ import subprocess
 import frappe
 from frappe import _
 
-from ampower_ai_agents.agent.git_ops import checkout_base
-from ampower_ai_agents.agent.graph import _get_bench_env
+from ampower_koda.agent.git_ops import checkout_base
+from ampower_koda.agent.graph import _get_bench_env
 
 DOCTYPE_NAME = "AI Agent Request"
 
@@ -18,9 +18,9 @@ def _validate_provider_key(doc):
     Verifies that the AI provider and its API key are correctly configured in settings.
     This check ensures the agent has its 'brain' ready before it attempts any work.
     """
-    settings = frappe.get_single("AI Agents Settings")
+    settings = frappe.get_single("AI Agent Settings")
     if not settings.enable_ai_agent:
-        frappe.throw(_("AI Coding Agent is disabled in AI Agents Settings."))
+        frappe.throw(_("AI Coding Agent is disabled in AI Agent Settings."))
     provider = (doc.ai_provider or settings.default_ai_provider or "OpenAI").strip()
     key_checks = {
         "OpenAI": ("openai_api_key", "OpenAI API key"),
@@ -29,7 +29,7 @@ def _validate_provider_key(doc):
     }
     field, label = key_checks.get(provider, key_checks["OpenAI"])
     if not getattr(settings, field, None):
-        frappe.throw(_("{0} is not set in AI Agents Settings.").format(label))
+        frappe.throw(_("{0} is not set in AI Agent Settings.").format(label))
 
 
 # --- Core Workflow Management ---
@@ -67,7 +67,7 @@ def start_agent(request_name: str):
     frappe.db.commit()
 
     frappe.enqueue(
-        "ampower_ai_agents.agent.executor.run_planning_phase",
+        "ampower_koda.agent.executor.run_planning_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
@@ -104,7 +104,7 @@ def execute_existing_plan(request_name: str):
     frappe.db.commit()
 
     frappe.enqueue(
-        "ampower_ai_agents.agent.executor.run_execution_phase",
+        "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
@@ -135,7 +135,7 @@ def approve_plan(request_name: str, edited_plan: str = None):
     frappe.db.commit()
 
     frappe.enqueue(
-        "ampower_ai_agents.agent.executor.run_execution_phase",
+        "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
@@ -190,7 +190,7 @@ def approve_bench(request_name: str, commands: str = None):
     frappe.db.commit()
 
     frappe.enqueue(
-        "ampower_ai_agents.agent.executor.run_bench_and_commit",
+        "ampower_koda.agent.executor.run_bench_and_commit",
         queue="default",
         timeout=1800,
         request_name=request_name,
@@ -231,7 +231,7 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     frappe.db.commit()
 
     frappe.enqueue(
-        "ampower_ai_agents.agent.executor.run_deploy_phase",
+        "ampower_koda.agent.executor.run_deploy_phase",
         queue="default",
         timeout=600,
         request_name=request_name,

@@ -19,7 +19,7 @@ frappe.pages['ai-agents-help'].on_page_load = function(wrapper) {
 
         <h3>Getting Started</h3>
         <ol>
-            <li>Open <b>AI Agents Settings</b> from the search bar.</li>
+            <li>Open <b>AI Agent Settings</b> from the search bar.</li>
             <li>Check <b>Enable AI Agent</b>.</li>
             <li>Enter your API key for OpenAI, Gemini, or Claude.</li>
             <li>Save.</li>

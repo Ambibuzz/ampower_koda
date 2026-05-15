@@ -44,7 +44,7 @@
         {
             "fieldname": "default_ai_provider",
             "fieldtype": "Select",
-            "label": "Default AI Provider",
+            "label": "AI Provider",
             "options": "OpenAI\nGemini\nClaude",
             "default": "OpenAI",
             "reqd": 0
@@ -55,9 +55,10 @@
         },
         {
             "fieldname": "default_ai_model",
-            "fieldtype": "Data",
-            "label": "Default AI Model",
+            "fieldtype": "Select",
+            "label": "AI Model",
             "default": "gpt-4o-mini",
+            "options": "gpt-4o-mini\ngpt-4o\ngpt-5-mini\no3-mini\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022",
             "description": "Default model for new requests. Changes with provider selection."
         },
         {
@@ -109,8 +110,8 @@
     "links": [],
     "modified": "2026-03-27 12:00:00.000000",
     "modified_by": "Administrator",
-    "module": "AI Agents",
-    "name": "AI Agents Settings",
+    "module": "Ampower Koda",
+    "name": "AI Agent Settings",
     "owner": "Administrator",
     "permissions": [
         {

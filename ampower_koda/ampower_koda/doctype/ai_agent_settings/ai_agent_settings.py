@@ -5,7 +5,7 @@ import frappe
 from frappe.model.document import Document
 
 
-class AIAgentsSettings(Document):
+class AIAgentSettings(Document):
     def validate(self):
         if not self.enable_ai_agent:
             return

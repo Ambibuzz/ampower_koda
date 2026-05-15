@@ -12,9 +12,9 @@ class AIAgentRequest(Document):
         self._set_defaults_from_settings()
 
     def _set_defaults_from_settings(self):
-        """Populate provider/model defaults from AI Agents Settings if not already set."""
+        """Populate provider/model defaults from AI Agent Settings if not already set."""
         try:
-            settings = frappe.get_single("AI Agents Settings")
+            settings = frappe.get_single("AI Agent Settings")
             if not self.ai_provider:
                 self.ai_provider = settings.default_ai_provider or "OpenAI"
             if not self.ai_model:

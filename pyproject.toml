@@ -1,5 +1,5 @@
 [project]
-name = "ampower_ai_agents"
+name = "ampower_koda"
 authors = [
     { name = "Ambibuzz Technologies LLP", email = "buzz@ambibuzz.com" }
 ]

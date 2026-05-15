@@ -6,11 +6,11 @@ import os
 
 import frappe
 
-from ampower_ai_agents.agent.graph import (
+from ampower_koda.agent.graph import (
     build_planning_graph,
     build_execution_graph,
 )
-from ampower_ai_agents.agent.git_ops import (
+from ampower_koda.agent.git_ops import (
     generate_branch_name,
     get_repo_root,
     get_current_branch,
@@ -93,7 +93,7 @@ def _revert_previous_changes(app_name: str, base_branch: str, request_name: str 
 def _get_doc_config(request_name: str) -> dict:
     """Load the AI Agent Request document and return config needed for the graph state."""
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    settings = frappe.get_single("AI Agents Settings")
+    settings = frappe.get_single("AI Agent Settings")
 
     if not settings.enable_ai_agent:
         frappe.throw("AI Agent is disabled in settings")
@@ -109,7 +109,7 @@ def _get_doc_config(request_name: str) -> dict:
     field_name, env_var, label = cfg
     api_key = settings.get_password(field_name) or ""
     if not api_key.strip():
-        frappe.throw(f"{label} not set in AI Agents Settings")
+        frappe.throw(f"{label} not set in AI Agent Settings")
     os.environ[env_var] = api_key.strip()
 
     return {
@@ -426,7 +426,7 @@ def run_bench_and_commit(request_name: str) -> None:
             cmds = _compute_bench_commands(app_name, [])
 
         import subprocess
-        from ampower_ai_agents.agent.graph import _get_bench_env
+        from ampower_koda.agent.graph import _get_bench_env
 
         bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
         bench_root = os.path.normpath(bench_root)

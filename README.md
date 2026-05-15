@@ -13,8 +13,8 @@ AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improve
 ## Installation
 
     cd frappe-bench
-    bench get-app ampower_ai_agents
-    bench --site your-site install-app ampower_ai_agents
+    bench get-app ampower_koda
+    bench --site your-site install-app ampower_koda
     bench migrate
     bench restart
 
@@ -35,7 +35,7 @@ Python dependencies (installed automatically):
 
 ## Setup
 
-1. Open AI Agents Settings from the search bar.
+1. Open AI Agent Settings from the search bar.
 2. Check Enable AI Agent.
 3. Enter your API key for the provider you want to use (OpenAI, Gemini, or Claude).
 4. Optionally set a default provider and model.
@@ -73,7 +73,7 @@ Each request goes through a multi-step pipeline with human approval gates. You c
 5. Click Start Agent.
 
 ### Persistence
-The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in AI Agents Settings as the encrypted default).
+The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in AI Agent Settings as the encrypted default).
 
 
 ## Approval Steps

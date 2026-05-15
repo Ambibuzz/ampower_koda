@@ -498,7 +498,7 @@ function setup_action_buttons(frm) {
 function start_agent(frm) {
     function do_start() {
         frappe.call({
-            method: 'ampower_ai_agents.agent.api.start_agent',
+            method: 'ampower_koda.agent.api.start_agent',
             args: { request_name: frm.doc.name },
             freeze: true,
             freeze_message: __('Starting agent...'),
@@ -527,7 +527,7 @@ function execute_existing_plan(frm) {
         function () {
             function do_execute() {
                 frappe.call({
-                    method: 'ampower_ai_agents.agent.api.execute_existing_plan',
+                    method: 'ampower_koda.agent.api.execute_existing_plan',
                     args: { request_name: frm.doc.name },
                     freeze: true,
                     freeze_message: __('Starting execution from existing plan...'),
@@ -557,7 +557,7 @@ function approve_plan(frm) {
         function () {
             var edited_plan = frm.doc.agent_plan || '';
             frappe.call({
-                method: 'ampower_ai_agents.agent.api.approve_plan',
+                method: 'ampower_koda.agent.api.approve_plan',
                 args: {
                     request_name: frm.doc.name,
                     edited_plan: edited_plan
@@ -583,7 +583,7 @@ function reject_plan(frm) {
         __('Reject this plan? The request will be cancelled.'),
         function () {
             frappe.call({
-                method: 'ampower_ai_agents.agent.api.reject_plan',
+                method: 'ampower_koda.agent.api.reject_plan',
                 args: { request_name: frm.doc.name },
                 callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
@@ -631,7 +631,7 @@ function approve_bench(frm) {
         __('Run these commands?') + '<div style="margin:10px 0;">' + preview + '</div>',
         function () {
             frappe.call({
-                method: 'ampower_ai_agents.agent.api.approve_bench',
+                method: 'ampower_koda.agent.api.approve_bench',
                 args: {
                     request_name: frm.doc.name,
                     commands: JSON.stringify(selected_cmds)
@@ -691,7 +691,7 @@ function approve_push(frm) {
             }
             d.hide();
             frappe.call({
-                method: 'ampower_ai_agents.agent.api.approve_push',
+                method: 'ampower_koda.agent.api.approve_push',
                 args: {
                     request_name: frm.doc.name,
                     push_branch: do_push ? 1 : 0,
@@ -719,7 +719,7 @@ function checkout_base_branch(frm) {
         __('Switch back to the base branch? Uncommitted changes will be discarded.'),
         function () {
             frappe.call({
-                method: 'ampower_ai_agents.agent.api.checkout_base_branch',
+                method: 'ampower_koda.agent.api.checkout_base_branch',
                 args: { request_name: frm.doc.name },
                 freeze: true,
                 freeze_message: __('Checking out base branch...'),
@@ -751,7 +751,7 @@ function show_post_checkout_bench_dialog(frm) {
     }
 
     frappe.call({
-        method: 'ampower_ai_agents.agent.api.get_default_bench_commands',
+        method: 'ampower_koda.agent.api.get_default_bench_commands',
         args: { request_name: frm.doc.name },
         callback: function (r) {
             var cmds = (r.message && r.message.commands) ? r.message.commands : default_cmds;
@@ -789,7 +789,7 @@ function show_post_checkout_bench_dialog(frm) {
                     }
                     d.hide();
                     frappe.call({
-                        method: 'ampower_ai_agents.agent.api.run_selected_bench_commands',
+                        method: 'ampower_koda.agent.api.run_selected_bench_commands',
                         args: {
                             request_name: frm.doc.name,
                             commands: JSON.stringify(selected)
@@ -824,7 +824,7 @@ function cancel_request(frm) {
         __('Cancel this agent request?'),
         function () {
             frappe.call({
-                method: 'ampower_ai_agents.agent.api.cancel_agent_request',
+                method: 'ampower_koda.agent.api.cancel_agent_request',
                 args: { request_name: frm.doc.name },
                 callback: function () {
                     frm.reload_doc();
@@ -868,7 +868,7 @@ function setup_status_polling(frm) {
             return;
         }
         frappe.call({
-            method: 'ampower_ai_agents.agent.api.get_agent_status',
+            method: 'ampower_koda.agent.api.get_agent_status',
             args: { request_name: frm.doc.name },
             async: true,
             silent: true,
