@@ -92,7 +92,7 @@ After bench commands run and changes are committed to a branch, the status chang
 
 Our AI Agent operations are designed with strict compliance and security measures in mind. All sensitive tokens are securely stored and encrypted, and every action requires explicit human approval to ensure full oversight.
 
-(1775651869174.gif)
+<img width="854" height="480" alt="1775651869174" src="https://github.com/user-attachments/assets/f39d1226-ab20-49f8-8d2c-d279f463faf2" />
 
 
 ## Buttons Available at All Times
