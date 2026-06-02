@@ -21,15 +21,15 @@ AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improve
 
 ## Requirements
 
-- Frappe v14 or later
+- Frappe v15 or later
 - Python 3.10+
 - One of: OpenAI API key, Google AI Studio (Gemini) API key, or Anthropic (Claude) API key
 - GitHub personal access token with repo scope
 - Node.js v18+ (managed via nvm recommended)
 
-Python dependencies (installed automatically):
+Python dependencies :
 
-- langchain, langchain-openai, langchain-google-genai, langchain-anthropic
+- langchain
 - langgraph
 
 
@@ -86,6 +86,13 @@ After implementation and code review, the agent computes which bench commands ar
 
 Push Approval:
 After bench commands run and changes are committed to a branch, the status changes to Awaiting Push Approval. You can test the changes on your instance first. Review the branch and repository details, then click Approve Push to commit, push, and create the pull request.
+
+
+## Compliance
+
+Our AI Agent operations are designed with strict compliance and security measures in mind. All sensitive tokens are securely stored and encrypted, and every action requires explicit human approval to ensure full oversight.
+
+![alt text](1775651869174.gif)
 
 
 ## Buttons Available at All Times
