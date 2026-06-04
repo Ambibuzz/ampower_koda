@@ -5,7 +5,8 @@ import json
 import os
 
 import frappe
-
+import subprocess
+from ampower_koda.agent.graph import _get_bench_env
 from ampower_koda.agent.graph import (
     build_planning_graph,
     build_execution_graph,
@@ -345,7 +346,8 @@ def run_execution_phase(request_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
-    """Determine which bench commands are needed based on edited file paths."""
+    """Determine which bench commands are needed based on which file types were edited.
+    Always includes clear-cache and supervisorctl restart."""
     edited_paths = [e.get("path", "") for e in edits if e.get("path")]
     site_name = frappe.local.site
 
@@ -374,7 +376,7 @@ def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
-    """Publish a realtime bench command log entry."""
+    """Broadcast a bench command start/result event via Frappe realtime."""
     import datetime
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     frappe.publish_realtime("agent_log", {
@@ -394,9 +396,8 @@ def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
 
 def run_bench_and_commit(request_name: str) -> None:
     """
-    Executes the approved bench commands to apply schema and asset changes.
-    Once complete, it updates the status to allow the user to review the
-    running application before finalizing the commit.
+    Executes the approved bench commands (migrate, build, clear-cache, etc.) and then
+waits for the user to review the live changes before approving the final commit and push.
     """
     frappe.set_user("Administrator")
     try:
@@ -425,8 +426,6 @@ def run_bench_and_commit(request_name: str) -> None:
         if not cmds:
             cmds = _compute_bench_commands(app_name, [])
 
-        import subprocess
-        from ampower_koda.agent.graph import _get_bench_env
 
         bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
         bench_root = os.path.normpath(bench_root)
@@ -547,8 +546,8 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                 error_log=f"commit_changes failed: {msg}")
             return
 
-        pr_url = ""
-        pr_number = ""
+        pr_url = None
+        pr_number = None
 
         if do_push:
             _update_status(request_name, user, "Pushing", f"Pushing branch '{branch_name}' to GitHub...")

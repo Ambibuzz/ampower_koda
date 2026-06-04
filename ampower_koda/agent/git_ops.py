@@ -4,6 +4,7 @@
 import os
 import re
 import subprocess
+import requests as http_requests
 
 import frappe
 
@@ -32,7 +33,7 @@ def run_git(cmd: list[str], cwd: str | None = None) -> tuple[bool, str]:
             text=True,
             timeout=120,
         )
-        out = (result.stdout or "").strip() + (result.stderr or "").strip()
+        out = ((result.stdout or "").strip() + "\n" + (result.stderr or "").strip()).strip()
         return result.returncode == 0, out
     except subprocess.TimeoutExpired:
         return False, "Git command timed out"
@@ -79,7 +80,7 @@ def create_branch(app_name: str, branch_name: str, base_branch: str = "main") ->
     run_git(["fetch", "origin", base_branch], cwd=root)
     ok, out = run_git(["checkout", "-b", branch_name, base_branch], cwd=root)
     if not ok:
-        ok, out = run_git(["checkout", "-b", branch_name], cwd=root)
+        return False, f"Failed to create branch '{branch_name}' from '{base_branch}': {out}"
     return ok, out
 
 
@@ -98,6 +99,8 @@ def commit_changes(app_name: str, message: str, git_user_name: str = "AI Agent",
     if not ok:
         return False, out
     ok, out = run_git(["status", "--short"], cwd=root)
+    if not ok:
+        return False, f"git status failed: {out}"
     if not out.strip():
         return False, "No changes to commit"
     ok, out = run_git(["commit", "-m", message], cwd=root)
@@ -106,8 +109,10 @@ def commit_changes(app_name: str, message: str, git_user_name: str = "AI Agent",
 
 def push_branch(app_name: str, branch_name: str, repo_url: str, token: str) -> tuple[bool, str]:
     """
-    Uploads the local branch to the remote GitHub repository 
-    using the provided credentials.
+    Uploads the local branch to the remote GitHub repository
+    using the provided credentials. The token is scrubbed from
+    any returned output to prevent it from leaking into logs or
+    realtime events.
     """
     if not repo_url:
         return False, "GitHub URL not provided"
@@ -134,7 +139,8 @@ def push_branch(app_name: str, branch_name: str, repo_url: str, token: str) -> t
     remote = f"https://{clean_token}@github.com/{owner}/{repo}.git"
     root = get_repo_root(app_name)
     ok, out = run_git(["push", remote, branch_name], cwd=root)
-    return ok, out
+    safe_out = out.replace(clean_token, "***")
+    return ok, safe_out
 
 
 def create_pull_request(
@@ -149,7 +155,6 @@ def create_pull_request(
     Uses the GitHub API to create a new Pull Request for the pushed branch. 
     This is the final step in the agent's collaborative workflow.
     """
-    import requests as http_requests
 
     if not token or not repo_url:
         return False, "GitHub token or repo URL not provided", None, None
@@ -199,7 +204,7 @@ def generate_branch_name(request_name: str, branch_prefix: str = "ai-agent/", ap
     except Exception:
         return base_name
 
-    ok, branches = run_git(["branch", "--list"], cwd=root)
+    ok, branches = run_git(["branch", "--list", "--all"], cwd=root)
     if not ok:
         return base_name
 
@@ -228,17 +233,21 @@ def checkout_base(app_name: str, base_branch: str = "main") -> tuple[bool, str]:
     """
     Discards all uncommitted changes and returns the repository to its 
     base branch. This is the primary 'reset' tool for the user.
+    Also pulls the latest changes from remote after switching branches.
     """
     root = get_repo_root(app_name)
 
     run_git(["reset", "--hard", "HEAD"], cwd=root)
-    run_git(["clean", "-fd"], cwd=root)
+    run_git(["clean", "-fdx"], cwd=root)
 
     current = get_current_branch(app_name)
     if current == base_branch:
-        return True, f"Already on {base_branch}"
+        run_git(["pull", "origin", base_branch], cwd=root)  
+        return True, f"Already on {base_branch}, pulled latest"
 
     ok, out = run_git(["checkout", base_branch], cwd=root)
     if not ok:
         return False, f"checkout {base_branch} failed: {out}"
+
+    run_git(["pull", "origin", base_branch], cwd=root)
     return True, f"Checked out {base_branch}"

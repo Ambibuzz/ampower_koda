@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
 # Whitelisted API for the AI Agent
 
+import json
 import os
 import subprocess
 
@@ -31,9 +32,6 @@ def _validate_provider_key(doc):
     if not getattr(settings, field, None):
         frappe.throw(_("{0} is not set in AI Agent Settings.").format(label))
 
-
-# --- Core Workflow Management ---
-# The following functions manage the high-level transitions of the agent's lifecycle.
 
 @frappe.whitelist()
 def start_agent(request_name: str):
@@ -167,8 +165,8 @@ def reject_plan(request_name: str):
 
 @frappe.whitelist()
 def approve_bench(request_name: str, commands: str = None):
-    """Approve running bench commands, then branch+commit.
-    commands is an optional JSON array of edited/filtered commands from the UI."""
+    """Approves and runs the pending bench commands (migrate, build, clear-cache, etc.).
+    Optionally pass an edited list of commands as a JSON array to override the defaults."""
     if not request_name:
         frappe.throw(_("Request name is required."))
 
@@ -177,7 +175,7 @@ def approve_bench(request_name: str, commands: str = None):
         frappe.throw(_("Cannot approve bench. Agent status is {0}.").format(doc.status))
 
     if commands:
-        import json as _json
+
         try:
             cmd_list = _json.loads(commands)
             if isinstance(cmd_list, list) and cmd_list:
@@ -198,7 +196,7 @@ def approve_bench(request_name: str, commands: str = None):
 
     cmds = []
     try:
-        import json as _json
+        
         cmds = _json.loads(
             frappe.db.get_value(DOCTYPE_NAME, request_name, "pending_bench_commands") or "[]"
         )
@@ -213,8 +211,8 @@ def approve_bench(request_name: str, commands: str = None):
 
 @frappe.whitelist()
 def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
-    """Approve pushing the branch and/or creating a PR.
-    push_branch=1 pushes the branch to remote. create_pr=1 creates a pull request."""
+    """Approves pushing the feature branch to remote and/or opening a pull request.
+    Set push_branch=1 to push, create_pr=1 to create a PR. At least one must be selected."""
     if not request_name:
         frappe.throw(_("Request name is required."))
 
@@ -276,7 +274,8 @@ def checkout_base_branch(request_name: str):
 
 @frappe.whitelist()
 def get_default_bench_commands(request_name: str):
-    """Return the default bench commands for a request's target app."""
+    """Returns the default list of bench commands for the request's target app:
+    migrate, build, clear-cache, and supervisorctl restart."""
     if not request_name:
         frappe.throw(_("Request name is required."))
 
@@ -301,7 +300,7 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
     if not request_name:
         frappe.throw(_("Request name is required."))
 
-    import json as _json
+    
     cmds = []
     if commands:
         try:
@@ -348,7 +347,7 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
 def get_agent_status(request_name: str):
     """Return current status and key fields for a request."""
     if not request_name:
-        return None
+        frappe.throw(_("Request name is required."))
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     return {
         "name": doc.name,

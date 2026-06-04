@@ -46,9 +46,11 @@ def list_directory(app_name: str, path: str) -> str:
 
 IGNORE_DIRS = {
     "__pycache__", "node_modules", ".git", ".github", ".vscode",
-    ".eggs", "*.egg-info", "dist", "build",
+    ".eggs", "dist", "build",
 }
 
+def _should_ignore_dir(d: str) -> bool:
+    return d in IGNORE_DIRS or d.endswith(".egg-info")
 
 def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
     """Recursively list the app directory tree. Returns an indented tree view.
@@ -218,10 +220,9 @@ def edit_file(app_name: str, path: str, old_string: str, new_string: str) -> str
             if len(content) > 3000:
                 preview += f"\n... ({len(content)} chars total, showing first 3000)"
             return (
-                f"EDIT_FAILED: old_string not found in {path}. "
-                f"The old_string you provided does not match any text in the file. "
-                f"Here is the actual file content — use read_file or copy an exact "
-                f"substring from below:\n\n{preview}"
+                f"EDIT_FAILED: old_string not found in {path} ({len(content)} chars, {content.count(chr(10))+1} lines). "
+                f"Use read_file to inspect the file and copy the exact string to match, "
+                f"including whitespace and indentation."
             )
         content = content.replace(old_string, new_string, 1)
         with open(full, "w", encoding="utf-8") as f:
@@ -259,7 +260,11 @@ def replace_lines(app_name: str, path: str, start_line: int, end_line: int, new_
                 f"File has {total} lines. Nearby content:\n{context_preview}"
                 f"Re-read the file with read_file to get correct line numbers."
             )
-        end_line = min(end_line, total)
+        if end_line > total:
+            return (
+                f"EDIT_FAILED: end_line {end_line} exceeds file length {total}. "
+                f"Re-read the file with read_file to get correct line numbers."
+            )
 
         before = lines[:start_line - 1]
         after = lines[end_line:]
