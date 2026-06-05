@@ -37,6 +37,7 @@ from ampower_koda.agent.git_ops import (
 MAX_TOOL_ROUNDS_PLANNING = 40
 MAX_TOOL_ROUNDS_EXECUTION = 30
 MAX_TOOL_ROUNDS_REVIEW = 10
+WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
 
 DOCTYPE_NAME = "AI Agent Request"
 
@@ -58,6 +59,8 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
     if provider == "Claude":
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(model=model, temperature=0)
+    if provider not in ("OpenAI", "Gemini", "Claude"):
+        frappe.log_error(f"Unknown AI provider '{provider}', defaulting to OpenAI", "Agent LLM Warning")
     return ChatOpenAI(model=model, temperature=0)
 
 
@@ -243,17 +246,38 @@ def _make_tools(app_name: str, read_only: bool = False):
 # Tool-calling loop with detailed realtime logging
 # ---------------------------------------------------------------------------
 
-def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_rounds: int = 20) -> tuple[str, list[str]]:
-    """Run a tool-calling loop. Publishes every tool call and LLM response via realtime.
-    Returns (final_text, list_of_edited_file_paths)."""
+def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_rounds: int = 20,state: dict = None) -> tuple[str, list[str], int]:
+    """
+    Run a tool-calling loop, publishing every tool call and LLM response via realtime.
+    Returns (final_text, list_of_edited_file_paths, total_tokens_used).
+
+    On each round the LLM is invoked with the full message history. If the LLM
+    returns no tool calls, the loop exits early and returns that response as the
+    final text.
+
+    If max_rounds is reached without the LLM stopping, one final llm.invoke()
+    is fired WITHOUT tools bound — this forces a plain text conclusion rather
+    than an infinite loop. Edited paths and token counts collected up to that
+    point are still returned.
+    """
     tool_map = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
     messages = [HumanMessage(content=prompt)]
     edited_paths = []
+    total_tokens = (state or {}).get("tokens_used", 0) # carry forward from prior phases
 
     for round_num in range(max_rounds):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
+
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            total_tokens += int(usage.get("total_tokens") or 0)
+            _publish_agent_log(request_name, "token_usage",
+                round=round_num + 1,
+                tokens_this_round=usage.get("total_tokens", 0),
+                tokens_total=total_tokens,
+            )
 
         response_text = getattr(response, "content", "") or ""
         if response_text:
@@ -263,7 +287,7 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
             )
 
         if not getattr(response, "tool_calls", None):
-            return response_text, edited_paths
+            return response_text, edited_paths, total_tokens
 
         for tc in response.tool_calls:
             _publish_agent_log(request_name, "tool_call",
@@ -283,8 +307,8 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
             else:
                 result = f"Unknown tool: {tc['name']}"
 
-            if tc["name"] in ("replace_lines", "insert_lines", "edit_file", "write_file"):
-                if "EDIT_OK" in result or "WRITE_OK" in result:
+            if tc["name"] in WRITE_TOOLS:
+                if not result.startswith("Tool error:") and not result.startswith("Error:"):
                     path_arg = tc.get("args", {}).get("path", "")
                     if path_arg and path_arg not in edited_paths:
                         edited_paths.append(path_arg)
@@ -297,7 +321,10 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
             messages.append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
     final = llm.invoke(messages)
-    return (getattr(final, "content", "") or ""), edited_paths
+    usage = getattr(final, "usage_metadata", None)
+    if usage:
+        total_tokens += int(usage.get("total_tokens") or 0)
+    return (getattr(final, "content", "") or ""), edited_paths, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +343,11 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
         llm = _get_llm(provider=provider, model=model)
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
         full_prompt = f"{system_prompt}\n\n{prompt}"
-        content, tool_edited_paths = _run_tool_calling_loop(
-            llm, tools, full_prompt, request_name=request_name, max_rounds=max_rounds
+        content, tool_edited_paths, total_tokens = _run_tool_calling_loop(
+            llm, tools, full_prompt,
+            request_name=request_name,
+            max_rounds=max_rounds,
+            state=state,      
         )
         max_output = 30000 if phase in ("Understanding", "Planning") else 8000
         steps = list(state.get("intermediate_steps") or []) + [
@@ -326,6 +356,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
         result = {
             "current_stage": phase,
             "intermediate_steps": steps,
+            "tokens_used": total_tokens,
         }
         if tool_edited_paths:
             result["_tool_edited_paths"] = tool_edited_paths

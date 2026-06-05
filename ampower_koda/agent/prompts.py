@@ -13,19 +13,27 @@ PROMPT_LABEL_MAP = {
 }
 
 class SafeDict(dict):
+    """dict subclass that returns '{key}' for missing keys instead of raising KeyError.
+    Used with str.format_map() to safely render prompt templates with partial context."""
     def __missing__(self, key):
         return "{" + key + "}"
 
 
 def render_prompt_safe(template: str, context: dict, default_template: str) -> str:
+    """
+    Render a prompt template using context variables.
+    Uses SafeDict so missing placeholders are left as-is rather than raising KeyError.
+    If rendering fails entirely, falls back to the raw template.
+    Context keys not present in the template are appended as titled sections.
+    """
     try:
         result = template.format_map(SafeDict(context))
-    except Exception:
+    except Exception as e:
+        frappe.log_error(f"Prompt render failed: {e}\nTemplate preview: {template[:200]}", "Prompt Render Error")
         result = template
 
-    # Ensure missing placeholders are appended
     for key, value in context.items():
-        if f"{{{key}}}" not in template:
+        if f"{{{key}}}" not in template and isinstance(value, str) and len(value) < 500:
             result += f"\n\n## {key.upper().replace('_', ' ')}\n{value}"
 
     return result
@@ -33,6 +41,12 @@ def render_prompt_safe(template: str, context: dict, default_template: str) -> s
 
 
 def get_config_prompt(fieldname: str, default_template: str, request_name: str = None) -> str:
+    """
+    Return the prompt template for a given fieldname.
+    If request_name is provided and the request has a matching prompt override
+    in its AI Agent Prompt Configuration child table, that is returned instead.
+    If use_default_prompts is enabled on the request, always returns the default.
+    """
     prompt_label = PROMPT_LABEL_MAP.get(fieldname, fieldname)
 
     # Only request-level override
@@ -49,7 +63,7 @@ def get_config_prompt(fieldname: str, default_template: str, request_name: str =
                 "AI Agent Prompt Configuration",
                 filters={
                     "parent": request_name,
-                    "prompt_key": prompt_label  
+                    "prompt_key": ["in", [prompt_label, fieldname]]  
                 },
                 fields=["content"],
                 order_by="idx asc"
@@ -450,13 +464,7 @@ After reading ALL files, give your verdict IMMEDIATELY.
 - All good: `REVIEW_PASSED=yes`
 - Issues found: `REVIEW_PASSED=no` then list each issue:
   - File: path — Issue: (e.g. Missing import of 'json') — Fix: (e.g. Add import at line 2)
-
-After reading ALL files, give your verdict IMMEDIATELY. Do NOT re-read files.
-
-### VERDICT FORMAT (REQUIRED):
-- All good: `REVIEW_PASSED=yes`
-- Issues found: `REVIEW_PASSED=no` then list each issue:
-  - File: path — Issue: description — Fix: what to change"""
+"""
     template = get_config_prompt("review_prompt", default, request_name)
 
     context = {
