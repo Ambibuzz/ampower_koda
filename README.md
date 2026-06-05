@@ -1,4 +1,4 @@
-# Ampower Koda — AI Coding Agent for Frappe
+# Ampower Koda- AI Coding Agent for Frappe
 
 AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improvement -- the agent reads the target app codebase, creates a plan, implements the changes, and opens a pull request on GitHub.
 
@@ -13,13 +13,13 @@ AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improve
 
 
 ## Installation
-
-    cd frappe-bench
-    bench get-app ampower_koda
-    bench --site your-site install-app ampower_koda
-    bench migrate
-    bench restart
-
+```
+cd frappe-bench
+bench get-app ampower_koda
+bench --site your-site install-app ampower_koda
+bench migrate
+bench restart
+```
 
 ## Requirements
 
@@ -27,7 +27,6 @@ AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improve
 - Python 3.10+
 - One of: OpenAI API key, Google AI Studio (Gemini) API key, or Anthropic (Claude) API key
 - GitHub personal access token with repo scope
-- Node.js v18+ (managed via nvm recommended)
 
 Python dependencies :
 
@@ -76,7 +75,6 @@ Each request goes through a multi-step pipeline with human approval gates. You c
 
 ### Persistence
 The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in AI Agent Settings as the encrypted default).
-
 
 ## Approval Steps
 
@@ -140,28 +138,13 @@ If a prompt type is not explicitly added to the table, the agent will fall back 
 
 ## Supported AI Providers
 
-OpenAI:
-- gpt-4o-mini, gpt-4o, gpt-5-mini, o3-mini
-
-Gemini (Google AI Studio):
-- gemini-2.0-flash, gemini-2.5-pro
-
-Claude (Anthropic):
-- claude-sonnet-4, claude-3-5-sonnet, claude-3-5-haiku
-
-
-## Troubleshooting
-
-- **No changes produced**: If the agent finishes but no diff is visible, try a more capable model (e.g., GPT-4o or Claude 3.5 Sonnet) or provide more detail in the description.
-- **Build failures**: Ensure Node.js v18+ is installed on your server. Using `nvm` is highly recommended.
-- **Migration errors**: Check the "Bench Commands" log for specific SQL or JSON schema errors.
-- **Token Issues**: Ensure your GitHub PAT has the `repo` scope and is not expired.
-
+1. OpenAI
+2. Google
+3. Anthropic
 
 ## In-App Help
 
 For more detailed guidance and tips, search for **AI Agents Help** in your Frappe search bar.
-
 
 ## License
 
