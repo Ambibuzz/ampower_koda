@@ -177,10 +177,10 @@ def approve_bench(request_name: str, commands: str = None):
     if commands:
 
         try:
-            cmd_list = _json.loads(commands)
+            cmd_list = json.loads(commands)
             if isinstance(cmd_list, list) and cmd_list:
                 frappe.db.set_value(DOCTYPE_NAME, request_name,
-                    "pending_bench_commands", _json.dumps(cmd_list))
+                    "pending_bench_commands", json.dumps(cmd_list))
         except (ValueError, TypeError):
             pass
 
@@ -197,7 +197,7 @@ def approve_bench(request_name: str, commands: str = None):
     cmds = []
     try:
         
-        cmds = _json.loads(
+        cmds = json.loads(
             frappe.db.get_value(DOCTYPE_NAME, request_name, "pending_bench_commands") or "[]"
         )
     except Exception:
@@ -304,7 +304,7 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
     cmds = []
     if commands:
         try:
-            cmds = _json.loads(commands)
+            cmds = json.loads(commands)
         except (ValueError, TypeError):
             frappe.throw(_("Invalid commands format."))
 

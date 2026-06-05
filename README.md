@@ -1,3 +1,5 @@
+# Ampower Koda — AI Coding Agent for Frappe
+
 AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improvement -- the agent reads the target app codebase, creates a plan, implements the changes, and opens a pull request on GitHub.
 
 

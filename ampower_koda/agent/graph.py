@@ -246,7 +246,7 @@ def _make_tools(app_name: str, read_only: bool = False):
 # Tool-calling loop with detailed realtime logging
 # ---------------------------------------------------------------------------
 
-def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_rounds: int = 20) -> tuple[str, list[str]]:
+def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_rounds: int = 20,state: dict = None) -> tuple[str, list[str], int]:
     """
     Run a tool-calling loop, publishing every tool call and LLM response via realtime.
     Returns (final_text, list_of_edited_file_paths, total_tokens_used).
@@ -264,7 +264,7 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
     llm_with_tools = llm.bind_tools(tools)
     messages = [HumanMessage(content=prompt)]
     edited_paths = []
-    total_tokens = (state or {}).get("tokens_used", 0)
+    total_tokens = (state or {}).get("tokens_used", 0) # carry forward from prior phases
 
     for round_num in range(max_rounds):
         response = llm_with_tools.invoke(messages)
