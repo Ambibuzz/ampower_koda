@@ -135,6 +135,9 @@ For advanced use cases, you can override the agent's default logic on a per-requ
 
 If a prompt type is not explicitly added to the table, the agent will fall back to its internal system default for that phase.
 
+## Data Security
+
+Please note that we use LLMs, and the data (repositories) will be processed by an LLM. We do not consider this a data security concern, as this is how agentic workflows typically operate. To perform tasks on your data, the LLM must be able to access and read the relevant information. Appropriate security controls and data handling practices should still be followed to ensure the protection of sensitive information.
 
 ## Supported AI Providers
 
