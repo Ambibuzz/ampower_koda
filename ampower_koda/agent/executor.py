@@ -24,6 +24,30 @@ from ampower_koda.agent.git_ops import (
 
 DOCTYPE_NAME = "AI Agent Request"
 
+def calculate_cost_estimate(provider: str, model: str, tokens: int) -> float:
+    """Estimate USD cost based on total tokens used and a blended model rate."""
+    if not tokens:
+        return 0.0
+    
+    # Blended average rates per 1,000,000 tokens (assumes 3:1 input/output ratio)
+    rates = {
+        # OpenAI
+        "gpt-4o-mini": 0.25,
+        "gpt-4o": 5.00,
+        "gpt-5-mini": 0.25,
+        "o3-mini": 2.00,
+        # Gemini
+        "gemini-2.0-flash": 0.15,
+        "gemini-2.5-pro": 2.50,
+        # Claude
+        "claude-sonnet-4-20250514": 6.00,
+        "claude-3-5-sonnet-20241022": 6.00,
+        "claude-3-5-haiku-20241022": 1.00,
+    }
+    
+    rate = rates.get((model or "").strip(), rates.get("gpt-4o-mini"))
+    return float((tokens / 1_000_000.0) * rate)
+
 
 def _revert_previous_changes(app_name: str, base_branch: str, request_name: str = "",
                               user: str = "", branch_prefix: str = "ai-agent/"):
@@ -210,9 +234,13 @@ def run_planning_phase(request_name: str) -> None:
 
         if final_state.get("error"):
             _save_logs(request_name, final_state)
+            tokens = final_state.get("tokens_used", 0)
+            cost = calculate_cost_estimate(config["ai_provider"], config["ai_model"], tokens)
             _update_status(request_name, user, "Failed",
                 final_state["error"],
-                error_log=final_state.get("error_log") or final_state["error"])
+                error_log=final_state.get("error_log") or final_state["error"],
+                tokens_used=tokens,
+                cost_estimate=cost)
             return
 
         plan = final_state.get("plan", "")
@@ -221,8 +249,13 @@ def run_planning_phase(request_name: str) -> None:
         frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", plan[:50000])
         frappe.db.commit()
 
+        tokens = final_state.get("tokens_used", 0)
+        cost = calculate_cost_estimate(config["ai_provider"], config["ai_model"], tokens)
+
         _update_status(request_name, user, "Awaiting Approval",
-            "Plan generated. Please review and approve.")
+            "Plan generated. Please review and approve.",
+            tokens_used=tokens,
+            cost_estimate=cost)
 
     except Exception as e:
         tb = frappe.get_traceback()
@@ -299,6 +332,7 @@ def run_execution_phase(request_name: str) -> None:
             "intermediate_steps": [],
             "edits_made": [],
             "stage_log": prev_stage_log,
+            "tokens_used": doc.tokens_used or 0,
         }
 
         final_state = graph.invoke(initial)
@@ -306,9 +340,13 @@ def run_execution_phase(request_name: str) -> None:
         _save_logs(request_name, final_state)
 
         if final_state.get("error"):
+            tokens = final_state.get("tokens_used", 0)
+            cost = calculate_cost_estimate(config["ai_provider"], config["ai_model"], tokens)
             _update_status(request_name, user, "Failed",
                 final_state["error"],
-                error_log=final_state.get("error_log") or final_state["error"])
+                error_log=final_state.get("error_log") or final_state["error"],
+                tokens_used=tokens,
+                cost_estimate=cost)
             return
 
         repo_root = get_repo_root(app_name)
@@ -327,12 +365,17 @@ def run_execution_phase(request_name: str) -> None:
         edits = final_state.get("edits_made") or []
         bench_cmds = _compute_bench_commands(app_name, edits)
 
+        tokens = final_state.get("tokens_used", 0)
+        cost = calculate_cost_estimate(config["ai_provider"], config["ai_model"], tokens)
+
         _update_status(
             request_name, user, "Awaiting Bench Approval",
             f"Implementation complete. {len(bench_cmds)} bench commands need approval.",
             patch_diff=patch_diff,
             files_changed=json.dumps(edits)[:50000],
             pending_bench_commands=json.dumps(bench_cmds),
+            tokens_used=tokens,
+            cost_estimate=cost,
         )
 
     except Exception as e:
@@ -636,7 +679,7 @@ def _generate_patch_diff(app_name: str) -> str:
 
 
 def _save_logs(request_name: str, final_state: dict):
-    """Persist stage_log and conversation_log to the document."""
+    """Persist stage_log, conversation_log, tokens_used, and cost_estimate to the document."""
     stage_logs = final_state.get("stage_log") or []
     if isinstance(stage_logs, list):
         stage_text = "\n".join(
@@ -646,11 +689,18 @@ def _save_logs(request_name: str, final_state: dict):
     else:
         stage_text = str(stage_logs)
 
+    tokens = final_state.get("tokens_used", 0)
+    provider = final_state.get("ai_provider", "OpenAI")
+    model = final_state.get("ai_model", "gpt-4o-mini")
+    cost = calculate_cost_estimate(provider, model, tokens)
+
     frappe.db.set_value(DOCTYPE_NAME, request_name, {
         "stage_log": stage_text[:50000],
         "conversation_log": json.dumps(
             final_state.get("intermediate_steps", []), indent=2
         )[:50000],
+        "tokens_used": tokens,
+        "cost_estimate": cost,
     })
     frappe.db.commit()
 
