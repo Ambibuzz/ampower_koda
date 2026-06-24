@@ -301,7 +301,8 @@
             "fieldname": "cost_estimate",
             "fieldtype": "Currency",
             "label": "Cost Estimate",
-            "read_only": 1
+            "read_only": 1,
+            "options": "USD"
         },
         {
             "fieldname": "prompts_tab",
