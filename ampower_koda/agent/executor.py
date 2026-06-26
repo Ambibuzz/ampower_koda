@@ -11,6 +11,7 @@ from ampower_koda.agent.graph import (
     build_planning_graph,
     build_execution_graph,
 )
+from ampower_koda.agent.pricing import calculate_cost_estimate
 from ampower_koda.agent.git_ops import (
     generate_branch_name,
     get_repo_root,
@@ -23,31 +24,6 @@ from ampower_koda.agent.git_ops import (
 )
 
 DOCTYPE_NAME = "AI Agent Request"
-
-def calculate_cost_estimate(provider: str, model: str, tokens: int) -> float:
-    """Estimate USD cost based on total tokens used and a blended model rate."""
-    if not tokens:
-        return 0.0
-    
-    # Blended average rates per 1,000,000 tokens (assumes 3:1 input/output ratio)
-    rates = {
-        # OpenAI
-        "gpt-4o-mini": 0.25,
-        "gpt-4o": 5.00,
-        "gpt-5-mini": 0.25,
-        "o3-mini": 2.00,
-        # Gemini
-        "gemini-2.0-flash": 0.15,
-        "gemini-2.5-pro": 2.50,
-        # Claude
-        "claude-sonnet-4-20250514": 6.00,
-        "claude-3-5-sonnet-20241022": 6.00,
-        "claude-3-5-haiku-20241022": 1.00,
-    }
-    
-    rate = rates.get((model or "").strip(), rates.get("gpt-4o-mini"))
-    return float((tokens / 1_000_000.0) * rate)
-
 
 def _revert_previous_changes(app_name: str, base_branch: str, request_name: str = "",
                               user: str = "", branch_prefix: str = "ai-agent/"):
