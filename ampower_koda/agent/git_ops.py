@@ -120,7 +120,7 @@ def push_branch(app_name: str, branch_name: str, repo_url: str, token: str) -> t
     clean_token = (token or "").strip()
     
     if not clean_token:
-        return False, "GitHub token not provided in the AI Agent Request"
+        return False, "GitHub token not provided in the Agent Request"
 
     # Safety check: if it looks like a URL, it's definitely not a token
     if clean_token.startswith("http"):
@@ -227,6 +227,80 @@ def get_current_branch(app_name: str) -> str:
     root = get_repo_root(app_name)
     ok, out = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
     return out.strip() if ok else ""
+
+
+def run_git_stdout(cmd: list[str], cwd: str | None = None) -> tuple[bool, str]:
+    """Run git and return stdout only (stderr excluded — suitable for diff parsing)."""
+    try:
+        result = subprocess.run(
+            ["git"] + cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result.returncode == 0, (result.stdout or "")
+    except subprocess.TimeoutExpired:
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def branch_exists(app_name: str, branch_name: str) -> bool:
+    """Return True if the given branch or ref exists in the repo."""
+    if not branch_name:
+        return False
+    root = get_repo_root(app_name)
+    ok, out = run_git_stdout(["rev-parse", "--verify", branch_name], cwd=root)
+    return ok and bool(out.strip())
+
+
+def list_changed_files(
+    app_name: str, base_branch: str, branch_name: str
+) -> tuple[bool, list[dict]]:
+    """
+    List files changed between base_branch and branch_name.
+    Returns ([{"status": "M|A|D|R", "path": "relative/path"}, ...]).
+    """
+    if not branch_name:
+        return False, []
+    root = get_repo_root(app_name)
+    base = (base_branch or "main").strip()
+    ok, out = run_git_stdout(
+        ["diff", "--name-status", base, branch_name],
+        cwd=root,
+    )
+    if not ok:
+        return False, []
+
+    files = []
+    for line in out.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0][0].upper()
+        path = parts[-1].strip()
+        if path:
+            files.append({"status": status, "path": path})
+    return True, files
+
+
+def diff_file(
+    app_name: str, base_branch: str, branch_name: str, file_path: str
+) -> tuple[bool, str]:
+    """Return unified diff for a single file between base and branch (untruncated)."""
+    if not branch_name or not file_path:
+        return False, ""
+    root = get_repo_root(app_name)
+    base = (base_branch or "main").strip()
+    ok, out = run_git_stdout(
+        ["diff", base, branch_name, "--", file_path],
+        cwd=root,
+    )
+    return ok, out
 
 
 def checkout_base(app_name: str, base_branch: str = "main") -> tuple[bool, str]:

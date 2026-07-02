@@ -78,7 +78,7 @@
             "in_list_view": 1,
             "in_standard_filter": 1,
             "label": "Type",
-            "options": "Bug Fix\nFeature Request\nImprovement",
+            "options": "Bug Fix\nReports & analytics\nDocTypes & data model\nForms & desk UI\nServer & business logic\nDocuments & output\nIntegrations\nPlatform & maintenance\nERPNext-flavored",
             "reqd": 1
         },
         {
@@ -127,7 +127,7 @@
             "label": "Model",
             "default": "gpt-4o-mini",
             "reqd": 1,
-            "options": "gpt-4o-mini\ngpt-4o\ngpt-5-mini\no3-mini\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022"
+            "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022"
         },
         {
             "fieldname": "config_section",
@@ -326,7 +326,7 @@
             "fieldname": "prompts",
             "fieldtype": "Table",
             "label": "Prompts",
-            "options": "AI Agent Prompt Configuration",
+            "options": "Agent Prompt Configuration",
             "depends_on": "eval:!doc.use_default_prompts"
         }
     ],
@@ -335,7 +335,7 @@
     "modified": "2026-03-12 10:00:00.000000",
     "modified_by": "Administrator",
     "module": "Ampower Koda",
-    "name": "AI Agent Request",
+    "name": "Agent Request",
     "naming_rule": "Expression",
     "owner": "Administrator",
     "permissions": [

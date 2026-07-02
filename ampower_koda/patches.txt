@@ -1,3 +1,4 @@
 [pre_model_sync]
 
 [post_model_sync]
+ampower_koda.patches.rename_agent_doctypes

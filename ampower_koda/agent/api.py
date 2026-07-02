@@ -8,10 +8,20 @@ import subprocess
 import frappe
 from frappe import _
 
-from ampower_koda.agent.git_ops import checkout_base
+from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent.executor import _generate_patch_diff
+from ampower_koda.agent.git_ops import (
+    branch_exists,
+    checkout_base,
+    diff_file,
+    get_current_branch,
+    get_repo_root,
+    list_changed_files,
+    run_git,
+)
 from ampower_koda.agent.graph import _get_bench_env
 
-DOCTYPE_NAME = "AI Agent Request"
+DOCTYPE_NAME = "Agent Request"
 
 
 def _validate_provider_key(doc):
@@ -19,9 +29,9 @@ def _validate_provider_key(doc):
     Verifies that the AI provider and its API key are correctly configured in settings.
     This check ensures the agent has its 'brain' ready before it attempts any work.
     """
-    settings = frappe.get_single("AI Agent Settings")
+    settings = frappe.get_single("Agent Settings")
     if not settings.enable_ai_agent:
-        frappe.throw(_("AI Coding Agent is disabled in AI Agent Settings."))
+        frappe.throw(_("AI Coding Agent is disabled in Agent Settings."))
     provider = (doc.ai_provider or settings.default_ai_provider or "OpenAI").strip()
     key_checks = {
         "OpenAI": ("openai_api_key", "OpenAI API key"),
@@ -30,7 +40,7 @@ def _validate_provider_key(doc):
     }
     field, label = key_checks.get(provider, key_checks["OpenAI"])
     if not getattr(settings, field, None):
-        frappe.throw(_("{0} is not set in AI Agent Settings.").format(label))
+        frappe.throw(_("{0} is not set in Agent Settings.").format(label))
 
 
 @frappe.whitelist()
@@ -71,6 +81,92 @@ def start_agent(request_name: str):
         request_name=request_name,
     )
     return {"status": "ok", "message": _("Planning phase started.")}
+
+
+@frappe.whitelist()
+def submit_follow_up(request_name: str, follow_up_message: str):
+    """
+    Append a user follow-up issue to existing context and run a surgical fix
+    on the same branch without restarting explore/plan.
+    """
+    if not request_name:
+        frappe.throw(_("Request name is required."))
+    if not (follow_up_message or "").strip():
+        frappe.throw(_("Follow-up message is required."))
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    restartable = ("Queued", "Failed", "Cancelled", "Completed", "Awaiting Approval", "Awaiting Push Approval")
+    if doc.status not in restartable:
+        frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
+    if not (doc.branch_name or "").strip():
+        frappe.throw(_("Follow-up fix needs an existing branch on this request."))
+
+    _validate_provider_key(doc)
+
+    base_request = (doc.user_message or "").strip()
+    follow_up = (follow_up_message or "").strip()
+
+    context_lines = []
+    if doc.status:
+        context_lines.append(f"- Previous status: {doc.status}")
+    if doc.branch_name:
+        context_lines.append(f"- Previous branch: {doc.branch_name}")
+    if doc.pr_url:
+        context_lines.append(f"- Previous PR: {doc.pr_url}")
+    if doc.error_log:
+        context_lines.append(f"- Previous error snapshot: {(doc.error_log or '')[:400]}")
+    context_text = "\n".join(context_lines) if context_lines else "- No additional run metadata recorded."
+
+    changed_paths = []
+    try:
+        for row in json.loads(doc.files_changed or "[]"):
+            p = (row or {}).get("path")
+            if p:
+                changed_paths.append(p)
+    except Exception:
+        pass
+    changed_hint = "\n".join(f"- {p}" for p in changed_paths[:20]) if changed_paths else "- (not recorded)"
+
+    merged_message = (
+        f"{base_request}\n\n"
+        "## FOLLOW-UP ISSUE AFTER USER TESTING\n"
+        f"{follow_up}\n\n"
+        "## CONTEXT FROM PREVIOUS RUN\n"
+        f"{context_text}\n\n"
+        "### Instructions for follow-up\n"
+        "- Fix the follow-up issue precisely.\n"
+        "- Keep all previously working functionality intact.\n"
+        "- Prefer surgical changes over broad rewrites.\n"
+    )
+    focused_plan = (
+        "Follow-up fix plan (same branch, no re-explore):\n"
+        "1) Reproduce the exact follow-up issue from USER REQUEST.\n"
+        "2) Inspect only the files directly related to the issue first.\n"
+        "3) Apply minimal targeted edits.\n"
+        "4) Run validate_code on changed .py/.js and verify no regressions in touched flows.\n"
+        "5) Report precise files changed and why.\n\n"
+        "Likely affected files from previous run:\n"
+        f"{changed_hint}"
+    )
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        "status": "Implementing",
+        "user_message": merged_message[:50000],
+        "agent_plan": focused_plan[:50000],
+        "error_log": "",
+        "bench_log": "",
+        "patch_diff": "",
+    })
+    frappe.db.commit()
+
+    frappe.enqueue(
+        "ampower_koda.agent.executor.run_execution_phase",
+        queue="default",
+        timeout=1800,
+        request_name=request_name,
+        preserve_branch=1,
+    )
+    return {"status": "ok", "message": _("Follow-up run started on existing branch (explore/plan skipped).")}
 
 
 @frappe.whitelist()
@@ -361,6 +457,373 @@ def get_agent_status(request_name: str):
         "bench_log": doc.bench_log,
         "patch_diff": doc.patch_diff,
     }
+
+
+_SKIP_TREE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "dist", "build", ".mypy_cache"}
+_SKIP_TREE_SUFFIXES = (".pyc", ".pyo")
+
+
+def _parse_patch_diff_index(patch_diff: str) -> dict[str, str]:
+    """Build {relative_path: status} from a stored unified diff."""
+    changed: dict[str, str] = {}
+    if not patch_diff:
+        return changed
+
+    lines = patch_diff.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith("--- "):
+            i += 1
+            continue
+
+        old_raw = line[4:].strip()
+        new_raw = ""
+        if i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+            new_raw = lines[i + 1][4:].strip()
+            i += 2
+        else:
+            i += 1
+            continue
+
+        if old_raw == "/dev/null" and new_raw.startswith("b/"):
+            changed[new_raw[2:]] = "A"
+        elif new_raw == "/dev/null" and old_raw.startswith("a/"):
+            changed[old_raw[2:]] = "D"
+        elif old_raw.startswith("a/") and new_raw.startswith("b/"):
+            changed[new_raw[2:]] = "M"
+        elif new_raw.startswith("b/"):
+            changed[new_raw[2:]] = "M"
+
+    return changed
+
+
+def _extract_file_diff_from_patch(patch_diff: str, file_path: str) -> str:
+    """Extract one file's diff block from combined patch_diff text."""
+    if not patch_diff or not file_path:
+        return ""
+
+    blocks = patch_diff.split("\n\n")
+    needle_a = f"--- a/{file_path}"
+    needle_null_old = "--- /dev/null"
+    needle_b = f"+++ b/{file_path}"
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        if needle_b in block and (needle_a in block or needle_null_old in block):
+            return block
+    return ""
+
+
+def _safe_repo_path(repo_root: str, file_path: str) -> str:
+    """Resolve file_path inside repo_root or throw on traversal."""
+    if not file_path or file_path.startswith("/") or ".." in file_path.split("/"):
+        frappe.throw(_("Invalid file path."))
+
+    full = os.path.normpath(os.path.join(repo_root, file_path))
+    root_norm = os.path.normpath(repo_root)
+    if not full.startswith(root_norm + os.sep) and full != root_norm:
+        frappe.throw(_("File path is outside the repository."))
+    return full
+
+
+def _write_repo_file(repo_root: str, file_path: str, content: str) -> str:
+    """Write content to a repo-relative path; return absolute path written."""
+    full = _safe_repo_path(repo_root, file_path)
+    parent = os.path.dirname(full)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(content)
+    return full
+
+
+def _should_skip_tree_entry(name: str) -> bool:
+    if name in _SKIP_TREE_DIRS:
+        return True
+    return any(name.endswith(suffix) for suffix in _SKIP_TREE_SUFFIXES)
+
+
+def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]:
+    """Walk repo_root and return nested tree nodes with change metadata."""
+
+    def walk(dir_path: str, rel_prefix: str) -> list[dict]:
+        nodes: list[dict] = []
+        try:
+            entries = sorted(os.listdir(dir_path))
+        except OSError:
+            return nodes
+
+        for name in entries:
+            if _should_skip_tree_entry(name):
+                continue
+
+            full = os.path.join(dir_path, name)
+            rel = f"{rel_prefix}/{name}" if rel_prefix else name
+
+            if os.path.isdir(full):
+                children = walk(full, rel)
+                changed_count = sum(
+                    1 for c in changed if c == rel or c.startswith(rel + "/")
+                )
+                nodes.append({
+                    "name": name,
+                    "type": "folder",
+                    "path": rel,
+                    "children": children,
+                    "changed_count": changed_count,
+                    "has_changes": changed_count > 0,
+                })
+            else:
+                status = changed.get(rel)
+                nodes.append({
+                    "name": name,
+                    "type": "file",
+                    "path": rel,
+                    "status": status,
+                    "has_changes": bool(status),
+                })
+
+        folders = [n for n in nodes if n["type"] == "folder"]
+        files = [n for n in nodes if n["type"] == "file"]
+        folders.sort(key=lambda n: n["name"].lower())
+        files.sort(key=lambda n: n["name"].lower())
+        return folders + files
+
+    return walk(repo_root, "")
+
+
+def _get_changed_files_for_request(doc) -> tuple[dict[str, str], str]:
+    """Return changed file map and data source ('git' or 'patch_diff')."""
+    app_name = (doc.target_app_name or "").strip()
+    base_branch = (doc.base_branch or "main").strip()
+    branch_name = (doc.branch_name or "").strip()
+
+    if app_name and branch_name and branch_exists(app_name, branch_name):
+        ok, files = list_changed_files(app_name, base_branch, branch_name)
+        if ok and files:
+            return {f["path"]: f["status"] for f in files}, "git"
+
+    patch_index = _parse_patch_diff_index(doc.patch_diff or "")
+    if patch_index:
+        return patch_index, "patch_diff"
+
+    if app_name and branch_name and branch_exists(app_name, branch_name):
+        ok, files = list_changed_files(app_name, base_branch, branch_name)
+        if ok:
+            return {f["path"]: f["status"] for f in files}, "git"
+
+    return {}, "none"
+
+
+@frappe.whitelist()
+def get_change_tree(request_name: str):
+    """Return full app directory tree with agent-modified files highlighted."""
+    if not request_name:
+        frappe.throw(_("Request name is required."))
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    app_name = (doc.target_app_name or "").strip()
+    if not app_name:
+        frappe.throw(_("Target app is not set on this request."))
+
+    repo_root = get_repo_root(app_name)
+    changed, source = _get_changed_files_for_request(doc)
+    tree = _build_directory_tree(repo_root, changed)
+
+    pending_cmds = []
+    try:
+        pending_cmds = json.loads(doc.pending_bench_commands or "[]")
+    except Exception:
+        pass
+
+    return {
+        "request_name": doc.name,
+        "app_name": app_name,
+        "base_branch": (doc.base_branch or "main").strip(),
+        "branch_name": (doc.branch_name or "").strip(),
+        "source": source,
+        "changed": changed,
+        "tree": tree,
+        "totals": {"files": len(changed)},
+        "request": {
+            "status": doc.status,
+            "pr_url": doc.pr_url,
+            "pr_number": doc.pr_number,
+            "pending_bench_commands": pending_cmds,
+        },
+    }
+
+
+@frappe.whitelist()
+def get_file_diff(request_name: str, file_path: str):
+    """Return untruncated unified diff for one file in the agent's changes."""
+    if not request_name:
+        frappe.throw(_("Request name is required."))
+    if not file_path:
+        frappe.throw(_("File path is required."))
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    app_name = (doc.target_app_name or "").strip()
+    if not app_name:
+        frappe.throw(_("Target app is not set on this request."))
+
+    repo_root = get_repo_root(app_name)
+    _safe_repo_path(repo_root, file_path)
+
+    base_branch = (doc.base_branch or "main").strip()
+    branch_name = (doc.branch_name or "").strip()
+    changed, source = _get_changed_files_for_request(doc)
+    status = changed.get(file_path, "")
+
+    diff_text = ""
+    if branch_name and branch_exists(app_name, branch_name):
+        ok, diff_text = diff_file(app_name, base_branch, branch_name, file_path)
+        if not ok:
+            diff_text = ""
+
+    if not diff_text.strip():
+        diff_text = _extract_file_diff_from_patch(doc.patch_diff or "", file_path)
+
+    return {
+        "path": file_path,
+        "status": status,
+        "source": source if diff_text else "none",
+        "diff": diff_text,
+    }
+
+
+def _detect_editor_language(file_path: str) -> str:
+    ext = os.path.splitext(file_path or "")[1].lower()
+    return {
+        ".py": "Python",
+        ".js": "Javascript",
+        ".json": "JSON",
+        ".html": "HTML",
+        ".css": "CSS",
+        ".md": "Markdown",
+    }.get(ext, "Text")
+
+
+def _ensure_agent_branch(doc) -> str:
+    """Checkout the request's agent branch before IDE file writes."""
+    app_name = (doc.target_app_name or "").strip()
+    branch_name = (doc.branch_name or "").strip()
+    if not app_name:
+        frappe.throw(_("Target app is not set on this request."))
+    if not branch_name:
+        frappe.throw(_("No agent branch found on this request."))
+
+    repo_root = get_repo_root(app_name)
+    current = get_current_branch(app_name)
+    if current != branch_name:
+        if not branch_exists(app_name, branch_name):
+            frappe.throw(_("Branch '{0}' was not found locally.").format(branch_name))
+        ok, out = run_git(["checkout", branch_name], cwd=repo_root)
+        if not ok:
+            frappe.throw(_("Could not checkout branch '{0}': {1}").format(branch_name, out))
+    return branch_name
+
+
+@frappe.whitelist()
+def get_file_content(request_name: str, file_path: str):
+    """Return full file content for the IDE editor."""
+    if not request_name:
+        frappe.throw(_("Request name is required."))
+    if not file_path:
+        frappe.throw(_("File path is required."))
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    _ensure_agent_branch(doc)
+    app_name = (doc.target_app_name or "").strip()
+    if not app_name:
+        frappe.throw(_("Target app is not set on this request."))
+
+    repo_root = get_repo_root(app_name)
+    full = _safe_repo_path(repo_root, file_path)
+    if not os.path.isfile(full):
+        frappe.throw(_("File not found: {0}").format(file_path))
+
+    with open(full, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    return {
+        "path": file_path,
+        "full_path": full,
+        "content": content,
+        "language": _detect_editor_language(file_path),
+    }
+
+
+@frappe.whitelist()
+def save_file_content(request_name: str, file_path: str, content: str):
+    """Save edited file content from the IDE to the agent branch working tree."""
+    if not request_name:
+        frappe.throw(_("Request name is required."))
+    if not file_path:
+        frappe.throw(_("File path is required."))
+    if content is None:
+        frappe.throw(_("File content is required."))
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    _ensure_agent_branch(doc)
+    app_name = (doc.target_app_name or "").strip()
+
+    repo_root = get_repo_root(app_name)
+    full_path = _write_repo_file(repo_root, file_path, content)
+
+    patch_diff = _generate_patch_diff(app_name)
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "patch_diff", patch_diff[:100000])
+    frappe.db.commit()
+
+    return {
+        "status": "ok",
+        "message": _("Saved {0} bytes to disk.").format(len(content)),
+        "path": file_path,
+        "full_path": full_path,
+    }
+
+
+@frappe.whitelist()
+def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
+    """Commit current changes, push branch, and optionally create PR from the IDE."""
+    if not request_name:
+        frappe.throw(_("Request name is required."))
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    if not (doc.branch_name or "").strip():
+        frappe.throw(_("No branch on this request."))
+
+    busy = ("Understanding", "Planning", "Implementing", "Reviewing", "Building", "Pushing")
+    if doc.status in busy:
+        frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
+
+    push_branch = int(push_branch or 0)
+    create_pr = int(create_pr or 0)
+    if not push_branch and not create_pr:
+        frappe.throw(_("Select at least one action (push branch or create PR)."))
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
+    frappe.db.commit()
+
+    frappe.enqueue(
+        "ampower_koda.agent.executor.run_deploy_phase",
+        queue="default",
+        timeout=600,
+        request_name=request_name,
+        do_push=bool(push_branch),
+        do_pr=bool(create_pr),
+    )
+
+    if push_branch and create_pr:
+        msg = _("Committing, pushing, and creating PR...")
+    elif push_branch:
+        msg = _("Committing and pushing branch {0}...").format(doc.branch_name)
+    else:
+        msg = _("Committing and creating PR...")
+    return {"status": "ok", "message": msg}
 
 
 @frappe.whitelist()

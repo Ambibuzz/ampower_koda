@@ -5,16 +5,16 @@ import frappe
 from frappe.model.document import Document
 
 
-class AIAgentRequest(Document):
+class AgentRequest(Document):
     def before_insert(self):
         if not self.owner:
             self.owner = frappe.session.user
         self._set_defaults_from_settings()
 
     def _set_defaults_from_settings(self):
-        """Populate provider/model defaults from AI Agent Settings if not already set."""
+        """Populate provider/model defaults from Agent Settings if not already set."""
         try:
-            settings = frappe.get_single("AI Agent Settings")
+            settings = frappe.get_single("Agent Settings")
             if not self.ai_provider:
                 self.ai_provider = settings.default_ai_provider or "OpenAI"
             if not self.ai_model:
@@ -28,15 +28,12 @@ class AIAgentRequest(Document):
         if not self.github_repo_url or not self.github_repo_url.strip():
             frappe.throw("GitHub Repo URL is required")
 
-        # Password fields need get_password() for value check on existing docs;
-        # on new docs the value is in self.github_token directly
         token = self.github_token
         if not self.is_new():
             token = self.get_password("github_token", raise_exception=False)
         if not token:
             frappe.throw("GitHub Token is required")
 
-        # Prevent duplicate prompt types
         if not self.use_default_prompts:
             seen = set()
             for row in self.prompts:

@@ -2,11 +2,11 @@ import frappe
 from frappe.model.document import Document
 
 
-class AIAgentPromptConfiguration(Document):
+class AgentPromptConfiguration(Document):
 
     def validate(self):
         existing = frappe.get_all(
-            "AI Agent Prompt Configuration",
+            "Agent Prompt Configuration",
             filters={
                 "parent": self.parent,
                 "parenttype": self.parenttype,

@@ -58,7 +58,7 @@
             "fieldtype": "Select",
             "label": "AI Model",
             "default": "gpt-4o-mini",
-            "options": "gpt-4o-mini\ngpt-4o\ngpt-5-mini\no3-mini\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022",
+            "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022",
             "description": "Default model for new requests. Changes with provider selection."
         },
         {
@@ -111,7 +111,7 @@
     "modified": "2026-03-31 20:30:00.000000",
     "modified_by": "Administrator",
     "module": "Ampower Koda",
-    "name": "AI Agent Settings",
+    "name": "Agent Settings",
     "owner": "Administrator",
     "permissions": [
         {

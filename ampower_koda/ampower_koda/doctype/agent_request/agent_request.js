@@ -1,21 +1,23 @@
 // Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-// AI Agent Request — client script
+// Agent Request: client script
 
 var PROVIDER_MODELS = {
     'OpenAI': [
-        { value: 'gpt-4o-mini', label: 'GPT-4o Mini — fast, cost-effective' },
-        { value: 'gpt-4o', label: 'GPT-4o — best overall' },
-        { value: 'gpt-5-mini', label: 'GPT-5 Mini — next-gen, efficient' },
-        { value: 'o3-mini', label: 'o3-mini — reasoning model' }
+        { value: 'gpt-4o-mini', label: 'GPT-4o Mini: fast, cost-effective' },
+        { value: 'gpt-5-mini', label: 'GPT-5 Mini: next-gen, efficient' },
+        { value: 'gpt-5.1-codex-mini', label: 'GPT-5.1 Codex Mini: compact coding' },
+        { value: 'gpt-5-codex', label: 'GPT-5 Codex: coding model' },
+        { value: 'gpt-5.1-codex', label: 'GPT-5.1 Codex: coding model' },
+        { value: 'gpt-5.2-codex', label: 'GPT-5.2 Codex: latest coding model' }
     ],
     'Gemini': [
-        { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash — fast, multimodal' },
-        { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — most capable' }
+        { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash: fast, multimodal' },
+        { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro: most capable' }
     ],
     'Claude': [
-        { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4 — balanced' },
-        { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet — proven' },
-        { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku — fast, light' }
+        { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4: balanced' },
+        { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet: proven' },
+        { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku: fast, light' }
     ]
 };
 
@@ -23,6 +25,18 @@ var DEFAULT_MODELS = {
     'OpenAI': 'gpt-4o-mini',
     'Gemini': 'gemini-2.0-flash',
     'Claude': 'claude-sonnet-4-20250514'
+};
+
+var REQUEST_TYPE_HELP = {
+    'Bug Fix': '<b>Highlights:</b> Fix a specific failure (validation error, broken API, JS error, wrong query).',
+    'Reports & analytics': '<b>Highlights:</b> Create or modify Script Reports, filters, columns, or analytics.',
+    'DocTypes & data model': '<b>Highlights:</b> Create/modify DocTypes, fields, child tables, permissions, naming rules.',
+    'Forms & desk UI': '<b>Highlights:</b> Client scripts, buttons, list view tweaks, field visibility, desk UX changes.',
+    'Server & business logic': '<b>Highlights:</b> Validation logic, controller changes, whitelisted APIs, queries.',
+    'Documents & output': '<b>Highlights:</b> Print Formats, PDF templates, document output formatting.',
+    'Integrations': '<b>Highlights:</b> External APIs, webhooks, sync, connectors, third-party services.',
+    'Platform & maintenance': '<b>Highlights:</b> Patches, hooks, scheduler tasks, performance or cleanup work.',
+    'ERPNext-flavored': '<b>Highlights:</b> ERPNext flows (Sales, Stock, Accounts) in your custom app.'
 };
 
 var STATUS_FLOW = [
@@ -37,7 +51,7 @@ var STATUS_META = {
     'Planning': { color: 'blue', label: 'Creating Plan' },
     'Awaiting Approval': { color: 'orange', label: 'Review Plan' },
     'Implementing': { color: 'yellow', label: 'Implementing Changes' },
-    'Reviewing': { color: 'yellow', label: 'Reviewing Code' },
+    'Reviewing': { color: 'yellow', label: 'Testing Changes' },
     'Awaiting Bench Approval': { color: 'orange', label: 'Approve Bench Commands' },
     'Building': { color: 'purple', label: 'Running Bench Commands' },
     'Awaiting Push Approval': { color: 'orange', label: 'Approve Push to GitHub' },
@@ -47,7 +61,7 @@ var STATUS_META = {
     'Cancelled': { color: 'grey', label: 'Cancelled' }
 };
 
-frappe.ui.form.on('AI Agent Request', {
+frappe.ui.form.on('Agent Request', {
     refresh: function (frm) {
         render_status_dashboard(frm);
         setup_action_buttons(frm);
@@ -55,8 +69,13 @@ frappe.ui.form.on('AI Agent Request', {
         setup_status_polling(frm);
         setup_live_log_panel(frm);
         set_model_options_for_provider(frm);
+        update_request_type_help(frm);
         toggle_config_readonly(frm);
         style_form(frm);
+    },
+
+    request_type: function (frm) {
+        update_request_type_help(frm);
     },
 
     ai_provider: function (frm) {
@@ -76,11 +95,12 @@ frappe.ui.form.on('AI Agent Request', {
             load_user_defaults(frm);
             set_model_options_for_provider(frm);
         }
+        update_request_type_help(frm);
     }
 });
 
 // ---------------------------------------------------------------------------
-// Status Dashboard — visual progress indicator
+// Status Dashboard: visual progress indicator
 // ---------------------------------------------------------------------------
 
 function render_status_dashboard(frm) {
@@ -103,7 +123,7 @@ function render_status_dashboard(frm) {
         { key: 'Planning', short: 'Plan' },
         { key: 'Awaiting Approval', short: 'Review' },
         { key: 'Implementing', short: 'Build' },
-        { key: 'Reviewing', short: 'Verify' },
+        { key: 'Reviewing', short: 'Test' },
         { key: 'Awaiting Bench Approval', short: 'Bench' },
         { key: 'Awaiting Push Approval', short: 'Push' },
         { key: 'Completed', short: 'Done' }
@@ -362,7 +382,7 @@ function style_form(frm) {
 }
 
 // ---------------------------------------------------------------------------
-// Model dropdown — filter options by selected provider
+// Model dropdown: filter options by selected provider
 // ---------------------------------------------------------------------------
 
 function set_model_options_for_provider(frm) {
@@ -380,9 +400,16 @@ function set_model_options_for_provider(frm) {
     }
 
     var desc = entries.map(function (m) {
-        return '<b>' + m.value + '</b> — ' + m.label.split(' — ')[1];
+        return '<b>' + m.value + '</b>: ' + m.label.split(': ')[1];
     }).join(' &nbsp;|&nbsp; ');
     frm.set_df_property('ai_model', 'description', desc);
+}
+
+function update_request_type_help(frm) {
+    var value = frm.doc.request_type || '';
+    var text = REQUEST_TYPE_HELP[value] || '<b>Highlights:</b> Select a request type to see what the agent will focus on.';
+    frm.set_df_property('request_type', 'description', text);
+    frm.refresh_field('request_type');
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +520,62 @@ function setup_action_buttons(frm) {
             cancel_request(frm);
         }, __('Actions'));
     }
+
+    var followup_allowed = ['Queued', 'Completed', 'Failed', 'Cancelled', 'Awaiting Approval', 'Awaiting Push Approval'].indexOf(status) !== -1;
+    if (followup_allowed && !frm.is_new()) {
+        frm.add_custom_button(__('Submit Follow-up Fix'), function () {
+            open_follow_up_dialog(frm);
+        }, __('Actions'));
+    }
+
+    if ((frm.doc.branch_name || frm.doc.patch_diff) && !frm.is_new()) {
+        frm.add_custom_button(__('Open IDE'), function () {
+            frappe.set_route('agent-diff-viewer', frm.doc.name);
+        }, __('Actions'));
+    }
+}
+
+function open_follow_up_dialog(frm) {
+    var dialog = new frappe.ui.Dialog({
+        title: __('Submit Follow-up Fix'),
+        fields: [
+            {
+                fieldname: 'follow_up_message',
+                fieldtype: 'Small Text',
+                label: __('What broke after testing?'),
+                reqd: 1,
+                description: __('Describe the error/regression observed after the previous run. This will be appended to the request context.'),
+            }
+        ],
+        primary_action_label: __('Start Follow-up Run'),
+        primary_action: function (values) {
+            var msg = (values.follow_up_message || '').trim();
+            if (!msg) {
+                frappe.msgprint(__('Please enter follow-up details.'));
+                return;
+            }
+            frappe.call({
+                method: 'ampower_koda.agent.api.submit_follow_up',
+                args: {
+                    request_name: frm.doc.name,
+                    follow_up_message: msg
+                },
+                freeze: true,
+                freeze_message: __('Submitting follow-up and starting surgical fix on same branch...'),
+                callback: function (r) {
+                    if (r.message && r.message.status === 'ok') {
+                        frappe.show_alert({
+                            message: __('Follow-up submitted. Agent started targeted fix on same branch.'),
+                            indicator: 'blue'
+                        });
+                        dialog.hide();
+                        frm.reload_doc();
+                    }
+                }
+            });
+        }
+    });
+    dialog.show();
 }
 
 function start_agent(frm) {
@@ -505,7 +588,7 @@ function start_agent(frm) {
             callback: function (r) {
                 if (r.message && r.message.status === 'ok') {
                     frappe.show_alert({
-                        message: __('Agent started — exploring codebase...'),
+                        message: __('Agent started: exploring codebase...'),
                         indicator: 'blue'
                     });
                     frm.reload_doc();
@@ -523,7 +606,7 @@ function start_agent(frm) {
 
 function execute_existing_plan(frm) {
     frappe.confirm(
-        __('Skip exploration & planning — execute the existing plan directly?<br><br>The agent will implement the plan, run bench commands, and ask for push approval.'),
+        __('Skip exploration & planning: execute the existing plan directly?<br><br>The agent will implement the plan, run bench commands, and ask for push approval.'),
         function () {
             function do_execute() {
                 frappe.call({
@@ -534,7 +617,7 @@ function execute_existing_plan(frm) {
                     callback: function (r) {
                         if (r.message && r.message.status === 'ok') {
                             frappe.show_alert({
-                                message: __('Executing existing plan — implementation in progress...'),
+                                message: __('Executing existing plan: implementation in progress...'),
                                 indicator: 'blue'
                             });
                             frm.reload_doc();
@@ -567,7 +650,7 @@ function approve_plan(frm) {
                 callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
-                            message: __('Plan approved — execution in progress...'),
+                            message: __('Plan approved: execution in progress...'),
                             indicator: 'green'
                         });
                         frm.reload_doc();
@@ -641,7 +724,7 @@ function approve_bench(frm) {
                 callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
-                            message: __('Bench commands approved — running...'),
+                            message: __('Bench commands approved: running...'),
                             indicator: 'blue'
                         });
                         frm.reload_doc();
@@ -1020,7 +1103,7 @@ function append_log_entry(frm, data) {
 }
 
 // ---------------------------------------------------------------------------
-// User defaults — remember last-used configuration across requests
+// User defaults: remember last-used configuration across requests
 // ---------------------------------------------------------------------------
 
 function save_user_defaults(frm) {
@@ -1036,7 +1119,7 @@ function save_user_defaults(frm) {
         frappe.call({
             method: 'frappe.model.utils.user_settings.save',
             args: {
-                doctype: 'AI Agent Request',
+                doctype: 'Agent Request',
                 user_settings: JSON.stringify(vals)
             },
             async: true
@@ -1047,7 +1130,10 @@ function save_user_defaults(frm) {
 function load_user_defaults(frm) {
     var stored = {};
     try {
-        var raw = frappe.get_user_settings('AI Agent Request');
+        var raw = frappe.get_user_settings('Agent Request');
+        if (!raw || !Object.keys(raw).length) {
+            raw = frappe.get_user_settings('AI Agent Request') || {};
+        }
         if (raw && typeof raw === 'object') stored = raw;
     } catch (e) { /* no saved settings */ }
 

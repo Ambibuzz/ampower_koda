@@ -39,12 +39,85 @@ MAX_TOOL_ROUNDS_EXECUTION = 30
 MAX_TOOL_ROUNDS_REVIEW = 10
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
 
-DOCTYPE_NAME = "AI Agent Request"
+DOCTYPE_NAME = "Agent Request"
+
+
+def _message_content_to_str(content) -> str:
+    """Normalize AIMessage content to plain text (Responses API returns list blocks)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif block.get("type") == "refusal" and block.get("refusal"):
+                    parts.append(str(block["refusal"]))
+            else:
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
+def _llm_response_text(response) -> str:
+    """Extract plain text from a LangChain chat model response."""
+    return _message_content_to_str(getattr(response, "content", ""))
+
+
+def _parse_review_verdict(text: str) -> tuple[bool, str]:
+    """Parse explicit testing verdict from review output without an extra LLM call."""
+    notes = (text or "").strip()
+    upper = notes.upper()
+    if _re.search(r"REVIEW_PASSED\s*[=:]\s*YES\b", upper):
+        return True, notes
+    if _re.search(r"REVIEW_PASSED\s*[=:]\s*NO\b", upper):
+        return False, notes
+    if "REVIEW_PASSED=YES" in upper or "REVIEW PASSED: YES" in upper:
+        return True, notes
+    if "REVIEW_PASSED=NO" in upper or "REVIEW PASSED: NO" in upper:
+        return False, notes
+    return False, notes or "Testing verdict missing explicit REVIEW_PASSED=yes/no."
+
+
+def _syntax_check_edits(app_name: str, edits: list[dict]) -> tuple[bool, str]:
+    """Validate edited .py/.js locally before spending an LLM review turn."""
+    paths = [e.get("path", "") for e in (edits or []) if e.get("path")]
+    code_paths = [p for p in paths if p.endswith((".py", ".js"))]
+    if not code_paths:
+        return True, ""
+
+    failures = []
+    summary_lines = []
+    for path in code_paths:
+        result = agent_tools.validate_code(app_name, path)
+        first_line = (result or "").split("\n", 1)[0][:240]
+        summary_lines.append(f"- {path}: {first_line}")
+        if "SYNTAX_ERROR" in result or "VALIDATION_FAILED" in result:
+            failures.append(result)
+
+    summary = "\n".join(summary_lines)
+    if failures:
+        return False, "\n\n".join(failures)
+    return True, summary
 
 
 # ---------------------------------------------------------------------------
 # LLM factory — supports OpenAI and Gemini
 # ---------------------------------------------------------------------------
+
+def _openai_uses_responses_api(model: str) -> bool:
+    """Codex and newer pro models require OpenAI's /v1/responses endpoint."""
+    name = (model or "").lower()
+    return "codex" in name or "gpt-5.2-pro" in name or name.startswith("gpt-5.4")
+
 
 def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
     """
@@ -61,7 +134,10 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
         return ChatAnthropic(model=model, temperature=0)
     if provider not in ("OpenAI", "Gemini", "Claude"):
         frappe.log_error(f"Unknown AI provider '{provider}', defaulting to OpenAI", "Agent LLM Warning")
-    return ChatOpenAI(model=model, temperature=0)
+    openai_kwargs = {"model": model, "temperature": 0}
+    if _openai_uses_responses_api(model):
+        openai_kwargs["use_responses_api"] = True
+    return ChatOpenAI(**openai_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +355,7 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
                 tokens_total=total_tokens,
             )
 
-        response_text = getattr(response, "content", "") or ""
+        response_text = _llm_response_text(response)
         if response_text:
             _publish_agent_log(request_name, "llm_response",
                 preview=response_text[:4000],
@@ -324,7 +400,7 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
     usage = getattr(final, "usage_metadata", None)
     if usage:
         total_tokens += int(usage.get("total_tokens") or 0)
-    return (getattr(final, "content", "") or ""), edited_paths, total_tokens
+    return _llm_response_text(final), edited_paths, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +425,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             max_rounds=max_rounds,
             state=state,      
         )
+        content = _message_content_to_str(content)
         max_output = 30000 if phase in ("Understanding", "Planning") else 8000
         steps = list(state.get("intermediate_steps") or []) + [
             {"phase": phase, "output": (content[:max_output] if content else "")}
@@ -397,7 +474,7 @@ def understand_node(state: dict) -> dict:
         updates["stage_log"] = logs
         return updates
     steps = updates.get("intermediate_steps") or []
-    summary = steps[-1].get("output", "") if steps else ""
+    summary = _message_content_to_str(steps[-1].get("output", "") if steps else "")
     updates["understanding_summary"] = summary
     logs = _log_stage({**state, "stage_log": logs}, "Understanding", "completed", summary[:200])
     updates["stage_log"] = logs
@@ -419,7 +496,7 @@ def plan_node(state: dict) -> dict:
         model = state.get("ai_model", "gpt-4o-mini")
         app_name = state.get("target_app_name", "target_app")
         request_name = state.get("request_name", "")
-        understanding = state.get("understanding_summary", "")
+        understanding = _message_content_to_str(state.get("understanding_summary", ""))
         user_message = state.get("user_message", "")
 
         if not understanding.strip():
@@ -436,7 +513,7 @@ def plan_node(state: dict) -> dict:
             preview="Generating detailed plan from codebase analysis...", round=1)
 
         response = llm.invoke([HumanMessage(content=full_prompt)])
-        plan = getattr(response, "content", "") or ""
+        plan = _llm_response_text(response)
 
         if not plan.strip():
             logs = _log_stage({**state, "stage_log": logs}, "Planning", "failed",
@@ -483,7 +560,9 @@ def implement_node(state: dict) -> dict:
     logs = _log_stage(state, "Implementing", "started", f"Applying code changes (attempt {attempt})")
 
     app_name = state.get("target_app_name", "")
-    all_text = (state.get("plan", "") + "\n" + state.get("understanding_summary", ""))
+    plan_text = _message_content_to_str(state.get("plan", ""))
+    understanding_text = _message_content_to_str(state.get("understanding_summary", ""))
+    all_text = plan_text + "\n" + understanding_text
     file_paths = _extract_file_paths(all_text)
     file_contents = _pre_read_files(app_name, file_paths)
     logs = _log_stage(
@@ -492,8 +571,8 @@ def implement_node(state: dict) -> dict:
     )
 
     base_prompt = get_implement_prompt(
-        state.get("plan", ""),
-        state.get("understanding_summary", ""),
+        plan_text,
+        understanding_text,
         state.get("user_message", ""),
         file_contents,
         request_name=state.get("request_name"),
@@ -545,9 +624,32 @@ def review_node(state: dict) -> dict:
     """
     if state.get("error"):
         return {"error": state["error"]}
-    logs = _log_stage(state, "Reviewing", "started", "Reviewing implemented changes")
+    logs = _log_stage(state, "Reviewing", "started", "Testing implemented changes")
     edits = state.get("edits_made", [])
+    app_name = state.get("target_app_name", "")
+
+    syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
+    if not syntax_ok:
+        updates = {
+            "review_passed": False,
+            "review_notes": syntax_report[:500],
+            "review_attempts": (state.get("review_attempts") or 0) + 1,
+        }
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Reviewing", "completed",
+            f"Testing FAILED (syntax): {syntax_report[:100]}"
+        )
+        updates["stage_log"] = logs
+        return updates
+
     prompt = get_review_prompt(edits, state.get("user_message", ""), request_name=state.get("request_name"))
+    if syntax_report:
+        prompt += (
+            "\n\n## SYNTAX PRE-CHECK (already validated locally)\n"
+            f"{syntax_report}\n"
+            "Do not call validate_code unless you need to re-check after reasoning. "
+            "Focus on request scope, wiring, and regressions, then give REVIEW_PASSED=yes/no."
+        )
     updates = _run_agent_turn(state, "Reviewing", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_REVIEW)
     if updates.get("error"):
         logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "failed", updates["error"][:200])
@@ -555,34 +657,13 @@ def review_node(state: dict) -> dict:
         return updates
 
     steps = updates.get("intermediate_steps") or []
-    last_out = (steps[-1].get("output", "") if steps else "")
+    last_out = _message_content_to_str(steps[-1].get("output", "") if steps else "")
 
-    if "REVIEW_PASSED" not in last_out.upper():
-        try:
-            provider = state.get("ai_provider", "OpenAI")
-            model = state.get("ai_model", "gpt-4o-mini")
-            llm = _get_llm(provider=provider, model=model)
-            verdict_response = llm.invoke([HumanMessage(
-                content=(
-                    "Based on the review you just performed, give your final verdict.\n"
-                    "Reply with EXACTLY one of:\n"
-                    "- REVIEW_PASSED=yes (if all changes are correct)\n"
-                    "- REVIEW_PASSED=no (followed by what's wrong)\n\n"
-                    f"Review output so far: {last_out[:2000]}"
-                )
-            )])
-            verdict = getattr(verdict_response, "content", "") or ""
-            if verdict.strip():
-                last_out = verdict
-        except Exception:
-            pass
-
-    last_out_upper = last_out.upper()
-    passed = "REVIEW_PASSED=YES" in last_out_upper
+    passed, notes = _parse_review_verdict(last_out)
     updates["review_passed"] = passed
-    updates["review_notes"] = last_out[:500]
+    updates["review_notes"] = notes[:500]
     updates["review_attempts"] = (state.get("review_attempts") or 0) + 1
-    result_msg = "Review PASSED" if passed else f"Review FAILED: {last_out[:100]}"
+    result_msg = "Testing PASSED" if passed else f"Testing FAILED: {notes[:100]}"
     logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "completed", result_msg)
     updates["stage_log"] = logs
     return updates

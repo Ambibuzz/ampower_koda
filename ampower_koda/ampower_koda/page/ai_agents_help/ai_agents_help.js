@@ -19,7 +19,7 @@ frappe.pages['ai-agents-help'].on_page_load = function(wrapper) {
 
         <h3>Getting Started</h3>
         <ol>
-            <li>Open <b>AI Agent Settings</b> from the search bar.</li>
+            <li>Open <b>Agent Settings</b> from the search bar.</li>
             <li>Check <b>Enable AI Agent</b>.</li>
             <li>Enter your API key for OpenAI, Gemini, or Claude.</li>
             <li>Save.</li>
@@ -29,7 +29,7 @@ frappe.pages['ai-agents-help'].on_page_load = function(wrapper) {
 
         <h3>Creating a Request</h3>
         <ol>
-            <li>Go to <a href="/app/ai-agent-request/new">AI Agent Request</a> and click New.</li>
+            <li>Go to <a href="/app/agent-request/new">Agent Request</a> and click New.</li>
             <li>Fill in the Title and Description with what you need.</li>
             <li>Select the AI Provider and Model.</li>
             <li>Enter the Target App Name (e.g. ampower_task_manager).</li>
@@ -110,7 +110,7 @@ frappe.pages['ai-agents-help'].on_page_load = function(wrapper) {
             </tr>
             <tr>
                 <td style="padding:8px;border-bottom:1px solid var(--border-color);">OpenAI</td>
-                <td style="padding:8px;border-bottom:1px solid var(--border-color);">gpt-4o-mini, gpt-4o, gpt-5-mini, o3-mini</td>
+                <td style="padding:8px;border-bottom:1px solid var(--border-color);">gpt-4o-mini, gpt-5-mini, gpt-5.1-codex-mini, gpt-5-codex, gpt-5.1-codex, gpt-5.2-codex</td>
             </tr>
             <tr>
                 <td style="padding:8px;border-bottom:1px solid var(--border-color);">Gemini</td>
@@ -126,7 +126,7 @@ frappe.pages['ai-agents-help'].on_page_load = function(wrapper) {
 
         <h3>Tips</h3>
         <ul>
-            <li>Use a more capable model (gpt-4o, claude-sonnet-4, gemini-2.5-pro) for complex tasks.</li>
+            <li>Use a more capable model (gpt-5.2-codex, claude-sonnet-4, gemini-2.5-pro) for complex tasks.</li>
             <li>Write detailed descriptions -- the more context, the better the result.</li>
             <li>Edit the plan before approving if you see something wrong.</li>
             <li>Test changes on the instance before approving the push.</li>

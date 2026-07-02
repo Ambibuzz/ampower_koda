@@ -6,12 +6,14 @@ import os
 
 import frappe
 import subprocess
-from ampower_koda.agent.graph import _get_bench_env
 from ampower_koda.agent.graph import (
+    _get_bench_env,
+    _message_content_to_str,
     build_planning_graph,
     build_execution_graph,
 )
 from ampower_koda.agent.git_ops import (
+    branch_exists,
     generate_branch_name,
     get_repo_root,
     get_current_branch,
@@ -22,7 +24,7 @@ from ampower_koda.agent.git_ops import (
     create_pull_request,
 )
 
-DOCTYPE_NAME = "AI Agent Request"
+DOCTYPE_NAME = "Agent Request"
 
 
 def _revert_previous_changes(app_name: str, base_branch: str, request_name: str = "",
@@ -92,9 +94,9 @@ def _revert_previous_changes(app_name: str, base_branch: str, request_name: str 
 
 
 def _get_doc_config(request_name: str) -> dict:
-    """Load the AI Agent Request document and return config needed for the graph state."""
+    """Load the Agent Request document and return config needed for the graph state."""
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    settings = frappe.get_single("AI Agent Settings")
+    settings = frappe.get_single("Agent Settings")
 
     if not settings.enable_ai_agent:
         frappe.throw("AI Agent is disabled in settings")
@@ -110,7 +112,7 @@ def _get_doc_config(request_name: str) -> dict:
     field_name, env_var, label = cfg
     api_key = settings.get_password(field_name) or ""
     if not api_key.strip():
-        frappe.throw(f"{label} not set in AI Agent Settings")
+        frappe.throw(f"{label} not set in Agent Settings")
     os.environ[env_var] = api_key.strip()
 
     return {
@@ -234,7 +236,7 @@ def run_planning_phase(request_name: str) -> None:
 # Phase 2: Execution (Implement + Review)
 # ---------------------------------------------------------------------------
 
-def run_execution_phase(request_name: str) -> None:
+def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
     """
     Carries out the implementation of the approved plan.
     This phase creates a working branch, applies code changes, and performs
@@ -254,25 +256,56 @@ def run_execution_phase(request_name: str) -> None:
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
 
     try:
-        revert_msg = _revert_previous_changes(
-            config["target_app_name"], config["base_branch"],
-            request_name=request_name, user=user,
-            branch_prefix=config["branch_prefix"],
-        )
-        if revert_msg:
-            _update_status(request_name, user, "Implementing", f"Cleaned up: {revert_msg}")
-
         app_name = config["target_app_name"]
-        branch_name = generate_branch_name(request_name, config["branch_prefix"], app_name)
-        ok, msg = create_branch(app_name, branch_name, config["base_branch"])
-        if not ok:
-            _update_status(request_name, user, "Failed",
-                f"Failed to create working branch: {msg}",
-                error_log=f"create_branch failed: {msg}")
-            return
-        _update_status(request_name, user, "Implementing",
-            f"Created branch '{branch_name}'. Starting implementation...",
-            branch_name=branch_name)
+        keep_same_branch = bool(int(preserve_branch or 0))
+
+        if keep_same_branch:
+            branch_name = (doc.branch_name or "").strip()
+            if not branch_name:
+                _update_status(request_name, user, "Failed",
+                    "Follow-up mode requires an existing branch on this request.",
+                    error_log="Missing branch_name for follow-up execution.")
+                return
+            if not branch_exists(app_name, branch_name):
+                _update_status(request_name, user, "Failed",
+                    f"Follow-up branch '{branch_name}' was not found in local repo.",
+                    error_log=f"Branch not found: {branch_name}")
+                return
+
+            repo_root = get_repo_root(app_name)
+            current = get_current_branch(app_name)
+            if current != branch_name:
+                ok, msg = run_git(["checkout", branch_name], cwd=repo_root)
+                if not ok:
+                    _update_status(request_name, user, "Failed",
+                        f"Could not checkout follow-up branch '{branch_name}': {msg}",
+                        error_log=f"checkout failed: {msg}")
+                    return
+            # Keep same branch but start from clean HEAD for precise follow-up edits.
+            run_git(["reset", "--hard", "HEAD"], cwd=repo_root)
+            run_git(["clean", "-fd"], cwd=repo_root)
+            _update_status(request_name, user, "Implementing",
+                f"Follow-up mode: using existing branch '{branch_name}' (explore/plan skipped).",
+                branch_name=branch_name)
+        else:
+            revert_msg = _revert_previous_changes(
+                config["target_app_name"], config["base_branch"],
+                request_name=request_name, user=user,
+                branch_prefix=config["branch_prefix"],
+            )
+            if revert_msg:
+                _update_status(request_name, user, "Implementing", f"Cleaned up: {revert_msg}")
+
+            branch_name = generate_branch_name(request_name, config["branch_prefix"], app_name)
+            ok, msg = create_branch(app_name, branch_name, config["base_branch"])
+            if not ok:
+                _update_status(request_name, user, "Failed",
+                    f"Failed to create working branch: {msg}",
+                    error_log=f"create_branch failed: {msg}")
+                return
+            _update_status(request_name, user, "Implementing",
+                f"Created branch '{branch_name}'. Starting implementation...",
+                branch_name=branch_name)
 
         plan = doc.agent_plan or ""
 
@@ -691,7 +724,7 @@ def _extract_understanding(doc) -> str:
         steps = json.loads(doc.conversation_log or "[]")
         for step in steps:
             if step.get("phase") == "Understanding":
-                return step.get("output", "")
+                return _message_content_to_str(step.get("output", ""))
     except (json.JSONDecodeError, TypeError):
         pass
     return ""
