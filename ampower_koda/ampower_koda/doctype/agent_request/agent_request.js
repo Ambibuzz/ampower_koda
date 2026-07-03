@@ -529,8 +529,8 @@ function setup_action_buttons(frm) {
     }
 
     if ((frm.doc.branch_name || frm.doc.patch_diff) && !frm.is_new()) {
-        frm.add_custom_button(__('Open IDE'), function () {
-            frappe.set_route('agent-diff-viewer', frm.doc.name);
+        frm.add_custom_button(__('Open Koda IDE'), function () {
+            frappe.set_route('koda-ide', frm.doc.name);
         }, __('Actions'));
     }
 }
@@ -821,23 +821,11 @@ function checkout_base_branch(frm) {
 }
 
 function show_post_checkout_bench_dialog(frm) {
-    var app = frm.doc.target_app_name || '';
-    var site = frm.doc.site_name || '';
-    var default_cmds = [];
-    if (app) {
-        default_cmds = [
-            'bench --site ' + (site || '{site}') + ' migrate',
-            'bench build --app ' + app,
-            'bench --site ' + (site || '{site}') + ' clear-cache',
-            'supervisorctl restart all'
-        ];
-    }
-
     frappe.call({
         method: 'ampower_koda.agent.api.get_default_bench_commands',
         args: { request_name: frm.doc.name },
         callback: function (r) {
-            var cmds = (r.message && r.message.commands) ? r.message.commands : default_cmds;
+            var cmds = (r.message && r.message.commands) || [];
             if (!cmds.length) return;
 
             var rows_html = cmds.map(function (c, i) {

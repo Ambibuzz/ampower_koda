@@ -1,12 +1,12 @@
 /* global ace */
 
-frappe.pages['agent-diff-viewer'].on_page_load = function (wrapper) {
+frappe.pages['koda-ide'].on_page_load = function (wrapper) {
     const route = frappe.get_route();
     const request_name = route[1];
 
     const page = frappe.ui.make_app_page({
         parent: wrapper,
-        title: __('Agent IDE'),
+        title: __('Koda IDE'),
         single_column: true,
     });
 
@@ -438,7 +438,7 @@ function build_ide_shell(page, ide) {
     const $shell = $(`
         <div class="koda-ide">
             <div class="koda-toolbar">
-                <span class="koda-title">${__('Agent IDE')}</span>
+                <span class="koda-title">${__('Koda IDE')}</span>
                 <span class="koda-meta koda-toolbar-meta">${__('Loading...')}</span>
                 <div class="koda-toolbar-actions">
                     <button type="button" class="koda-btn koda-btn-primary koda-btn-save" disabled title="Ctrl+S">${__('Save')}</button>

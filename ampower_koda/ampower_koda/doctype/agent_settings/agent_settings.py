@@ -2,6 +2,7 @@
 # For license information, please see license.txt
 
 import frappe
+from frappe import _
 from frappe.model.document import Document
 
 
@@ -18,4 +19,6 @@ class AgentSettings(Document):
         }
         field, label = key_map.get(provider, key_map["OpenAI"])
         if not getattr(self, field, None):
-            frappe.throw(f"{label} is required when {provider} is the default provider")
+            frappe.throw(
+                _("{0} is required when {1} is the default provider").format(label, provider)
+            )

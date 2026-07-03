@@ -3,6 +3,8 @@
 
 import frappe
 
+from ampower_koda.agent.errors import log_agent_error
+
 # Mapping internal fieldname -> prompt_key option label
 PROMPT_LABEL_MAP = {
     "system_prompt": "System Prompt",
@@ -29,7 +31,10 @@ def render_prompt_safe(template: str, context: dict, default_template: str) -> s
     try:
         result = template.format_map(SafeDict(context))
     except Exception as e:
-        frappe.log_error(f"Prompt render failed: {e}\nTemplate preview: {template[:200]}", "Prompt Render Error")
+        log_agent_error(
+            "Prompt Render Error",
+            f"{e}\nTemplate preview: {template[:200]}\n{frappe.get_traceback()}",
+        )
         result = template
 
     for key, value in context.items():
@@ -70,18 +75,18 @@ def get_config_prompt(fieldname: str, default_template: str, request_name: str =
             )
 
             if len(overrides) > 1:
-                frappe.log_error(
-                    title="Duplicate Prompt Configuration",
-                    message=f"Multiple prompts found for {request_name}, prompt_key={prompt_label}. Using first (idx asc)."
+                log_agent_error(
+                    "Duplicate Prompt Configuration",
+                    f"Multiple prompts found for {request_name}, prompt_key={prompt_label}. Using first (idx asc).",
                 )
 
             if overrides:
                 return overrides[0]["content"]
 
         except Exception as e:
-            frappe.log_error(
-                title="Prompt Fetch Failed",
-                message=f"request_name={request_name}, fieldname={fieldname}\n{str(e)}"
+            log_agent_error(
+                "Prompt Fetch Failed",
+                f"request_name={request_name}, fieldname={fieldname}\n{e}\n{frappe.get_traceback()}",
             )
 
     return default_template

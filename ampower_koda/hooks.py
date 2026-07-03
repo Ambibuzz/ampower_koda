@@ -1,5 +1,5 @@
 app_name = "ampower_koda"
-app_title = "AmPower Koda"
+app_title = "Ampower Koda"
 app_publisher = "Ambibuzz Technologies LLP"
 app_description = "AI Coding Agent for Frappe apps"
 app_email = "buzz@ambibuzz.com"

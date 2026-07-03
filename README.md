@@ -8,6 +8,7 @@ AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improve
 - **Live Monitoring**: Track agent progress in real-time with an auto-scrolling log console and visual status dashboard.
 - **Human-in-the-loop**: Full control over every phase. Review and edit implementation plans and bench commands before they run.
 - **Smart Exploration**: Powered by LangGraph, the agent performs deep codebase analysis to minimize hallucinations.
+- **Koda IDE**: Browse the changed files, edit code in a built-in editor, view diffs, and save, deploy, or push changes without leaving Frappe.
 - **Git Native**: Automatically manages branches and creates clean Pull Requests on GitHub.
 - **Multi-Model Support**: Choose between OpenAI, Google Gemini, or Anthropic Claude.
 
@@ -135,6 +136,19 @@ For advanced use cases, you can override the agent's default logic on a per-requ
 
 If a prompt type is not explicitly added to the table, the agent will fall back to its internal system default for that phase.
 
+## Koda IDE
+
+Once a request has an agent branch or a generated diff, open the **Koda IDE** from the Actions dropdown on the Agent Request (**Open Koda IDE**). The IDE lets you:
+
+- Browse the changed files in a file explorer, with change badges (added / modified / deleted).
+- Edit any file in a full code editor with syntax highlighting and a light/dark theme toggle.
+- Switch between **Code** and **Diff** views to inspect exactly what changed.
+- **Save** edits directly to the agent branch on disk.
+- **Deploy** the selected bench commands (migrate, build, clear-cache, restart).
+- **Push** the branch and create a pull request on GitHub.
+
+Open tabs can be closed via the close (×) control that appears on hover.
+
 ## Data Security
 
 Please note that we use LLMs, and the data (repositories) will be processed by an LLM. We do not consider this a data security concern, as this is how agentic workflows typically operate. To perform tasks on your data, the LLM must be able to access and read the relevant information. Appropriate security controls and data handling practices should still be followed to ensure the protection of sensitive information.
@@ -147,7 +161,7 @@ Please note that we use LLMs, and the data (repositories) will be processed by a
 
 ## In-App Help
 
-For more detailed guidance and tips, search for **AI Agents Help** in your Frappe search bar.
+For more detailed guidance and tips, search for **Koda Docs** in your Frappe search bar.
 
 ## License
 

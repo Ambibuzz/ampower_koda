@@ -8,6 +8,8 @@ import requests as http_requests
 
 import frappe
 
+from ampower_koda.agent.errors import log_agent_error
+
 
 def get_repo_root(app_name: str) -> str:
     """
@@ -36,8 +38,13 @@ def run_git(cmd: list[str], cwd: str | None = None) -> tuple[bool, str]:
         out = ((result.stdout or "").strip() + "\n" + (result.stderr or "").strip()).strip()
         return result.returncode == 0, out
     except subprocess.TimeoutExpired:
+        log_agent_error("Agent Git: command timeout", f"cmd={' '.join(cmd)}\ncwd={cwd}")
         return False, "Git command timed out"
     except Exception as e:
+        log_agent_error(
+            "Agent Git: command failed",
+            f"cmd={' '.join(cmd)}\ncwd={cwd}\n{e}\n{frappe.get_traceback()}",
+        )
         return False, str(e)
 
 
@@ -184,6 +191,10 @@ def create_pull_request(
         msg = data.get("message", resp.text)
         return False, msg, None, None
     except Exception as e:
+        log_agent_error(
+            "Agent Git: create pull request",
+            f"repo={repo_url}\n{e}\n{frappe.get_traceback()}",
+        )
         return False, str(e), None, None
 
 
@@ -201,7 +212,11 @@ def generate_branch_name(request_name: str, branch_prefix: str = "ai-agent/", ap
 
     try:
         root = get_repo_root(app_name)
-    except Exception:
+    except Exception as e:
+        log_agent_error(
+            "Agent Git: generate branch name",
+            f"app={app_name}\n{e}\n{frappe.get_traceback()}",
+        )
         return base_name
 
     ok, branches = run_git(["branch", "--list", "--all"], cwd=root)
@@ -241,8 +256,13 @@ def run_git_stdout(cmd: list[str], cwd: str | None = None) -> tuple[bool, str]:
         )
         return result.returncode == 0, (result.stdout or "")
     except subprocess.TimeoutExpired:
+        log_agent_error("Agent Git: stdout command timeout", f"cmd={' '.join(cmd)}\ncwd={cwd}")
         return False, ""
-    except Exception:
+    except Exception as e:
+        log_agent_error(
+            "Agent Git: stdout command failed",
+            f"cmd={' '.join(cmd)}\ncwd={cwd}\n{e}\n{frappe.get_traceback()}",
+        )
         return False, ""
 
 

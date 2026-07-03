@@ -6,6 +6,13 @@ import re
 
 import frappe
 
+from ampower_koda.agent.errors import log_agent_error
+
+
+def _tool_error(tool: str, exc: Exception, message: str) -> str:
+    log_agent_error(f"Agent Tool: {tool}", f"{exc}\n{frappe.get_traceback()}")
+    return message
+
 
 def _app_root(app_name: str) -> str:
     """Return the root path of the given Frappe app."""
@@ -41,7 +48,7 @@ def list_directory(app_name: str, path: str) -> str:
             lines.append(prefix + e)
         return "\n".join(lines) if lines else "(empty)"
     except Exception as ex:
-        return f"Error: {ex}"
+        return _tool_error("list_directory", ex, f"Error: {ex}")
 
 
 IGNORE_DIRS = {
@@ -49,8 +56,6 @@ IGNORE_DIRS = {
     ".eggs", "dist", "build",
 }
 
-def _should_ignore_dir(d: str) -> bool:
-    return d in IGNORE_DIRS or d.endswith(".egg-info")
 
 def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
     """Recursively list the app directory tree. Returns an indented tree view.
@@ -96,7 +101,7 @@ def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
 
         return "\n".join(lines) if lines else "(empty)"
     except Exception as ex:
-        return f"Error: {ex}"
+        return _tool_error("find_files", ex, f"Error: {ex}")
 
 
 def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0) -> str:
@@ -105,7 +110,7 @@ def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0) 
     - If start_line and end_line are both > 0, reads only that range (1-indexed, inclusive).
     - Otherwise reads the full file.
 
-    Returns numbered lines (format: '    1 | content') so that line numbers can be used 
+    Returns numbered lines (format: '    1 | content') so that line numbers can be used
     directly with replace_lines / insert_lines.
     """
     try:
@@ -131,7 +136,7 @@ def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0) 
         numbered = [f"{i+1:5d} | {line.rstrip()}" for i, line in enumerate(all_lines)]
         return f"[{path}] {total} lines\n" + "\n".join(numbered)
     except Exception as ex:
-        return f"Error: {ex}"
+        return _tool_error("read_file", ex, f"Error: {ex}")
 
 
 def search_code(app_name: str, pattern: str, path: str = "") -> str:
@@ -149,8 +154,8 @@ def search_code(app_name: str, pattern: str, path: str = "") -> str:
         regex = re.compile(pattern, re.MULTILINE | re.IGNORECASE)
         app_root = _app_root(app_name)
         results = []
-        CONTEXT_LINES = 3
-        MAX_RESULTS = 80
+        context_lines = 3
+        max_results = 80
 
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in {
@@ -162,27 +167,31 @@ def search_code(app_name: str, pattern: str, path: str = "") -> str:
                     try:
                         with open(full, "r", encoding="utf-8", errors="replace") as f:
                             lines = f.readlines()
-                    except Exception:
+                    except Exception as e:
+                        log_agent_error(
+                            "Agent Tool: search_code read",
+                            f"path={full}\n{e}\n{frappe.get_traceback()}",
+                        )
                         continue
 
                     rel = os.path.relpath(full, app_root)
                     for i, line in enumerate(lines):
                         if regex.search(line):
-                            start = max(0, i - CONTEXT_LINES)
-                            end = min(len(lines), i + CONTEXT_LINES + 1)
+                            start = max(0, i - context_lines)
+                            end = min(len(lines), i + context_lines + 1)
                             context = []
                             for j in range(start, end):
                                 marker = ">>>" if j == i else "   "
                                 context.append(f"  {marker} {j + 1:4d} | {lines[j].rstrip()}")
                             results.append(f"{rel}:{i + 1}\n" + "\n".join(context))
 
-                            if len(results) >= MAX_RESULTS:
-                                results.append(f"\n... (stopped at {MAX_RESULTS} matches)")
+                            if len(results) >= max_results:
+                                results.append(f"\n... (stopped at {max_results} matches)")
                                 return "\n\n".join(results)
 
         return "\n\n".join(results) if results else f"No matches for: {pattern}"
     except Exception as ex:
-        return f"Error: {ex}"
+        return _tool_error("search_code", ex, f"Error: {ex}")
 
 
 def write_file(app_name: str, path: str, content: str) -> str:
@@ -198,7 +207,7 @@ def write_file(app_name: str, path: str, content: str) -> str:
             f.write(content)
         return f"WRITE_OK: Wrote {len(content)} chars to {path}"
     except Exception as ex:
-        return f"WRITE_FAILED: Error: {ex}"
+        return _tool_error("write_file", ex, f"WRITE_FAILED: Error: {ex}")
 
 
 def edit_file(app_name: str, path: str, old_string: str, new_string: str) -> str:
@@ -229,7 +238,7 @@ def edit_file(app_name: str, path: str, old_string: str, new_string: str) -> str
             f.write(content)
         return f"EDIT_OK: Updated {path} successfully."
     except Exception as ex:
-        return f"EDIT_FAILED: Error: {ex}"
+        return _tool_error("edit_file", ex, f"EDIT_FAILED: Error: {ex}")
 
 
 def replace_lines(app_name: str, path: str, start_line: int, end_line: int, new_content: str) -> str:
@@ -282,7 +291,7 @@ def replace_lines(app_name: str, path: str, start_line: int, end_line: int, new_
             f"File now has {len(result)} lines."
         )
     except Exception as ex:
-        return f"EDIT_FAILED: Error: {ex}"
+        return _tool_error("replace_lines", ex, f"EDIT_FAILED: Error: {ex}")
 
 
 def insert_lines(app_name: str, path: str, after_line: int, new_content: str) -> str:
@@ -316,14 +325,11 @@ def insert_lines(app_name: str, path: str, after_line: int, new_content: str) ->
             f"File now has {len(result)} lines."
         )
     except Exception as ex:
-        return f"EDIT_FAILED: Error: {ex}"
+        return _tool_error("insert_lines", ex, f"EDIT_FAILED: Error: {ex}")
 
 
 def get_file_outline(app_name: str, path: str) -> str:
-    """
-    Extracts class and function definitions from a file (.py, .js, .ts).
-    Includes line numbers for quick navigation.
-    """
+    """Extract class and function definitions from a file (.py, .js, .ts)."""
     try:
         full = _resolve_path(app_name, path)
         if not os.path.isfile(full):
@@ -378,14 +384,11 @@ def get_file_outline(app_name: str, path: str) -> str:
 
         return f"[{path}] {total} lines — outline:\n" + "\n".join(outline)
     except Exception as ex:
-        return f"Error: {ex}"
+        return _tool_error("get_file_outline", ex, f"Error: {ex}")
 
 
 def read_doctype_schema(app_name: str, doctype_name: str) -> str:
-    """
-    Reads the JSON schema file for a Frappe DocType. 
-    Useful for identifying fieldnames and properties.
-    """
+    """Read the JSON schema file for a Frappe DocType."""
     try:
         app_root = _app_root(app_name)
         name_lower = doctype_name.replace(" ", "_").lower()
@@ -397,17 +400,11 @@ def read_doctype_schema(app_name: str, doctype_name: str) -> str:
                     return f.read()
         return f"DocType schema not found: {doctype_name}"
     except Exception as ex:
-        return f"Error: {ex}"
+        return _tool_error("read_doctype_schema", ex, f"Error: {ex}")
 
 
 def validate_code(app_name: str, path: str) -> str:
-    """Check for syntax errors in a .py or .js file (path relative to app root).
-
-    - Returns 'VALID' if no syntax errors are found.
-    - Returns detailed error message with line numbers if syntax is invalid.
-    
-    ALWAYS call this after any edit to verify that the file remains functional.
-    """
+    """Check for syntax errors in a .py or .js file (path relative to app root)."""
     try:
         full = _resolve_path(app_name, path)
         if not os.path.isfile(full):
@@ -427,24 +424,25 @@ def validate_code(app_name: str, path: str) -> str:
                     f"{e.msg}\nLine content: {e.text.strip() if e.text else 'N/A'}"
                 )
             except Exception as e:
+                log_agent_error(
+                    "Agent Tool: validate_code python",
+                    f"path={path}\n{e}\n{frappe.get_traceback()}",
+                )
                 return f"VALIDATION_ERROR: {e}"
 
         elif path.endswith(".js"):
-            # Use node --check for reliable JS syntax validation in Linux
             import subprocess
             try:
                 result = subprocess.run(
                     ["node", "--check", full],
                     capture_output=True,
                     text=True,
-                    timeout=5
+                    timeout=5,
                 )
                 if result.returncode == 0:
                     return f"VALID: {path} has no syntax errors."
-                else:
-                    return f"SYNTAX_ERROR in {path}:\n{result.stderr.strip() or result.stdout.strip()}"
+                return f"SYNTAX_ERROR in {path}:\n{result.stderr.strip() or result.stdout.strip()}"
             except FileNotFoundError:
-                # Basic bracket check if node is missing
                 stack = []
                 for i, char in enumerate(content):
                     if char in "({[":
@@ -460,8 +458,12 @@ def validate_code(app_name: str, path: str) -> str:
                     return f"SYNTAX_ERROR in {path}: Unclosed {char} starting at char {i}"
                 return f"VALID: {path} (basic check: brackets balanced)"
             except Exception as e:
+                log_agent_error(
+                    "Agent Tool: validate_code javascript",
+                    f"path={path}\n{e}\n{frappe.get_traceback()}",
+                )
                 return f"VALIDATION_ERROR: {e}"
 
         return f"SKIP: Validation not supported for this file type: {path}"
     except Exception as ex:
-        return f"VALIDATION_FAILED: Error: {ex}"
+        return _tool_error("validate_code", ex, f"VALIDATION_FAILED: Error: {ex}")

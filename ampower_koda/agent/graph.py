@@ -1,12 +1,10 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# LangGraph workflows: Planning (Understand→Plan) and Execution (Implement→Review→Bench→Deploy)
+# LangGraph workflows: Planning (Understand -> Plan) and Execution (Implement -> Review).
+# The bench and deploy steps run in executor.py, not in the graph.
 
-import json
 import os
 import re as _re
-import subprocess
 from datetime import datetime
-from functools import partial
 
 import frappe
 from langchain_core.tools import tool
@@ -14,6 +12,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langchain_openai import ChatOpenAI
 
+from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.prompts import (
@@ -22,15 +21,6 @@ from ampower_koda.agent.prompts import (
     get_plan_prompt,
     get_implement_prompt,
     get_review_prompt,
-)
-from ampower_koda.agent.git_ops import (
-    create_branch,
-    commit_changes,
-    push_branch,
-    create_pull_request,
-    generate_branch_name,
-    run_git,
-    get_repo_root,
 )
 
 
@@ -120,10 +110,7 @@ def _openai_uses_responses_api(model: str) -> bool:
 
 
 def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
-    """
-    Factory function to initialize the appropriate Large Language Model (LLM) 
-    based on the user's preferred provider and model.
-    """
+    """Build the chat model for the given provider and model."""
     provider = (provider or "OpenAI").strip()
     model = (model or "gpt-4o-mini").strip()
     if provider == "Gemini":
@@ -133,7 +120,10 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(model=model, temperature=0)
     if provider not in ("OpenAI", "Gemini", "Claude"):
-        frappe.log_error(f"Unknown AI provider '{provider}', defaulting to OpenAI", "Agent LLM Warning")
+        log_agent_error(
+            "Agent LLM Warning",
+            f"Unknown AI provider '{provider}', defaulting to OpenAI",
+        )
     openai_kwargs = {"model": model, "temperature": 0}
     if _openai_uses_responses_api(model):
         openai_kwargs["use_responses_api"] = True
@@ -216,7 +206,10 @@ def _log_stage(state: dict, stage: str, status: str, summary: str) -> list:
                 "message": summary[:200],
             }, user=user)
         except Exception:
-            pass
+            log_agent_error(
+                "Agent Graph: stage log persist",
+                f"request={request_name}\nstage={stage}\n{frappe.get_traceback()}",
+            )
 
     return logs
 
@@ -235,12 +228,10 @@ def _publish_agent_log(request_name: str, log_type: str, **kwargs):
         }
         frappe.publish_realtime("agent_log", payload, user=user)
     except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Tool builders — closure over app_name
-# ---------------------------------------------------------------------------
+        log_agent_error(
+            "Agent Graph: publish agent_log",
+            f"request={request_name}\ntype={log_type}\n{frappe.get_traceback()}",
+        )
 
 def _make_tools(app_name: str, read_only: bool = False):
     """Build LangChain tools bound to a specific app_name."""
@@ -379,6 +370,10 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
                     if len(result) > 15000:
                         result = result[:15000] + "\n... (truncated)"
                 except Exception as e:
+                    log_agent_error(
+                        f"Agent Graph: tool {tc['name']}",
+                        f"request={request_name}\n{e}\n{frappe.get_traceback()}",
+                    )
                     result = f"Tool error: {e}"
             else:
                 result = f"Unknown tool: {tc['name']}"
@@ -439,6 +434,10 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             result["_tool_edited_paths"] = tool_edited_paths
         return result
     except Exception as e:
+        log_agent_error(
+            f"Agent Graph: {phase}",
+            f"request={state.get('request_name')}\n{e}\n{frappe.get_traceback()}",
+        )
         steps = list(state.get("intermediate_steps") or []) + [
             {"phase": phase, "output": f"Error: {e}"}
         ]
@@ -454,11 +453,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 # ---------------------------------------------------------------------------
 
 def understand_node(state: dict) -> dict:
-    """
-    The 'Understanding' node. Here, the agent explores the codebase to build 
-     a comprehensive mental model of the relevant files and logic before 
-     attempting any planning.
-    """
+    """Explore the codebase with read-only tools to gather context for planning."""
     if state.get("error"):
         return {"error": state["error"]}
     logs = _log_stage(state, "Understanding", "started", "Exploring codebase to understand the request")
@@ -467,7 +462,7 @@ def understand_node(state: dict) -> dict:
         state.get("request_type", "Improvement"),
         request_name=state.get("request_name"),
     )
-    # The agent is given read-only tools for this phase to ensure a safe exploration.
+    # Read-only tools keep exploration side-effect free.
     updates = _run_agent_turn(state, "Understanding", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_PLANNING)
     if updates.get("error"):
         logs = _log_stage({**state, "stage_log": logs}, "Understanding", "failed", updates["error"][:200])
@@ -482,10 +477,7 @@ def understand_node(state: dict) -> dict:
 
 
 def plan_node(state: dict) -> dict:
-    """
-    The 'Planning' node. The agent synthesizes its discoveries from the 
-    Understanding phase into a concrete, step-by-step implementation plan.
-    """
+    """Turn the understanding summary into a step-by-step implementation plan."""
     if state.get("error"):
         return {"error": state["error"]}
 
@@ -537,6 +529,10 @@ def plan_node(state: dict) -> dict:
             "stage_log": logs,
         }
     except Exception as e:
+        log_agent_error(
+            "Agent Graph: Planning",
+            f"request={state.get('request_name')}\n{e}\n{frappe.get_traceback()}",
+        )
         logs = _log_stage({**state, "stage_log": logs}, "Planning", "failed", str(e)[:200])
         return {
             "current_stage": "Planning",
@@ -550,10 +546,7 @@ def plan_node(state: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def implement_node(state: dict) -> dict:
-    """
-    The 'Implementing' node. In this phase, the agent applies the approved plan 
-    by writing code and creating new files as needed.
-    """
+    """Apply the approved plan by editing and creating files with write tools."""
     if state.get("error"):
         return {"error": state["error"]}
     attempt = (state.get("review_attempts") or 0) + 1
@@ -618,10 +611,7 @@ You MUST fix ALL of these issues in this attempt. Read the affected files first 
 
 
 def review_node(state: dict) -> dict:
-    """
-    The 'Reviewing' node. The agent takes an adversarial look at its own 
-    implementation to identify potential bugs, syntax errors, or missed requirements.
-    """
+    """Validate the edits (syntax first, then a scoped LLM review) and set the verdict."""
     if state.get("error"):
         return {"error": state["error"]}
     logs = _log_stage(state, "Reviewing", "started", "Testing implemented changes")
@@ -689,175 +679,6 @@ def _get_bench_env() -> dict:
                 env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
                 break
     return env
-
-
-def bench_node(state: dict) -> dict:
-    """
-    The 'Building' node. This node executes the necessary bench commands 
-    (like migrations or asset builds) to integrate the changes into the site.
-    """
-    if state.get("error"):
-        return {"error": state["error"]}
-    logs = _log_stage(state, "Building", "started", "Running bench commands to apply changes")
-
-    edits = state.get("edits_made", [])
-    edited_paths = [e.get("path", "") for e in edits if e.get("path")]
-    app_name = state.get("target_app_name", "")
-    request_name = state.get("request_name", "")
-
-    bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
-    bench_root = os.path.normpath(bench_root)
-
-    site_name = frappe.local.site
-    bench_env = _get_bench_env()
-
-    has_doctype_changes = any(
-        p.endswith(".json") and "/doctype/" in p for p in edited_paths
-    )
-    has_js_css_changes = any(
-        p.endswith((".js", ".css", ".html")) for p in edited_paths
-    )
-
-    cmds = []
-    if has_doctype_changes:
-        cmds.append(f"bench --site {site_name} migrate")
-    if has_js_css_changes:
-        cmds.append(f"bench build --app {app_name}")
-    cmds.append(f"bench --site {site_name} clear-cache")
-    cmds.append("supervisorctl restart all")
-
-    bench_output_parts = []
-    for cmd in cmds:
-        _log_stage({**state, "stage_log": logs}, "Building", "progress", f"Running: {cmd}")
-        _publish_agent_log(request_name, "bench_command", command=cmd)
-        try:
-            result = subprocess.run(
-                cmd.split(),
-                cwd=bench_root,
-                capture_output=True,
-                text=True,
-                timeout=900,
-                env=bench_env,
-            )
-            output = (result.stdout or "") + (result.stderr or "")
-            success = result.returncode == 0
-            status_str = "OK" if success else f"FAILED (exit {result.returncode})"
-            entry = f"$ {cmd}\n{status_str}\n{output.strip()}\n"
-            bench_output_parts.append(entry)
-            _publish_agent_log(request_name, "bench_result",
-                command=cmd,
-                success=success,
-                output_preview=output[:500],
-            )
-        except subprocess.TimeoutExpired:
-            entry = f"$ {cmd}\nTIMEOUT after 900s\n"
-            bench_output_parts.append(entry)
-            _publish_agent_log(request_name, "bench_result",
-                command=cmd, success=False, output_preview="Timed out after 900s")
-        except Exception as e:
-            entry = f"$ {cmd}\nERROR: {e}\n"
-            bench_output_parts.append(entry)
-
-    bench_log = "\n".join(bench_output_parts)
-
-    if request_name:
-        try:
-            frappe.db.set_value(DOCTYPE_NAME, request_name, "bench_log", bench_log[:50000])
-            frappe.db.commit()
-        except Exception:
-            pass
-
-    logs = _log_stage({**state, "stage_log": logs}, "Building", "completed",
-        f"Ran {len(cmds)} bench commands")
-    return {
-        "current_stage": "Building",
-        "bench_log": bench_log,
-        "stage_log": logs,
-    }
-
-
-def deploy_node(state: dict) -> dict:
-    """
-    The 'Pushing' node. Finalizes the work by committing the changes to a branch, 
-    pushing to the remote repository, and optionally opening a pull request.
-    """
-    if state.get("error"):
-        return {"error": state["error"]}
-    logs = _log_stage(state, "Pushing", "started", "Creating branch, committing, pushing and opening PR")
-
-    app_name = state.get("target_app_name", "")
-    request_name = state.get("request_name", "AGENT-0000")
-    request_type = state.get("request_type", "Improvement")
-    plan = state.get("plan", "")
-    user_message = state.get("user_message", "")[:500]
-    base_branch = state.get("base_branch", "main")
-    branch_prefix = state.get("branch_prefix", "ai-agent/")
-    repo_url = state.get("github_repo_url", "")
-    token = state.get("github_token", "")
-    git_user_name = state.get("git_user_name", "AI Agent")
-    git_user_email = state.get("git_user_email", "ai-agent@ampower.com")
-
-    branch_name = generate_branch_name(request_name, branch_prefix)
-
-    repo_root = get_repo_root(app_name)
-    ok, diff_out = run_git(["diff", "--stat", "HEAD"], cwd=repo_root)
-    ok2, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
-    has_changes = bool((diff_out or "").strip()) or bool((untracked or "").strip())
-    if not has_changes:
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed",
-            "No file changes detected on disk. The implement phase did not produce any actual edits.")
-        return {
-            "current_stage": "Pushing",
-            "error": "No code changes were produced. The implement phase did not modify any files on disk.",
-            "branch_name": "",
-            "stage_log": logs,
-        }
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "progress",
-        f"Verified file changes exist: {(diff_out or untracked or '')[:100]}")
-
-    ok, msg = create_branch(app_name, branch_name, base_branch)
-    if not ok:
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed", f"Branch creation failed: {msg[:150]}")
-        return {"current_stage": "Pushing", "error": f"create_branch: {msg}", "branch_name": branch_name, "stage_log": logs}
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "progress", f"Branch created: {branch_name}")
-
-    commit_msg = f"[AI Agent] {request_type}: {request_name}\n\n{user_message[:200]}"
-    ok, msg = commit_changes(app_name, commit_msg, git_user_name, git_user_email)
-    if not ok:
-        if "No changes" in msg:
-            logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed",
-                "No files were actually changed. The implement phase edits may have all failed.")
-            return {"current_stage": "Pushing", "error": "No code changes were produced.", "branch_name": branch_name, "stage_log": logs}
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed", f"Commit failed: {msg[:150]}")
-        return {"current_stage": "Pushing", "error": f"commit: {msg}", "branch_name": branch_name, "stage_log": logs}
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "progress", "Changes committed")
-
-    ok, msg = push_branch(app_name, branch_name, repo_url, token)
-    if not ok:
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed", f"Push failed: {msg[:150]}")
-        return {"current_stage": "Pushing", "error": f"push: {msg}", "branch_name": branch_name, "stage_log": logs}
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "progress", "Branch pushed to remote")
-
-    pr_title = f"[AI Agent] {request_type}: {request_name}"
-    pr_body = f"## Request\n{user_message}\n\n## Plan\n{plan}"
-    ok, msg, pr_url, pr_number = create_pull_request(pr_title, pr_body, branch_name, repo_url, token, base_branch)
-    if not ok:
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed", f"PR creation failed: {msg[:150]}")
-        return {"current_stage": "Pushing", "error": f"PR: {msg}", "branch_name": branch_name, "pr_url": None, "pr_number": None, "stage_log": logs}
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "completed", f"PR #{pr_number} created: {pr_url}")
-    return {
-        "current_stage": "Completed",
-        "branch_name": branch_name,
-        "pr_url": pr_url,
-        "pr_number": pr_number,
-        "error": None,
-        "stage_log": logs,
-    }
 
 
 # ---------------------------------------------------------------------------

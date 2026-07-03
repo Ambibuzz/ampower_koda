@@ -1,7 +1,7 @@
-frappe.pages['ai-agents-help'].on_page_load = function(wrapper) {
+frappe.pages['koda-docs'].on_page_load = function(wrapper) {
     var page = frappe.ui.make_app_page({
         parent: wrapper,
-        title: 'AI Agents - How to Use',
+        title: 'Koda Docs - How to Use',
         single_column: true
     });
 
@@ -10,7 +10,7 @@ frappe.pages['ai-agents-help'].on_page_load = function(wrapper) {
 
         <h3>Overview</h3>
         <p>
-            AmPower AI Agents is a coding assistant for Frappe apps.
+            Ampower Koda is a coding assistant for Frappe apps.
             You describe a bug fix, feature, or improvement -- the agent reads the target app,
             creates a plan, implements the changes, and opens a pull request on GitHub.
         </p>
@@ -147,7 +147,7 @@ frappe.pages['ai-agents-help'].on_page_load = function(wrapper) {
         <hr>
 
         <p style="color:var(--text-muted);font-size:12px;">
-            AmPower AI Agents by Ambibuzz Technologies LLP.
+            Ampower Koda by Ambibuzz Technologies LLP.
             For issues, contact buzz@ambibuzz.com.
         </p>
     </div>

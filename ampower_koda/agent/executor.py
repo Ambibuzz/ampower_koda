@@ -1,11 +1,14 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# Two-phase executor: planning phase (understand+plan) and execution phase (implement+review+bench+deploy)
+# Executor phases: planning (understand + plan), execution (implement + review),
+# bench + commit, and deploy (push + PR). Enqueued as background jobs from api.py.
 
+import datetime
 import json
 import os
+import subprocess
 
 import frappe
-import subprocess
+from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.graph import (
     _get_bench_env,
     _message_content_to_str,
@@ -87,7 +90,10 @@ def _revert_previous_changes(app_name: str, base_branch: str, request_name: str 
                 "message": summary,
             }, user=user or "Administrator")
         except Exception:
-            pass
+            log_agent_error(
+                "Agent Executor: revert publish",
+                f"request={request_name}\n{frappe.get_traceback()}",
+            )
         return summary
 
     return ""
@@ -132,11 +138,7 @@ def _get_doc_config(request_name: str) -> dict:
 
 
 def _update_status(request_name: str, user: str, status: str, message: str = "", **kwargs):
-    """
-    Updates the request's status and persists key fields to the database.
-    This function also broadcasts the progress via realtime events, acting as the
-    primary 'voice' of the agent for the end-user.
-    """
+    """Persist the status (plus any allowed fields) and broadcast progress via realtime."""
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", status)
     allowed_fields = [
         "branch_name", "pr_url", "pr_number", "conversation_log",
@@ -158,16 +160,12 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
 # ---------------------------------------------------------------------------
 
 def run_planning_phase(request_name: str) -> None:
-    """
-    Executes the initial discovery phase of the agent's work.
-    This phase involves building a mental model of the codebase (Understanding)
-    and drafting a proposed path forward (Planning).
-    """
+    """Run the planning phase (understand + plan) and pause for plan approval."""
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Agent Planning Config Error")
+        log_agent_error("Agent Planning Config Error", frappe.get_traceback())
         frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Failed")
         frappe.db.set_value(DOCTYPE_NAME, request_name, "error_log", str(e))
         frappe.db.commit()
@@ -187,8 +185,6 @@ def run_planning_phase(request_name: str) -> None:
 
         _update_status(request_name, user, "Understanding", "Exploring codebase...")
 
-        # We build the planning graph which defines the agent's thought process
-        # for discovering relevant files and drafting the solution.
         graph = build_planning_graph()
         initial = {
             "user_message": doc.user_message or "",
@@ -228,7 +224,7 @@ def run_planning_phase(request_name: str) -> None:
 
     except Exception as e:
         tb = frappe.get_traceback()
-        frappe.log_error(tb, "Agent Planning Error")
+        log_agent_error("Agent Planning Error", tb)
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
@@ -237,16 +233,16 @@ def run_planning_phase(request_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
-    """
-    Carries out the implementation of the approved plan.
-    This phase creates a working branch, applies code changes, and performs
-    an automated review to ensure quality and correctness.
+    """Create/reuse the working branch, run implement + review, then await bench approval.
+
+    When preserve_branch is set, reuse the request's existing branch for a follow-up
+    fix instead of creating a fresh one.
     """
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Agent Execution Config Error")
+        log_agent_error("Agent Execution Config Error", frappe.get_traceback())
         frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Failed")
         frappe.db.set_value(DOCTYPE_NAME, request_name, "error_log", str(e))
         frappe.db.commit()
@@ -309,8 +305,7 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
 
         plan = doc.agent_plan or ""
 
-        # We parse the existing log to ensure the execution graph has full context
-        # of what was discovered during the planning phase.
+        # Carry the planning-phase stage log into execution for continuity.
         prev_stage_log = _parse_stage_log(doc.stage_log or "")
 
         graph = build_execution_graph()
@@ -370,7 +365,7 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
 
     except Exception as e:
         tb = frappe.get_traceback()
-        frappe.log_error(tb, "Agent Execution Error")
+        log_agent_error("Agent Execution Error", tb)
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
@@ -410,7 +405,6 @@ def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
 
 def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
     """Broadcast a bench command start/result event via Frappe realtime."""
-    import datetime
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     frappe.publish_realtime("agent_log", {
         "request_name": request_name,
@@ -428,15 +422,12 @@ def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
 
 
 def run_bench_and_commit(request_name: str) -> None:
-    """
-    Executes the approved bench commands (migrate, build, clear-cache, etc.) and then
-waits for the user to review the live changes before approving the final commit and push.
-    """
+    """Run the approved bench commands, then pause for push approval so the user can test."""
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Agent Bench Config Error")
+        log_agent_error("Agent Bench Config Error", frappe.get_traceback())
         frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Failed")
         frappe.db.set_value(DOCTYPE_NAME, request_name, "error_log", str(e))
         frappe.db.commit()
@@ -492,9 +483,17 @@ waits for the user to review the live changes before approving the final commit 
             except subprocess.TimeoutExpired:
                 bench_output_parts.append(f"$ {cmd}\nTIMEOUT after 900s\n")
                 _publish_bench_log(user, request_name, cmd, False, "TIMEOUT after 900s")
+                log_agent_error(
+                    "Agent Executor: bench command timeout",
+                    f"request={request_name}\ncmd={cmd}",
+                )
             except Exception as e:
                 bench_output_parts.append(f"$ {cmd}\nERROR: {e}\n")
                 _publish_bench_log(user, request_name, cmd, False, str(e))
+                log_agent_error(
+                    "Agent Executor: bench command",
+                    f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
+                )
 
         if deferred_cmds:
             for cmd in deferred_cmds:
@@ -519,12 +518,15 @@ waits for the user to review the live changes before approving the final commit 
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                log_agent_error(
+                    "Agent Executor: deferred supervisorctl",
+                    f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
+                )
 
     except Exception as e:
         tb = frappe.get_traceback()
-        frappe.log_error(tb, "Agent Bench+Commit Error")
+        log_agent_error("Agent Bench+Commit Error", tb)
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
@@ -533,15 +535,12 @@ waits for the user to review the live changes before approving the final commit 
 # ---------------------------------------------------------------------------
 
 def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True) -> None:
-    """
-    Finalizes the task by committing the changes and pushing them to GitHub.
-    Depending on the user's choice, it can also automatically create a Pull Request.
-    """
+    """Commit the changes, then optionally push the branch and open a pull request."""
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        frappe.log_error(frappe.get_traceback(), "Agent Deploy Config Error")
+        log_agent_error("Agent Deploy Config Error", frappe.get_traceback())
         frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Failed")
         frappe.db.set_value(DOCTYPE_NAME, request_name, "error_log", str(e))
         frappe.db.commit()
@@ -628,7 +627,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
 
     except Exception as e:
         tb = frappe.get_traceback()
-        frappe.log_error(tb, "Agent Deploy Error")
+        log_agent_error("Agent Deploy Error", tb)
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
@@ -661,10 +660,18 @@ def _generate_patch_diff(app_name: str) -> str:
                         content = f.read(50000)
                     parts.append(f"--- /dev/null\n+++ b/{fpath}\n" +
                                  "\n".join(f"+{line}" for line in content.split("\n")))
-                except Exception:
+                except Exception as e:
+                    log_agent_error(
+                        "Agent Executor: patch diff file read",
+                        f"app={app_name}\npath={fpath}\n{e}\n{frappe.get_traceback()}",
+                    )
                     parts.append(f"--- /dev/null\n+++ b/{fpath}\n+[binary or unreadable]")
         return "\n\n".join(parts)[:100000]
     except Exception as e:
+        log_agent_error(
+            "Agent Executor: generate patch diff",
+            f"app={app_name}\n{e}\n{frappe.get_traceback()}",
+        )
         return f"(could not generate diff: {e})"
 
 
@@ -679,13 +686,34 @@ def _save_logs(request_name: str, final_state: dict):
     else:
         stage_text = str(stage_logs)
 
-    frappe.db.set_value(DOCTYPE_NAME, request_name, {
-        "stage_log": stage_text[:50000],
-        "conversation_log": json.dumps(
-            final_state.get("intermediate_steps", []), indent=2
-        )[:50000],
-    })
-    frappe.db.commit()
+    try:
+        conversation_log = json.dumps(
+            final_state.get("intermediate_steps", []),
+            indent=2,
+            default=str,
+        )[:50000]
+    except (TypeError, ValueError) as e:
+        log_agent_error(
+            "Agent Executor: serialize conversation log",
+            f"request={request_name}\n{e}\n{frappe.get_traceback()}",
+        )
+        conversation_log = json.dumps([{
+            "phase": "Logging",
+            "output": f"Could not serialize conversation log: {e}",
+        }])[:50000]
+
+    try:
+        frappe.db.set_value(DOCTYPE_NAME, request_name, {
+            "stage_log": stage_text[:50000],
+            "conversation_log": conversation_log,
+        })
+        frappe.db.commit()
+    except Exception as e:
+        log_agent_error(
+            "Agent Executor: save logs",
+            f"request={request_name}\n{e}\n{frappe.get_traceback()}",
+        )
+        raise
 
 
 def _parse_stage_log(stage_log_text: str) -> list[dict]:
@@ -725,6 +753,9 @@ def _extract_understanding(doc) -> str:
         for step in steps:
             if step.get("phase") == "Understanding":
                 return _message_content_to_str(step.get("output", ""))
-    except (json.JSONDecodeError, TypeError):
-        pass
+    except (json.JSONDecodeError, TypeError) as e:
+        log_agent_error(
+            "Agent Executor: extract understanding",
+            f"request={getattr(doc, 'name', '')}\n{e}\n{frappe.get_traceback()}",
+        )
     return ""
