@@ -211,8 +211,10 @@ def approve_bench(request_name: str, commands: str = None):
 
 @frappe.whitelist()
 def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
-    """Approves pushing the feature branch to remote and/or opening a pull request.
-    Set push_branch=1 to push, create_pr=1 to create a PR. At least one must be selected."""
+    """
+    Approves pushing the feature branch to remote and/or opening a pull request.
+    Set push_branch=1 to push, create_pr=1 to create a PR. At least one must be selected.
+    """
     if not request_name:
         frappe.throw(_("Request name is required."))
 

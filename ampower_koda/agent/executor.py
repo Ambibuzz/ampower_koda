@@ -21,6 +21,9 @@ from ampower_koda.agent.git_ops import (
     push_branch,
     create_pull_request,
 )
+from ampower_koda.agent.kg.builder import GraphBuilder
+from ampower_koda.agent.kg.lookup import summarize_graph
+from ampower_koda.agent.kg.store import KGGraphStore
 
 DOCTYPE_NAME = "AI Agent Request"
 
@@ -134,6 +137,11 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
     Updates the request's status and persists key fields to the database.
     This function also broadcasts the progress via realtime events, acting as the
     primary 'voice' of the agent for the end-user.
+
+    Knowledge graph state is tracked via kg_status and kg_cache_key, where
+    kg_cache_key holds the linked Koda Knowledge Graph document name. Node
+    and edge counts, and the built-from commit, live on that linked document
+    rather than being mirrored here.
     """
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", status)
     allowed_fields = [
@@ -141,6 +149,7 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
         "agent_plan", "files_changed", "error_log", "tokens_used",
         "cost_estimate", "stage_log", "bench_log", "patch_diff",
         "pending_bench_commands",
+        "kg_status", "kg_cache_key",
     ]
     if kwargs:
         for k, v in kwargs.items():
@@ -185,6 +194,8 @@ def run_planning_phase(request_name: str) -> None:
 
         _update_status(request_name, user, "Understanding", "Exploring codebase...")
 
+        kg_context = _build_kg_context(config["target_app_name"], request_name=request_name)
+
         # We build the planning graph which defines the agent's thought process
         # for discovering relevant files and drafting the solution.
         graph = build_planning_graph()
@@ -193,6 +204,7 @@ def run_planning_phase(request_name: str) -> None:
             "request_type": doc.request_type or "Improvement",
             "request_name": request_name,
             "target_app_name": config["target_app_name"],
+            "kg_context": kg_context,
             "ai_provider": config["ai_provider"],
             "ai_model": config["ai_model"],
             "github_repo_url": config["github_repo_url"],
@@ -503,6 +515,8 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
     """
     Finalizes the task by committing the changes and pushing them to GitHub.
     Depending on the user's choice, it can also automatically create a Pull Request.
+    The knowledge graph is not part of this commit; it is stored separately
+    as its own Koda Knowledge Graph document.
     """
     frappe.set_user("Administrator")
     try:
@@ -695,3 +709,65 @@ def _extract_understanding(doc) -> str:
     except (json.JSONDecodeError, TypeError):
         pass
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Graph — auto-build-if-missing, persisted via the Koda Knowledge
+# Graph DocType (replaces the old Redis TTL cache).
+# ---------------------------------------------------------------------------
+
+def _build_kg_context(target_app_name: str, request_name: str = "") -> str:
+    """Check whether a persisted knowledge graph exists for this app at its
+    current commit; build one if missing and auto-build is enabled. Persists
+    the graph via KGGraphStore, backed by the Koda Knowledge Graph DocType.
+    Records the outcome on kg_status/kg_cache_key on the calling request.
+    Never raises — any failure here just means no KG context is available
+    for this run, and kg_status is set to "Failed" so the UI can reflect it.
+
+    kg_cache_key stores the Koda Knowledge Graph document name
+    (e.g. "KG-my_app-a1b2c3d4").
+    """
+    try:
+        settings = frappe.get_single("AI Agent Settings")
+        if not settings.kg_auto_reference:
+            return ""
+
+        repo_root = get_repo_root(target_app_name)
+        ok_sha, commit_sha = run_git(["rev-parse", "HEAD"], cwd=repo_root)
+        commit_sha = commit_sha.strip()
+        if not ok_sha or not commit_sha:
+            return ""
+
+        store = KGGraphStore()
+        graph = store.load(target_app_name, commit_sha)
+
+        if graph is None:
+            if not settings.kg_auto_build_if_missing:
+                return ""
+            graph = GraphBuilder().build(repo_root, target_app_name)
+            graph.commit_sha = commit_sha
+            doc_name = store.save(target_app_name, commit_sha, graph, status="Ready")
+        else:
+            doc_name = f"KG-{target_app_name}-{commit_sha[:8]}"
+
+        summary = summarize_graph(graph)
+
+        if request_name:
+            frappe.db.set_value(DOCTYPE_NAME, request_name, {
+                "kg_status": "Ready",
+                "kg_cache_key": doc_name,
+            })
+            frappe.db.commit()
+
+        return summary
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "KG Context Lookup Warning")
+        if request_name:
+            try:
+                frappe.db.set_value(DOCTYPE_NAME, request_name, "kg_status", "Failed")
+                frappe.db.commit()
+            except Exception:
+                pass
+        return ""
+
+        

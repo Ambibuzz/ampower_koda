@@ -1,0 +1,163 @@
+{
+    "actions": [],
+    "creation": "2026-07-06 00:00:00.000000",
+    "doctype": "DocType",
+    "engine": "InnoDB",
+    "field_order": [
+        "app_name",
+        "commit_sha",
+        "status",
+        "built_at",
+        "column_break_1",
+        "node_count",
+        "edge_count",
+        "schema_version",
+        "graph_key",
+        "section_break_visual",
+        "visualization_html",
+        "section_break_raw",
+        "graph_json",
+        "graph_file",
+        "section_break_error",
+        "error_message"
+    ],
+    "fields": [
+        {
+            "fieldname": "app_name",
+            "fieldtype": "Data",
+            "label": "App Name",
+            "read_only": 1,
+            "in_list_view": 1,
+            "in_standard_filter": 1,
+            "reqd": 1
+        },
+        {
+            "fieldname": "commit_sha",
+            "fieldtype": "Data",
+            "label": "Commit SHA",
+            "read_only": 1,
+            "in_list_view": 1,
+            "in_standard_filter": 1,
+            "reqd": 1
+        },
+        {
+            "default": "Building",
+            "fieldname": "status",
+            "fieldtype": "Select",
+            "label": "Status",
+            "options": "Building\nReady\nFailed",
+            "in_list_view": 1,
+            "in_standard_filter": 1,
+            "read_only": 1
+        },
+        {
+            "fieldname": "built_at",
+            "fieldtype": "Datetime",
+            "label": "Built At",
+            "read_only": 1,
+            "in_list_view": 1
+        },
+        {
+            "fieldname": "column_break_1",
+            "fieldtype": "Column Break"
+        },
+        {
+            "fieldname": "node_count",
+            "fieldtype": "Int",
+            "label": "Nodes",
+            "read_only": 1
+        },
+        {
+            "fieldname": "edge_count",
+            "fieldtype": "Int",
+            "label": "Edges",
+            "read_only": 1
+        },
+        {
+            "default": "1",
+            "fieldname": "schema_version",
+            "fieldtype": "Int",
+            "label": "Schema Version",
+            "read_only": 1,
+            "description": "Version of the graph_json payload shape. Lets the client script detect and handle older graphs if GraphBuilder's output format changes later."
+        },
+        {
+            "fieldname": "graph_key",
+            "fieldtype": "Data",
+            "label": "Graph Key",
+            "hidden": 1,
+            "read_only": 1,
+            "unique": 1,
+            "description": "Computed as '{app_name}::{commit_sha}'. Enforces one graph per app+commit at the database level."
+        },
+        {
+            "fieldname": "section_break_visual",
+            "fieldtype": "Section Break",
+            "label": "Repository Visualization"
+        },
+        {
+            "fieldname": "visualization_html",
+            "fieldtype": "HTML",
+            "options": "<div class=\"text-muted\" style=\"padding:20px;text-align:center;\">Loading…</div>"
+        },
+        {
+            "fieldname": "section_break_raw",
+            "fieldtype": "Section Break",
+            "label": "Raw Data",
+            "collapsible": 1
+        },
+        {
+            "fieldname": "graph_json",
+            "fieldtype": "Code",
+            "label": "Graph JSON",
+            "options": "JSON",
+            "read_only": 1,
+            "description": "Populated when the serialized graph is under the inline-storage size threshold. Empty when graph_file is used instead."
+        },
+        {
+            "fieldname": "graph_file",
+            "fieldtype": "Attach",
+            "label": "Graph File (compressed)",
+            "read_only": 1,
+            "description": "Gzip-compressed JSON attachment, used instead of Graph JSON when the payload exceeds the inline size threshold."
+        },
+        {
+            "fieldname": "section_break_error",
+            "fieldtype": "Section Break",
+            "label": "Error",
+            "collapsible": 1,
+            "depends_on": "eval:doc.status=='Failed'"
+        },
+        {
+            "fieldname": "error_message",
+            "fieldtype": "Small Text",
+            "label": "Error Message",
+            "read_only": 1
+        }
+    ],
+    "index_web_pages_for_search": 0,
+    "links": [],
+    "modified": "2026-07-06 00:00:00.000000",
+    "modified_by": "Administrator",
+    "module": "Ampower Koda",
+    "name": "Koda Knowledge Graph",
+    "naming_rule": "By script",
+    "owner": "Administrator",
+    "permissions": [
+        {
+            "create": 1,
+            "delete": 1,
+            "email": 1,
+            "print": 1,
+            "read": 1,
+            "report": 1,
+            "role": "System Manager",
+            "share": 1,
+            "write": 1
+        }
+    ],
+    "sort_field": "modified",
+    "sort_order": "DESC",
+    "states": [],
+    "track_changes": 0
+}

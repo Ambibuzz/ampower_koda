@@ -26,6 +26,10 @@
         "branch_prefix",
         "git_user_name",
         "git_user_email",
+        "kg_status_section",
+        "kg_status",
+        "column_break_kg",
+        "kg_cache_key",
         "result_section",
         "pr_url",
         "column_break_result",
@@ -183,6 +187,33 @@
             "fieldtype": "Data",
             "label": "Git User Email",
             "options": "Email"
+        },
+        {
+            "fieldname": "kg_status_section",
+            "fieldtype": "Section Break",
+            "label": "Knowledge Graph Reference",
+            "collapsible": 1,
+            "depends_on": "eval:doc.kg_status"
+        },
+        {
+            "fieldname": "kg_status",
+            "fieldtype": "Select",
+            "label": "Graph Status",
+            "options": "Not Used\nBuilding\nReady\nFailed",
+            "default": "Not Used",
+            "read_only": 1
+        },
+        {
+            "fieldname": "column_break_kg",
+            "fieldtype": "Column Break"
+        },
+        {
+            "fieldname": "kg_cache_key",
+            "fieldtype": "Link",
+            "options": "Koda Knowledge Graph",
+            "label": "Knowledge Graph",
+            "read_only": 1,
+            "description": "The persisted knowledge graph built for this request's target app at its current commit."
         },
         {
             "fieldname": "result_section",

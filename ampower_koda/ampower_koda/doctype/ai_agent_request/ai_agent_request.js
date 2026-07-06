@@ -488,6 +488,27 @@ function setup_action_buttons(frm) {
         }, __('Actions'));
     }
 
+    // kg_cache_key holds the linked Koda Knowledge Graph document name.
+    if (frm.doc.kg_status === 'Ready' && frm.doc.kg_cache_key) {
+        frm.add_custom_button(__('Visualize Knowledge Graph'), function () {
+            frappe.set_route('Form', 'Koda Knowledge Graph', frm.doc.kg_cache_key);
+        }, __('Actions'));
+    } else if (frm.doc.kg_status === 'Building') {
+        frm.add_custom_button(__('Knowledge Graph Building…'), function () {
+            frappe.show_alert({
+                message: __('The knowledge graph is still being built.'),
+                indicator: 'orange'
+            });
+        }, __('Actions'));
+    } else if (frm.doc.kg_status === 'Failed') {
+        frm.add_custom_button(__('Knowledge Graph Failed'), function () {
+            frappe.show_alert({
+                message: __('Knowledge graph build failed — check the server error log for details.'),
+                indicator: 'red'
+            });
+        }, __('Actions'));
+    }
+
     if (running.indexOf(status) !== -1) {
         frm.add_custom_button(__('Cancel'), function () {
             cancel_request(frm);
@@ -915,7 +936,7 @@ function setup_live_log_panel(frm) {
             + '</div>'
             + '<div class="agent-log-container"></div>'
             + '</div>';
-        
+
         var $panel = $(html);
 
         if ($anchor) {
@@ -950,7 +971,7 @@ function setup_live_log_panel(frm) {
         frm._log_history.forEach(function (data) {
             // We temporarily bypass the deduplication check in append_log_entry for this re-population
             var old_ids = frm._last_entry_ids;
-            frm._last_entry_ids = []; 
+            frm._last_entry_ids = [];
             append_log_entry(frm, data);
             frm._last_entry_ids = old_ids;
         });
@@ -959,11 +980,11 @@ function setup_live_log_panel(frm) {
 
 function append_log_entry(frm, data) {
     if (!frm._log_history) frm._log_history = [];
-    
+
     // Check if this specific log entry is already in history to avoid duplicates after reload
     var entry_id = (data.timestamp || '') + (data.type || '') + (data.tool_name || '') + (data.preview || '').substring(0, 50);
     if (frm._last_entry_ids && frm._last_entry_ids.indexOf(entry_id) !== -1) return;
-    
+
     frm._log_history.push(data);
     if (!frm._last_entry_ids) frm._last_entry_ids = [];
     frm._last_entry_ids.push(entry_id);

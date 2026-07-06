@@ -390,6 +390,13 @@ def understand_node(state: dict) -> dict:
         state.get("request_type", "Improvement"),
         request_name=state.get("request_name"),
     )
+    kg_context = state.get("kg_context", "")
+    if kg_context:
+        prompt = (
+            f"{prompt}\n\n"
+            "## Knowledge Graph Reference (pre-computed — use this to target your exploration)\n"
+            f"{kg_context}\n"
+        )
     # The agent is given read-only tools for this phase to ensure a safe exploration.
     updates = _run_agent_turn(state, "Understanding", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_PLANNING)
     if updates.get("error"):

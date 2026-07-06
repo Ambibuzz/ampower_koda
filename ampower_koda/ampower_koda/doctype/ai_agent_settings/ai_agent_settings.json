@@ -11,6 +11,11 @@
         "default_ai_provider",
         "column_break_defaults",
         "default_ai_model",
+        "kg_section",
+        "kg_buffer_ttl_seconds",
+        "column_break_kg",
+        "kg_auto_reference",
+        "kg_auto_build_if_missing",
         "openai_section",
         "openai_api_key",
         "gemini_section",
@@ -60,6 +65,38 @@
             "default": "gpt-4o-mini",
             "options": "gpt-4o-mini\ngpt-4o\ngpt-5-mini\no3-mini\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022",
             "description": "Default model for new requests. Changes with provider selection."
+        },
+        {
+            "fieldname": "kg_section",
+            "fieldtype": "Section Break",
+            "label": "Knowledge Graph",
+            "depends_on": "enable_ai_agent"
+        },
+        {
+            "fieldname": "kg_buffer_ttl_seconds",
+            "fieldtype": "Int",
+            "label": "Buffer TTL (seconds)",
+            "default": "86400",
+            "description": "How long a cached knowledge graph stays valid before rebuild is required"
+        },
+        {
+            "fieldname": "column_break_kg",
+            "fieldtype": "Column Break"
+        },
+        {
+            "default": "1",
+            "fieldname": "kg_auto_reference",
+            "fieldtype": "Check",
+            "label": "Auto-reference Knowledge Graph",
+            "description": "If a cached graph exists for the target app at its current commit, use it during requests instead of scanning files blindly"
+        },
+        {
+            "default": "1",
+            "fieldname": "kg_auto_build_if_missing",
+            "fieldtype": "Check",
+            "label": "Auto-build Knowledge Graph if Missing",
+            "depends_on": "kg_auto_reference",
+            "description": "If no cached graph exists yet, build and cache one automatically before exploration starts. Adds time to the first request on a new app."
         },
         {
             "fieldname": "openai_section",

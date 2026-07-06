@@ -30,6 +30,7 @@ class AgentState(TypedDict, total=False):
     # Understanding phase
     understanding_summary: str
     explored_paths: list
+    kg_context: str  # pre-built knowledge graph summary, injected into the Understanding prompt if available
 
     # Plan phase
     plan: str
