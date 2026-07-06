@@ -15,10 +15,18 @@ IGNORED_DIR_NAMES = {".git", "__pycache__", "node_modules", ".ampower_koda"}
 
 
 class GraphBuilder:
+    """Builds a full knowledge graph for a Frappe app by parsing its tracked
+    .py/.js source files with tree-sitter, then resolving DocType, call, and
+    usage relationships across the whole repo. One instance can be reused
+    across multiple build() calls; parsers are cached per language.
+    """
     def __init__(self):
+        """Initializes an empty per-language parser cache."""
         self._parsers: dict[str, TreeSitterParser] = {}
 
     def _parser_for(self, language: str) -> TreeSitterParser:
+        """Returns the cached TreeSitterParser for this language, creating
+        and caching one on first use."""
         if language not in self._parsers:
             self._parsers[language] = TreeSitterParser(language)
         return self._parsers[language]
@@ -57,8 +65,12 @@ class GraphBuilder:
         return files
 
     def build(self, repo_root: str, app_name: str, files: list[str] | None = None) -> Graph:
-        """Build a full (or partial, if `files` is given) knowledge graph.
-        `commit_sha` is set by the caller after building."""
+        """Builds a full (or partial, if `files` is given) knowledge graph
+        for the app: parses each source file into nodes with tree-sitter,
+        adds DocType nodes from doctype_walker, then resolves call and
+        DocType-usage edges across the whole set. commit_sha is left empty
+        here and set by the caller after building.
+        """
         graph = Graph(
             app=app_name,
             commit_sha="",
@@ -120,6 +132,11 @@ class GraphBuilder:
         return graph
 
     def _resolve_call_edges(self, graph: Graph, all_raw_captures: list[tuple[str, dict]]) -> None:
+        """Adds a 'calls' edge from each file to every Function/Method whose
+        name matches a captured call site in that file. Resolution is by
+        name only, at file granularity — not per-caller-function, and with
+        no disambiguation between same-named functions in different files.
+        """
         name_to_ids: dict[str, list[str]] = {}
         for node_id, node in graph.nodes.items():
             if node.type in ("Function", "Method"):
@@ -143,6 +160,10 @@ class GraphBuilder:
                 graph.add_edge(Edge(source_id=file_id, target_id=target_id, type="calls"))
 
     def _resolve_doctype_usage_edges(self, graph: Graph, all_raw_captures: list[tuple[str, dict]]) -> None:
+        """Adds a 'uses_doctype' edge from each file to every DocType node
+        referenced by a captured doctype-argument call site in that file,
+        at file granularity.
+        """
         name_to_id = {n.name: nid for nid, n in graph.nodes.items() if n.type == "DocType"}
 
         for rel_path, cap in all_raw_captures:

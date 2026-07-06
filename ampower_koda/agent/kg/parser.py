@@ -25,6 +25,8 @@ _EXT_TO_LANGUAGE = {
 
 
 def language_for_file(file_path: str) -> str | None:
+    """Returns the tree-sitter language name for this file's extension
+    (e.g. "python" for .py), or None if the extension isn't supported."""
     _, ext = os.path.splitext(file_path)
     return _EXT_TO_LANGUAGE.get(ext)
 
@@ -33,6 +35,10 @@ class TreeSitterParser:
     """Parses a single file with tree-sitter and extracts Node objects using .scm queries."""
 
     def __init__(self, language: str):
+        """Sets up a tree-sitter Parser for this language and loads its
+        associated .scm query files. Raises ValueError for an unsupported
+        language name.
+        """
         if language not in _LANGUAGES:
             raise ValueError(f"Unsupported language: {language}")
         self.language_name = language
@@ -41,6 +47,9 @@ class TreeSitterParser:
         self._queries = self._load_queries(language)
 
     def _load_queries(self, language: str) -> list[Query]:
+        """Loads and compiles the .scm query files registered for this
+        language, skipping any that don't exist on disk.
+        """
         prefix = {"python": ["python_symbols", "python_calls"], "javascript": ["javascript_symbols"]}
         queries = []
         for name in prefix.get(language, []):
@@ -88,9 +97,12 @@ class TreeSitterParser:
         return nodes, raw_captures
 
     def _capture_to_node(
-        self, capture_name: str, text: str, line_start: int, line_end: int,
-        rel_path: str, app_name: str,
-    ) -> Node | None:
+        self, capture_name: str, text: str, line_start: int, line_end: int, rel_path: str, app_name: str,) -> Node | None:
+        """Converts a single query capture into a Node, if its capture name
+        maps to a known node type (function/class/whitelisted-API name).
+        Returns None for captures that exist only for edge resolution
+        (e.g. call-site captures), which don't become nodes themselves.
+        """
         type_map = {
             "function.name": "Function",
             "class.name": "Class",
