@@ -15,6 +15,7 @@ from ampower_koda.agent.graph import (
     build_planning_graph,
     build_execution_graph,
 )
+from ampower_koda.agent.prompts import plan_has_open_questions
 from ampower_koda.agent.git_ops import (
     branch_exists,
     generate_branch_name,
@@ -216,11 +217,23 @@ def run_planning_phase(request_name: str) -> None:
         plan = final_state.get("plan", "")
         _save_logs(request_name, final_state)
 
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", plan[:50000])
+        understanding = _message_content_to_str(final_state.get("understanding_summary", "")).strip()
+        frappe.db.set_value(DOCTYPE_NAME, request_name, {
+            "agent_plan": plan[:50000],
+            "understanding_snapshot": understanding,
+        })
         frappe.db.commit()
 
-        _update_status(request_name, user, "Awaiting Approval",
-            "Plan generated. Please review and approve.")
+        if plan_has_open_questions(plan):
+            approval_msg = (
+                "Plan generated with open questions. Review 'Questions for User', "
+                "update the request or edit the plan, then approve."
+            )
+        else:
+            approval_msg = "Plan generated. Review the todos and approve to start implementation."
+
+        _update_status(request_name, user, "Awaiting Approval", approval_msg,
+            tokens_used=int(final_state.get("tokens_used") or 0))
 
     except Exception as e:
         tb = frappe.get_traceback()
@@ -327,6 +340,8 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
             "intermediate_steps": [],
             "edits_made": [],
             "stage_log": prev_stage_log,
+            # Continue the running token total from the planning phase.
+            "tokens_used": int(doc.tokens_used or 0),
         }
 
         final_state = graph.invoke(initial)
@@ -359,8 +374,9 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
             request_name, user, "Awaiting Bench Approval",
             f"Implementation complete. {len(bench_cmds)} bench commands need approval.",
             patch_diff=patch_diff,
-            files_changed=json.dumps(edits)[:50000],
+            files_changed=dump_json_capped(edits),
             pending_bench_commands=json.dumps(bench_cmds),
+            tokens_used=int(final_state.get("tokens_used") or 0),
         )
 
     except Exception as e:
@@ -573,10 +589,22 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
             config["git_user_name"], config["git_user_email"],
         )
         if not ok:
-            _update_status(request_name, user, "Failed",
-                f"Failed to commit changes: {msg}",
-                error_log=f"commit_changes failed: {msg}")
-            return
+            # Nothing new to commit. Only treat this as a failure if there is also
+            # nothing already committed on the branch to push. This is a safety net
+            # for races; ide_push guards the no-changes case first.
+            if "no changes to commit" in (msg or "").lower():
+                if _branch_has_commits_vs_base(app_name, config["base_branch"], branch_name):
+                    # There are existing commits worth pushing/PRing; keep going.
+                    pass
+                else:
+                    status = "Completed" if (doc.pr_url or "").strip() else "Awaiting Push Approval"
+                    _update_status(request_name, user, status, "No changes to push.")
+                    return
+            else:
+                _update_status(request_name, user, "Failed",
+                    f"Failed to commit changes: {msg}",
+                    error_log=f"commit_changes failed: {msg}")
+                return
 
         pr_url = None
         pr_number = None
@@ -635,6 +663,19 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: str) -> bool:
+    """True if `branch_name` has commits that `base_branch` does not (local only)."""
+    if not (app_name and base_branch and branch_name):
+        return False
+    try:
+        repo_root = get_repo_root(app_name)
+        ok, out = run_git(["rev-list", "--count", f"{base_branch}..{branch_name}"], cwd=repo_root)
+        return ok and out.strip().isdigit() and int(out.strip()) > 0
+    except Exception:
+        log_agent_error("Agent Deploy: rev-list vs base", frappe.get_traceback())
+        return False
+
+
 def _generate_patch_diff(app_name: str) -> str:
     """Generate a unified diff of all uncommitted changes in the target app repo."""
     try:
@@ -676,7 +717,7 @@ def _generate_patch_diff(app_name: str) -> str:
 
 
 def _save_logs(request_name: str, final_state: dict):
-    """Persist stage_log and conversation_log to the document."""
+    """Persist stage_log and append this run's conversation_log to the document."""
     stage_logs = final_state.get("stage_log") or []
     if isinstance(stage_logs, list):
         stage_text = "\n".join(
@@ -687,20 +728,15 @@ def _save_logs(request_name: str, final_state: dict):
         stage_text = str(stage_logs)
 
     try:
-        conversation_log = json.dumps(
-            final_state.get("intermediate_steps", []),
-            indent=2,
-            default=str,
-        )[:50000]
-    except (TypeError, ValueError) as e:
+        new_block = _format_conversation_log(final_state.get("intermediate_steps", []))
+    except Exception as e:
         log_agent_error(
             "Agent Executor: serialize conversation log",
             f"request={request_name}\n{e}\n{frappe.get_traceback()}",
         )
-        conversation_log = json.dumps([{
-            "phase": "Logging",
-            "output": f"Could not serialize conversation log: {e}",
-        }])[:50000]
+        new_block = f"Could not format conversation log: {e}"
+
+    conversation_log = _append_conversation_log(request_name, new_block)
 
     try:
         frappe.db.set_value(DOCTYPE_NAME, request_name, {
@@ -746,14 +782,140 @@ def _parse_stage_log(stage_log_text: str) -> list[dict]:
     return entries
 
 
+def dump_json_capped(obj, limit: int = 50000) -> str:
+    """Serialize obj to valid JSON no longer than `limit` chars.
+
+    JSON DocType columns enforce json_valid(); naive string truncation would
+    corrupt the JSON and fail the constraint. If the full dump is too large, long
+    string values are shortened so the result stays valid JSON.
+    """
+    text = json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+    if len(text) <= limit:
+        return text
+
+    def shrink(value, budget):
+        if isinstance(value, str) and len(value) > budget:
+            return value[:budget] + "…[truncated]"
+        if isinstance(value, list):
+            return [shrink(v, budget) for v in value]
+        if isinstance(value, dict):
+            return {k: shrink(v, budget) for k, v in value.items()}
+        return value
+
+    budget = 4000
+    while budget >= 200:
+        candidate = json.dumps(shrink(obj, budget), indent=2, ensure_ascii=False, default=str)
+        if len(candidate) <= limit:
+            return candidate
+        budget //= 2
+
+    return json.dumps(
+        {"_truncated": True, "note": "Log too large to store."},
+        ensure_ascii=False,
+    )
+
+
+def as_json_list(value) -> list:
+    """Coerce a JSON-typed field into a list.
+
+    Tolerates None, empty string, a JSON string, or an already-parsed list/dict —
+    JSON DocType fields may surface as either a raw string or a parsed value.
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return []
+        if isinstance(parsed, list):
+            return parsed
+        return [parsed] if parsed else []
+    return []
+
+
+_PHASE_MARKER = "===== PHASE: "
+_RUN_MARKER = "========== RUN @ "
+# Total conversation_log kept per request across all runs. Very high on purpose:
+# each run is naturally bounded, so this only guards pathological growth.
+_CONVERSATION_LOG_LIMIT = 1_500_000
+
+
+def _format_conversation_log(steps, limit: int = 500000) -> str:
+    """Render agent steps as clean, human-readable sectioned text (no JSON escaping)."""
+    blocks = []
+    for step in steps or []:
+        if not isinstance(step, dict):
+            continue
+        phase = step.get("phase", "Step")
+        output = _message_content_to_str(step.get("output", "")).strip()
+        blocks.append(f"{_PHASE_MARKER}{phase} =====\n{output}")
+    text = "\n\n".join(blocks)
+    if len(text) > limit:
+        text = text[:limit] + "\n\n… [log truncated]"
+    return text
+
+
+def _append_conversation_log(request_name: str, new_block: str) -> str:
+    """Append this run's log block to the existing conversation_log.
+
+    The log accumulates across the request lifecycle (planning run -> execution
+    run -> follow-up runs) so the full conversation is retained. start_agent
+    clears it for a fresh from-scratch run.
+    """
+    existing = (frappe.db.get_value(DOCTYPE_NAME, request_name, "conversation_log") or "").rstrip()
+    if not (new_block or "").strip():
+        return existing
+
+    header = f"{_RUN_MARKER}{datetime.datetime.now():%Y-%m-%d %H:%M:%S} ==========\n\n"
+    block = header + new_block
+    combined = f"{existing}\n\n{block}" if existing else block
+
+    if len(combined) > _CONVERSATION_LOG_LIMIT:
+        # Keep the most recent content; drop oldest runs (understanding is also
+        # persisted separately, so extraction is unaffected by this rare trim).
+        combined = "… [older runs truncated]\n\n" + combined[-_CONVERSATION_LOG_LIMIT:]
+    return combined
+
+
 def _extract_understanding(doc) -> str:
-    """Extract understanding summary from conversation log if available."""
+    """Extract the Understanding section from the conversation log.
+
+    Prefers the dedicated understanding_snapshot field (stable across runs and log
+    trimming). Falls back to parsing the clean sectioned-text conversation log, then
+    to the legacy JSON format for requests logged before the format change.
+    """
+    snapshot = (getattr(doc, "understanding_snapshot", "") or "").strip()
+    if snapshot:
+        return snapshot
+
+    text = doc.conversation_log or ""
     try:
-        steps = json.loads(doc.conversation_log or "[]")
-        for step in steps:
-            if step.get("phase") == "Understanding":
-                return _message_content_to_str(step.get("output", ""))
-    except (json.JSONDecodeError, TypeError) as e:
+        if text.strip():
+            marker = f"{_PHASE_MARKER}Understanding ====="
+            idx = text.find(marker)
+            if idx != -1:
+                start = idx + len(marker)
+                # Stop at the next phase or run boundary, whichever comes first.
+                candidates = [
+                    pos for pos in (
+                        text.find(f"\n{_PHASE_MARKER}", start),
+                        text.find(f"\n{_RUN_MARKER}", start),
+                    ) if pos != -1
+                ]
+                next_idx = min(candidates) if candidates else -1
+                section = text[start:] if next_idx == -1 else text[start:next_idx]
+                return section.strip()
+
+            # Legacy JSON-formatted logs.
+            for step in as_json_list(text):
+                if isinstance(step, dict) and step.get("phase") == "Understanding":
+                    return _message_content_to_str(step.get("output", ""))
+    except Exception as e:
         log_agent_error(
             "Agent Executor: extract understanding",
             f"request={getattr(doc, 'name', '')}\n{e}\n{frappe.get_traceback()}",

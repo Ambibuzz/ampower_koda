@@ -176,6 +176,10 @@ function inject_ide_styles() {
             white-space: nowrap;
         }
         .koda-toolbar .koda-meta b { color: var(--text); font-weight: 600; }
+        .koda-branch-warning {
+            color: #e3a008;
+            font-weight: 600;
+        }
         .koda-toolbar-actions {
             display: flex;
             align-items: center;
@@ -619,7 +623,7 @@ function load_workspace(request_name, $shell, ide) {
             }
             ide.context = r.message;
             ide.treeData = r.message.tree;
-            render_toolbar_meta($shell, r.message);
+            render_toolbar_meta($shell, ide, r.message);
             render_tree($shell, ide, r.message);
             const first = find_first_changed_file(r.message.tree || []);
             if (first) {
@@ -629,16 +633,60 @@ function load_workspace(request_name, $shell, ide) {
     });
 }
 
-function render_toolbar_meta($shell, data) {
+function render_toolbar_meta($shell, ide, data) {
     const branch = data.branch_name || '—';
     const count = (data.totals && data.totals.files) || Object.keys(data.changed || {}).length;
     const status = (data.request && data.request.status) || '';
-    $shell.find('.koda-toolbar-meta').html(
-        `${frappe.utils.escape_html(data.app_name || '')} · `
+    let html = `${frappe.utils.escape_html(data.app_name || '')} · `
         + `${count} ${__('changed')} · `
         + `${__('branch')}: <b>${frappe.utils.escape_html(branch)}</b> · `
-        + `${__('status')}: ${frappe.utils.escape_html(status)}`
-    );
+        + `${__('status')}: ${frappe.utils.escape_html(status)}`;
+    if (data.branch_matches === false) {
+        const on = frappe.utils.escape_html(data.current_branch || __('(unknown)'));
+        html += ` · <span class="koda-branch-warning">${__('Read-only — repo is on {0}', [on])}</span>`;
+    }
+    $shell.find('.koda-toolbar-meta').html(html);
+    apply_branch_state($shell, ide, data);
+}
+
+function apply_branch_state($shell, ide, data) {
+    // branch_matches is only present on newer backends; absence means editable.
+    const readOnly = data.branch_matches === false;
+    const was_read_only = ide.readOnly === true;
+    ide.readOnly = readOnly;
+    ide.current_branch = data.current_branch || '';
+    ide.branch_name = data.branch_name || '';
+
+    const $save = $shell.find('.koda-btn-save');
+    const $deploy = $shell.find('.koda-btn-deploy');
+    const $push = $shell.find('.koda-btn-push');
+    const $codeBtn = $shell.find('.koda-view-btn[data-mode="code"]');
+
+    if (readOnly) {
+        const tip = __('Repository is on branch {0}, not {1}. Checkout {1} to edit, deploy, or push.',
+            [ide.current_branch || __('(unknown)'), ide.branch_name || __('(none)')]);
+        $save.prop('disabled', true).attr('title', tip);
+        $deploy.prop('disabled', true).attr('title', tip);
+        $push.prop('disabled', true).attr('title', tip);
+        $codeBtn.prop('disabled', true).attr('title', tip);
+        if (ide.editor) ide.editor.setReadOnly(true);
+
+        // Force diff-only view since the working tree is not this request's branch.
+        ide.viewMode = 'diff';
+        $shell.find('.koda-view-btn').removeClass('active');
+        $shell.find('.koda-view-btn[data-mode="diff"]').addClass('active');
+        apply_view_mode($shell, ide);
+
+        if (!was_read_only) {
+            append_terminal($shell, tip);
+        }
+    } else {
+        $deploy.prop('disabled', false).attr('title', '');
+        $push.prop('disabled', false).attr('title', '');
+        $codeBtn.prop('disabled', false).attr('title', '');
+        if (ide.editor) ide.editor.setReadOnly(false);
+        update_save_button($shell, ide);
+    }
 }
 
 function render_tree($shell, ide, data) {
@@ -726,6 +774,16 @@ function do_open_file(file_path, $shell, ide) {
     $shell.find('.koda-tree-row').filter(function () {
         return $(this).attr('data-path') === file_path;
     }).addClass('selected');
+
+    if (ide.readOnly) {
+        // Working tree is on a different branch; show the diff only, never read the file.
+        $shell.find('.koda-editor-wrap').addClass('has-file');
+        update_breadcrumb($shell, file_path, file_path);
+        update_tabs($shell, ide);
+        set_status($shell, file_path, file_path);
+        load_file_diff(file_path, $shell, ide);
+        return;
+    }
 
     const loadAndShow = function (content, language, full_path) {
         ide.files[file_path] = ide.files[file_path] || {};
@@ -1037,7 +1095,6 @@ function open_push_dialog(ide, $shell) {
                 return;
             }
             dialog.hide();
-            append_terminal($shell, __('Starting commit and push...'));
             frappe.call({
                 method: 'ampower_koda.agent.api.ide_push',
                 args: {
@@ -1047,7 +1104,14 @@ function open_push_dialog(ide, $shell) {
                 },
                 freeze: true,
                 callback: function (r) {
-                    append_terminal($shell, (r.message && r.message.message) || __('Push started.'));
+                    const msg = (r.message && r.message.message) || '';
+                    if (r.message && r.message.status === 'noop') {
+                        append_terminal($shell, msg || __('No changes to push.'));
+                        frappe.show_alert({ message: msg || __('No changes to push.'), indicator: 'orange' });
+                        return;
+                    }
+                    append_terminal($shell, __('Starting commit and push...'));
+                    append_terminal($shell, msg || __('Push started.'));
                     frappe.show_alert({ message: __('Push started in background'), indicator: 'blue' });
                 },
             });
@@ -1063,7 +1127,7 @@ function refresh_tree_badges($shell, ide) {
         callback: function (r) {
             if (!r.message) return;
             ide.context = r.message;
-            render_toolbar_meta($shell, r.message);
+            render_toolbar_meta($shell, ide, r.message);
             render_tree($shell, ide, r.message);
             if (ide.activePath) {
                 $shell.find('.koda-tree-row').filter(function () {

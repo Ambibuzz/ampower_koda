@@ -14,6 +14,13 @@ class AgentRequest(Document):
             self.owner = frappe.session.user
         self._set_defaults_from_settings()
 
+    def _normalize_json_fields(self):
+        """Blank JSON fields must be NULL, not '' — empty strings fail json_valid()."""
+        for df in self.meta.get("fields", {"fieldtype": "JSON"}):
+            value = self.get(df.fieldname)
+            if isinstance(value, str) and not value.strip():
+                self.set(df.fieldname, None)
+
     def _set_defaults_from_settings(self):
         """Populate provider/model defaults from Agent Settings if not already set."""
         try:
@@ -29,6 +36,8 @@ class AgentRequest(Document):
             )
 
     def validate(self):
+        self._normalize_json_fields()
+
         if not (self.target_app_name or "").strip():
             frappe.throw(_("Target App Name is required"))
         if not (self.github_repo_url or "").strip():

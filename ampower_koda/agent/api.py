@@ -10,7 +10,7 @@ import frappe
 from frappe import _
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.executor import _generate_patch_diff
+from ampower_koda.agent.executor import _generate_patch_diff, as_json_list
 from ampower_koda.agent.git_ops import (
     branch_exists,
     checkout_base,
@@ -21,6 +21,7 @@ from ampower_koda.agent.git_ops import (
     run_git,
 )
 from ampower_koda.agent.graph import _get_bench_env
+from ampower_koda.agent.prompts import plan_has_open_questions
 
 DOCTYPE_NAME = "Agent Request"
 
@@ -88,6 +89,7 @@ def start_agent(request_name: str):
         "bench_log": "",
         "patch_diff": "",
         "conversation_log": "",
+        "understanding_snapshot": "",
     })
     frappe.db.commit()
 
@@ -136,8 +138,8 @@ def submit_follow_up(request_name: str, follow_up_message: str):
 
     changed_paths = []
     try:
-        for row in json.loads(doc.files_changed or "[]"):
-            p = (row or {}).get("path")
+        for row in as_json_list(doc.files_changed):
+            p = (row or {}).get("path") if isinstance(row, dict) else None
             if p:
                 changed_paths.append(p)
     except Exception:
@@ -203,6 +205,12 @@ def execute_existing_plan(request_name: str):
     if not (doc.agent_plan or "").strip():
         frappe.throw(_("No plan found for this request."))
 
+    if plan_has_open_questions(doc.agent_plan or ""):
+        frappe.throw(_(
+            "This plan has open questions in 'Questions for User'. "
+            "Resolve them before executing."
+        ))
+
     # Implementation can only start if we are at the approval stage or have finished a previous run.
     allowed = ("Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval")
     if doc.status not in allowed:
@@ -240,6 +248,17 @@ def approve_plan(request_name: str, edited_plan: str = None):
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status != "Awaiting Approval":
         frappe.throw(_("Cannot approve plan. Agent status is {0}.").format(doc.status))
+
+    plan_to_run = (edited_plan or doc.agent_plan or "").strip()
+    if not plan_to_run:
+        frappe.throw(_("No plan found for this request."))
+
+    if plan_has_open_questions(plan_to_run):
+        frappe.throw(_(
+            "This plan has open questions in 'Questions for User'. "
+            "Answer them in the request description, edit the plan to resolve them, "
+            "or replace that section with 'None — request is fully clear.' before approving."
+        ))
 
     if edited_plan is not None and edited_plan.strip():
         frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", edited_plan.strip()[:50000])
@@ -674,6 +693,8 @@ def get_change_tree(request_name: str):
     changed, source = _get_changed_files_for_request(doc)
     tree = _build_directory_tree(repo_root, changed)
 
+    branch_state = _get_branch_state(doc)
+
     pending_cmds = []
     try:
         pending_cmds = json.loads(doc.pending_bench_commands or "[]")
@@ -688,6 +709,8 @@ def get_change_tree(request_name: str):
         "app_name": app_name,
         "base_branch": (doc.base_branch or "main").strip(),
         "branch_name": (doc.branch_name or "").strip(),
+        "current_branch": branch_state["current_branch"],
+        "branch_matches": branch_state["matches"],
         "source": source,
         "changed": changed,
         "tree": tree,
@@ -752,24 +775,58 @@ def _detect_editor_language(file_path: str) -> str:
     }.get(ext, "Text")
 
 
-def _ensure_agent_branch(doc) -> str:
-    """Checkout the request's agent branch before IDE file writes."""
+def _get_branch_state(doc) -> dict:
+    """Return the repo's current branch and whether it matches the request branch.
+
+    This never checks out a branch. `matches` is True only when the request has a
+    branch and the repo is currently on it.
+    """
     app_name = (doc.target_app_name or "").strip()
     branch_name = (doc.branch_name or "").strip()
+    current = get_current_branch(app_name) if app_name else ""
+    matches = bool(branch_name) and current == branch_name
+    return {"current_branch": current, "branch_name": branch_name, "matches": matches}
+
+
+def _require_request_branch(doc) -> str:
+    """Ensure the repo is on the request's branch; throw on mismatch (no checkout).
+
+    Used to gate write/deploy/push actions so the IDE never silently switches the
+    branch the user has checked out.
+    """
+    app_name = (doc.target_app_name or "").strip()
     if not app_name:
         frappe.throw(_("Target app is not set on this request."))
+    branch_name = (doc.branch_name or "").strip()
     if not branch_name:
         frappe.throw(_("No agent branch found on this request."))
 
-    repo_root = get_repo_root(app_name)
-    current = get_current_branch(app_name)
-    if current != branch_name:
-        if not branch_exists(app_name, branch_name):
-            frappe.throw(_("Branch '{0}' was not found locally.").format(branch_name))
-        ok, out = run_git(["checkout", branch_name], cwd=repo_root)
-        if not ok:
-            frappe.throw(_("Could not checkout branch '{0}': {1}").format(branch_name, out))
+    state = _get_branch_state(doc)
+    if not state["matches"]:
+        frappe.throw(
+            _("Repository is on branch '{0}', not this request's branch '{1}'. "
+              "Checkout '{1}' to edit, deploy, or push.").format(
+                  state["current_branch"] or _("(unknown)"), branch_name)
+        )
     return branch_name
+
+
+def _has_pushable_changes(doc) -> bool:
+    """True if the repo has uncommitted work or committed changes vs the base branch.
+
+    Uses only local git state (working tree + base..branch); no remote fetch.
+    """
+    app_name = (doc.target_app_name or "").strip()
+    if not app_name:
+        return False
+
+    repo_root = get_repo_root(app_name)
+    ok, status_out = run_git(["status", "--short"], cwd=repo_root)
+    if ok and status_out.strip():
+        return True
+
+    changed, _source = _get_changed_files_for_request(doc)
+    return bool(changed)
 
 
 @frappe.whitelist()
@@ -782,7 +839,7 @@ def get_file_content(request_name: str, file_path: str):
         frappe.throw(_("File path is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    _ensure_agent_branch(doc)
+    _require_request_branch(doc)
     app_name = (doc.target_app_name or "").strip()
     if not app_name:
         frappe.throw(_("Target app is not set on this request."))
@@ -818,7 +875,7 @@ def save_file_content(request_name: str, file_path: str, content: str):
     if doc.status in BUSY_STATUSES:
         frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
-    _ensure_agent_branch(doc)
+    _require_request_branch(doc)
     app_name = (doc.target_app_name or "").strip()
 
     repo_root = get_repo_root(app_name)
@@ -850,10 +907,15 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     if doc.status in BUSY_STATUSES:
         frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
+    _require_request_branch(doc)
+
     push_branch = int(push_branch or 0)
     create_pr = int(create_pr or 0)
     if not push_branch and not create_pr:
         frappe.throw(_("Select at least one action (push branch or create PR)."))
+
+    if not _has_pushable_changes(doc):
+        return {"status": "noop", "message": _("No changes to push.")}
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
     frappe.db.commit()

@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
 # System prompts for the AI coding agent — Cursor-inspired, anti-hallucination, production-grade
 
+import re
+
 import frappe
 
 from ampower_koda.agent.errors import log_agent_error
@@ -317,96 +319,125 @@ Quote the EXACT code sections (with line numbers) that will need to be modified.
     return render_prompt_safe(template, context, default)
 
 
+def plan_has_open_questions(plan: str) -> bool:
+    """True when the plan lists unanswered Questions for User (not 'None — request is fully clear')."""
+    if not (plan or "").strip():
+        return False
+    match = re.search(
+        r"## Questions for User\s*\n(.*?)(?=\n## |\Z)",
+        plan,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return False
+    body = match.group(1).strip()
+    if not body:
+        return False
+    lowered = body.lower()
+    clear_markers = (
+        "none — request is fully clear",
+        "none - request is fully clear",
+        "none. request is fully clear",
+        "no open questions",
+        "none — all requirements are clear",
+        "none - all requirements are clear",
+    )
+    if lowered in clear_markers or lowered.startswith("none —") and "fully clear" in lowered:
+        return False
+    if lowered.startswith("none") and len(body.split()) <= 6:
+        return False
+    return True
+
+
 def get_plan_prompt(understanding_summary: str, user_message: str = "", request_name: str = None) -> str:
     user_section = f"## USER REQUEST\n{user_message}\n\n" if user_message else ""
     default = """{user_section}## CODEBASE ANALYSIS
 {understanding_summary}
 
-## YOUR TASK: Create a Production-Ready Implementation Plan
+## YOUR TASK: Create an Implementation Plan (Todos Only — No Code)
 
-You are writing this plan for an AI agent that will execute it step-by-step. The agent can read files, search code, and make edits — but it needs EXTREMELY precise instructions. Vague plans lead to broken code.
+You are writing a **review plan** for a human to approve before any code is written.
+An implementation agent will execute this plan **after approval** — it will read files and write code then.
+Your job now is to describe **what** must be done, not **how** in source code.
 
-**CRITICAL: Do NOT call any tools. You already have all the codebase information above. Write the plan ONLY.**
+**CRITICAL: Do NOT call any tools. Do NOT write code, pseudocode, or JSON/Python/JS snippets in this plan.**
 
-### RULES FOR EVERY TASK IN THE PLAN
-1. **Every task MUST be an actual code change** — exploration is DONE.
-2. **Scope to the request type** — only the files needed for that category.
-3. **Reference exact line numbers** for MODIFY tasks.
-4. **Show complete code** — actual Python, JS, or JSON, not pseudocode.
-5. **Match existing app patterns** — copy peer artifacts for Report/Page/DocType/Print Format.
-6. **Bench steps** — migrate only for schema JSON; build only for JS/CSS/public; omit if not needed.
-7. **Don't over-build** — a report-only request should not create DocTypes; a bug fix should not add new artifacts.
+### Planning principles (Cursor / Antigravity style)
+1. **Todos, not code** — each item is a clear task with a detailed description and acceptance criteria.
+2. **No assumptions** — if scope, behavior, field names, or UX are unclear from the request or codebase analysis, ask the user in **Questions for User**. Do not guess.
+3. **Ground in analysis** — reference exact file paths and line ranges from the codebase analysis. Quote short excerpts (1–3 lines) only for context, never full replacements.
+4. **Minimal scope** — only tasks required for this request type. No drive-by refactors.
+5. **Exploration is done** — do not add read/inspect/explore tasks.
 
-### Plan scope examples (by request type)
-- **Bug Fix**: 1–3 tasks on the failing path (.py, .js, or hooks.py)
-- **Reports & analytics**: report `.json` + `.py` (+ `.js` for filters) — reference the peer report
-- **DocTypes & data model**: `.json` + controller `.py` + client `.js` + permissions
-- **Forms & desk UI**: client `.js` changes, optional server `.py` if calls needed
-- **Server & business logic**: controller `.py`, whitelisted methods, queries
-- **Documents & output**: Print Format JSON/HTML + any helper `.py`
-- **Integrations**: integration module `.py` + config + optional client wiring
-- **Platform & maintenance**: hooks.py, patches, scheduled jobs
-- **ERPNext-flavored**: custom hooks/overrides around standard ERPNext DocTypes
-
-### Plan Format (EXACT)
+### Plan Format (use these exact section headings)
 
 ---
 
-## Summary
-2-3 sentences: what this plan accomplishes and which files are affected.
+## Overview
+2–4 sentences: goal, approach, and which areas of the app are affected.
 
-## Checklist
+## Scope
+**In scope:** bullet list of what this plan covers
+**Out of scope:** bullet list of what is explicitly NOT included (prevents scope creep)
 
-### Task 1: [Action verb + what changes]
-**File:** `exact/path/to/file.ext`
+## Assumptions
+List assumptions you are making based on the codebase analysis.
+If you have none, write exactly: `None — all requirements verified from codebase analysis.`
+
+## Questions for User
+If ANYTHING is ambiguous, missing, or could be interpreted multiple ways, list numbered questions here.
+Be specific — reference what you found vs what you need.
+If the request is fully clear, write exactly: `None — request is fully clear.`
+
+## Implementation Todos
+
+Each todo is one logical unit of work. Use this structure for every todo:
+
+### TODO 1: [Short action title]
+**Goal:** One sentence outcome.
+**Description:** Detailed instructions for the implementer — what to change, where, and why. Reference file paths and line ranges from the analysis. Describe behavior and patterns to follow (e.g. "match the peer report at …"). Do NOT paste code.
+**Files:** `path/one.ext`, `path/two.ext`
 **Action:** MODIFY | CREATE | DELETE
-**Lines affected:** [start_line]-[end_line] (for MODIFY)
-
-**Context — what currently exists at this location:**
-```
-[Quote 3-5 lines of actual code from the codebase analysis above, with line numbers]
-```
-
-**New code to write:**
-```
-[Complete, production-ready code — NOT pseudocode]
-[Include proper indentation matching the file]
-[Include all necessary imports/dependencies]
-```
-
-**Insertion point:** After line [N] / Replace lines [N]-[M] / New file
-
-**Why:** One sentence.
+**Acceptance criteria:**
+- [ ] Measurable check 1
+- [ ] Measurable check 2
+**Dependencies:** TODO N (or None)
 
 ---
 
-(Repeat for every task)
+(Repeat for every todo — typically 2–8 todos depending on request size)
 
 ## Execution Order
-1. Task N — reason for ordering
-2. Task M — depends on N being done
-...
+Numbered list explaining why todos run in this sequence and any dependencies.
+
+## Bench Commands
+- **migrate:** yes/no — reason (schema JSON changed?)
+- **build:** yes/no — reason (JS/CSS/public assets changed?)
+- **clear-cache:** yes/no — reason
 
 ## Testing Checklist
-- [ ] Implementation matches the user request (scope only — no extra files or features)
-- [ ] .py and .js syntax valid; .json is valid JSON
-- [ ] Server-client wiring correct if the request needs frappe.call / whitelisted APIs
-- [ ] bench migrate / bench build steps listed if schema or assets changed
-- [ ] No unrelated files modified
+- [ ] Request scope satisfied — no extra files or features
+- [ ] Syntax valid (.py, .js, .json as applicable)
+- [ ] Server–client wiring correct if APIs involved
+- [ ] Bench steps listed match actual changes
 
-## Risk Assessment
-- Potential issues and mitigation
+## Risks & Mitigations
+Bullet list of potential issues and how to avoid them.
 
 ---
 
-### CRITICAL WARNINGS
-- **NEVER create a task that just says "read" or "inspect"** — all reading is already done
-- **NEVER write "update as needed" or "add appropriate code"** — write the EXACT code
-- **NEVER assume a field/function exists if it wasn't found in the codebase analysis**
-- **If the user's request requires a server-side API change**, include that task
-- **If new CSS is needed**, include a task for CSS changes
-- **Always include error handling** in new code
-- **When creating new Frappe artifacts** (Reports, DocTypes, Pages): copy a complete JSON structure from an existing artifact of the same type in the codebase analysis. Review checks request scope and blocking issues — not a field-by-field metadata audit.
+### FORBIDDEN in this plan
+- **NO** "New code to write" or code blocks with implementation
+- **NO** pseudocode or partial functions
+- **NO** "update as needed" or "add appropriate logic"
+- **NO** exploration/read-only tasks
+- **NO** guessing field names, API paths, or behavior — ask in Questions for User instead
+
+### When to ask questions (examples)
+- User request mentions a feature but analysis shows multiple valid places to implement it
+- Required field names or DocType names not found in analysis
+- UX behavior not specified (filters, permissions, defaults)
+- Conflict between user request and existing app patterns
 """
     template = get_config_prompt("plan_prompt", default, request_name)
 
@@ -423,48 +454,47 @@ def get_implement_prompt(plan: str, understanding_summary: str, user_message: st
     default = """## ORIGINAL USER REQUEST
 {user_message}
 
-## APPROVED PLAN TO EXECUTE
+## APPROVED PLAN (Todos — implement each one)
 {plan}
+
+The plan contains **todo descriptions only** — no pre-written code. You must read the codebase, follow each TODO's description and acceptance criteria, and write production-ready code yourself.
+
+## CODEBASE CONTEXT FROM EXPLORATION
+{understanding_summary}
 
 ## PRE-LOADED FILE CONTENTS (with line numbers)
 {file_contents}
 
-## IMPLEMENTATION INSTRUCTIONS — FOLLOW EXACTLY
+## IMPLEMENTATION INSTRUCTIONS
 
-### Read order by task type (before each edit)
+Work through every **TODO** in the approved plan, in the stated execution order.
+
+For each TODO:
+1. **Read** the files listed in the todo (use read_file at the exact line ranges mentioned)
+2. **Verify** anchors match the codebase — re-read if line numbers shifted
+3. **Implement** the described change with replace_lines (preferred) or write_file for new files
+4. **Validate** with validate_code on every .py and .js edit
+5. **Confirm** the todo's acceptance criteria before moving to the next
+
+### Read order by task type
 - **Bug fix**: failing file first → trace related .py/.js/hooks.py
 - **DocType**: .json → .py → .js (if all exist)
-- **Report**: .json → .py → .js (copy peer report pattern)
+- **Report**: .json → .py → .js (copy peer report pattern from codebase)
 - **Page**: .json → .py → .js → .html
 - **Hook/API only**: hooks.py and/or target .py
 
-### Workflow for EACH task:
-
-**Step 1: Read target location**
-- `read_file(path, start_line, end_line)` at exact edit location
-- Check imports (lines 1–30) for frappe, json, datetime
-- Read 10+ lines above and below
-
-**Step 2: Anchor Verification**
-- Confirm unique 3-line anchor matches plan line numbers; else `search_code`
-
-**Step 3: Apply edit**
-- `replace_lines` (preferred); match indentation; never edit_file for multi-line
-
-**Step 4: validate_code** on .py/.js — fix SYNTAX_ERROR immediately
-
-**Step 5: read_file** edited region; for cross-file tasks verify fieldnames/method paths match
-
-### CRITICAL RULES:
+### CRITICAL RULES
 - **Read → Anchor → Edit → Validate → Verify** for every change
+- **Implement ALL todos** — don't skip; don't add unplanned files
+- **Match existing app patterns** — copy structure from peer artifacts when creating new ones
 - **NEVER insert code inside JS template literals**
-- **Implement ALL plan tasks** — don't skip; don't add unplanned files
+- **NEVER guess** field names or API paths — read files first
 - List [MODIFIED] and [CREATED] files when done
 
-### If problems:
-- EDIT_FAILED → re-read file, fresh line numbers
-- Bug fix → search_code for error symbol; don't create new artifacts
-- Line numbers shifted → re-read before retry
+### If problems
+- EDIT_FAILED → re-read file, use fresh line numbers
+- Line numbers shifted → search_code or re-read before retry
+- Todo description conflicts with file contents → follow the file, note in output
 """
     template = get_config_prompt("implement_prompt", default, request_name)
 

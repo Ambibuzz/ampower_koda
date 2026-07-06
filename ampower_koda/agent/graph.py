@@ -8,7 +8,7 @@ from datetime import datetime
 
 import frappe
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langchain_openai import ChatOpenAI
 
@@ -28,6 +28,20 @@ MAX_TOOL_ROUNDS_PLANNING = 40
 MAX_TOOL_ROUNDS_EXECUTION = 30
 MAX_TOOL_ROUNDS_REVIEW = 10
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
+
+# Per-phase output stored in conversation_log. High so full phase text is retained
+# (phase outputs are LLM summaries and are naturally well under this in practice).
+MAX_PHASE_OUTPUT_CHARS = 60000
+
+# History trimming: keep recent tool rounds verbatim, compact older ones to text.
+# A "round" is one assistant tool-call message plus all of its tool results.
+KEEP_TOOL_ROUNDS = 8          # recent rounds retained in full
+MIN_KEEP_ROUNDS = 3           # never trim below this many, even under char pressure
+TRIM_CHAR_BUDGET = 100000     # approx history chars before char-based trimming kicks in
+COMPACT_RESULT_PREVIEW = 200  # chars of each tool result kept in the compact summary
+
+# Provider-native prompt caching for the stable system prefix (safe no-op when unsupported).
+ENABLE_PROMPT_CACHE = True
 
 DOCTYPE_NAME = "Agent Request"
 
@@ -128,6 +142,30 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
     if _openai_uses_responses_api(model):
         openai_kwargs["use_responses_api"] = True
     return ChatOpenAI(**openai_kwargs)
+
+
+def _build_system_message(provider: str, system_prompt: str) -> SystemMessage:
+    """Build the system message, adding provider-native prompt caching where supported.
+
+    Anthropic supports an explicit `cache_control` breakpoint on the system block,
+    which caches the large, stable instruction prefix (big cost saver on repeated
+    tool rounds). OpenAI caches stable prefixes automatically, so a plain system
+    message is enough there. Gemini/others fall back to a plain system message.
+    Caching only reduces cost; it never changes model output.
+    """
+    if ENABLE_PROMPT_CACHE and (provider or "").strip() == "Claude":
+        try:
+            return SystemMessage(content=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }])
+        except Exception:
+            log_agent_error(
+                "Agent Graph: anthropic cache system message",
+                frappe.get_traceback(),
+            )
+    return SystemMessage(content=system_prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +271,20 @@ def _publish_agent_log(request_name: str, log_type: str, **kwargs):
             f"request={request_name}\ntype={log_type}\n{frappe.get_traceback()}",
         )
 
+def _persist_token_usage(request_name: str, total_tokens: int):
+    """Write the running token total to the request so the form shows live usage."""
+    if not request_name:
+        return
+    try:
+        frappe.db.set_value(DOCTYPE_NAME, request_name, "tokens_used", int(total_tokens or 0))
+        frappe.db.commit()
+    except Exception:
+        log_agent_error(
+            "Agent Graph: persist token usage",
+            f"request={request_name}\n{frappe.get_traceback()}",
+        )
+
+
 def _make_tools(app_name: str, read_only: bool = False):
     """Build LangChain tools bound to a specific app_name."""
 
@@ -313,38 +365,87 @@ def _make_tools(app_name: str, read_only: bool = False):
 # Tool-calling loop with detailed realtime logging
 # ---------------------------------------------------------------------------
 
-def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_rounds: int = 20,state: dict = None) -> tuple[str, list[str], int]:
+def _compact_round_summary(round_entry: dict) -> list[str]:
+    """One short line per tool call in a round, for the compacted-history block."""
+    return round_entry.get("summary", [])
+
+
+def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
+                           request_name: str = "", max_rounds: int = 20,
+                           state: dict = None, provider: str = "OpenAI") -> tuple[str, list[str], int]:
     """
     Run a tool-calling loop, publishing every tool call and LLM response via realtime.
     Returns (final_text, list_of_edited_file_paths, total_tokens_used).
 
-    On each round the LLM is invoked with the full message history. If the LLM
-    returns no tool calls, the loop exits early and returns that response as the
-    final text.
+    Context control (token savings without quality loss):
+      - The stable system prompt is a separate, cache-friendly message.
+      - Older tool rounds are compacted to a short text summary while the most
+        recent rounds are kept verbatim, so the model keeps working context but
+        we stop re-sending large, already-consumed tool outputs every round.
 
-    If max_rounds is reached without the LLM stopping, one final llm.invoke()
-    is fired WITHOUT tools bound — this forces a plain text conclusion rather
-    than an infinite loop. Edited paths and token counts collected up to that
-    point are still returned.
+    A "round" is one assistant tool-call message plus all of its tool results;
+    rounds are trimmed atomically so no tool_call_id is ever left dangling.
+
+    If max_rounds is reached without the LLM stopping, one final llm.invoke() is
+    fired WITHOUT tools bound to force a plain-text conclusion.
     """
     tool_map = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
-    messages = [HumanMessage(content=prompt)]
-    edited_paths = []
-    total_tokens = (state or {}).get("tokens_used", 0) # carry forward from prior phases
 
-    for round_num in range(max_rounds):
-        response = llm_with_tools.invoke(messages)
-        messages.append(response)
+    system_msg = _build_system_message(provider, system_prompt)
+    task_msg = HumanMessage(content=task_prompt)
 
+    rounds: list[dict] = []      # each: {"ai": AIMessage, "tools": [ToolMessage], "summary": [str]}
+    compacted: list[str] = []    # summary lines for dropped (older) rounds
+    edited_paths: list[str] = []
+    total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
+
+    def build_messages():
+        msgs = [system_msg, task_msg]
+        if compacted:
+            msgs.append(HumanMessage(content=(
+                "## Earlier tool activity (older rounds, summarized to save context)\n"
+                "These tools already ran; re-read a file only if you need details not captured here.\n"
+                + "\n".join(compacted)
+            )))
+        for r in rounds:
+            msgs.append(r["ai"])
+            msgs.extend(r["tools"])
+        return msgs
+
+    def estimate_chars():
+        return sum(len(str(getattr(m, "content", ""))) for r in rounds for m in [r["ai"], *r["tools"]])
+
+    def maybe_trim():
+        trimmed = False
+        while len(rounds) > KEEP_TOOL_ROUNDS:
+            compacted.extend(_compact_round_summary(rounds.pop(0)))
+            trimmed = True
+        while len(rounds) > MIN_KEEP_ROUNDS and estimate_chars() > TRIM_CHAR_BUDGET:
+            compacted.extend(_compact_round_summary(rounds.pop(0)))
+            trimmed = True
+        if trimmed:
+            _publish_agent_log(request_name, "history_trim",
+                kept_rounds=len(rounds),
+                compacted_lines=len(compacted),
+            )
+
+    def account_tokens(response, round_label):
+        nonlocal total_tokens
         usage = getattr(response, "usage_metadata", None)
         if usage:
             total_tokens += int(usage.get("total_tokens") or 0)
             _publish_agent_log(request_name, "token_usage",
-                round=round_num + 1,
+                round=round_label,
                 tokens_this_round=usage.get("total_tokens", 0),
                 tokens_total=total_tokens,
             )
+            _persist_token_usage(request_name, total_tokens)
+
+    for round_num in range(max_rounds):
+        maybe_trim()
+        response = llm_with_tools.invoke(build_messages())
+        account_tokens(response, round_num + 1)
 
         response_text = _llm_response_text(response)
         if response_text:
@@ -356,6 +457,7 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
         if not getattr(response, "tool_calls", None):
             return response_text, edited_paths, total_tokens
 
+        round_entry = {"ai": response, "tools": [], "summary": []}
         for tc in response.tool_calls:
             _publish_agent_log(request_name, "tool_call",
                 tool_name=tc["name"],
@@ -389,12 +491,20 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
                 result_preview=result[:500],
                 round=round_num + 1,
             )
-            messages.append(ToolMessage(content=result, tool_call_id=tc["id"]))
+            round_entry["tools"].append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
-    final = llm.invoke(messages)
-    usage = getattr(final, "usage_metadata", None)
-    if usage:
-        total_tokens += int(usage.get("total_tokens") or 0)
+            arg_preview = ", ".join(
+                f"{k}={str(v)[:60]}" for k, v in list(tc.get("args", {}).items())[:3]
+            )
+            round_entry["summary"].append(
+                f"[r{round_num + 1}] {tc['name']}({arg_preview}) -> {result[:COMPACT_RESULT_PREVIEW]}"
+            )
+
+        rounds.append(round_entry)
+
+    maybe_trim()
+    final = llm.invoke(build_messages())
+    account_tokens(final, max_rounds + 1)
     return _llm_response_text(final), edited_paths, total_tokens
 
 
@@ -413,15 +523,15 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
         tools = _make_tools(app_name, read_only=read_only_tools)
         llm = _get_llm(provider=provider, model=model)
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
-        full_prompt = f"{system_prompt}\n\n{prompt}"
         content, tool_edited_paths, total_tokens = _run_tool_calling_loop(
-            llm, tools, full_prompt,
+            llm, tools, system_prompt, prompt,
             request_name=request_name,
             max_rounds=max_rounds,
-            state=state,      
+            state=state,
+            provider=provider,
         )
         content = _message_content_to_str(content)
-        max_output = 30000 if phase in ("Understanding", "Planning") else 8000
+        max_output = MAX_PHASE_OUTPUT_CHARS
         steps = list(state.get("intermediate_steps") or []) + [
             {"phase": phase, "output": (content[:max_output] if content else "")}
         ]
@@ -481,7 +591,7 @@ def plan_node(state: dict) -> dict:
     if state.get("error"):
         return {"error": state["error"]}
 
-    logs = _log_stage(state, "Planning", "started", "Creating detailed implementation plan from codebase analysis")
+    logs = _log_stage(state, "Planning", "started", "Creating todo-based implementation plan")
 
     try:
         provider = state.get("ai_provider", "OpenAI")
@@ -499,13 +609,26 @@ def plan_node(state: dict) -> dict:
         llm = _get_llm(provider=provider, model=model)
         system_prompt = get_system_prompt(app_name, request_name=request_name)
         plan_prompt = get_plan_prompt(understanding, user_message, request_name=request_name)
-        full_prompt = f"{system_prompt}\n\n{plan_prompt}"
 
         _publish_agent_log(request_name, "llm_response",
-            preview="Generating detailed plan from codebase analysis...", round=1)
+            preview="Generating todo-based plan from codebase analysis...", round=1)
 
-        response = llm.invoke([HumanMessage(content=full_prompt)])
+        response = llm.invoke([
+            _build_system_message(provider, system_prompt),
+            HumanMessage(content=plan_prompt),
+        ])
         plan = _llm_response_text(response)
+
+        total_tokens = state.get("tokens_used", 0)
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            total_tokens += int(usage.get("total_tokens") or 0)
+            _publish_agent_log(request_name, "token_usage",
+                round=1,
+                tokens_this_round=usage.get("total_tokens", 0),
+                tokens_total=total_tokens,
+            )
+            _persist_token_usage(request_name, total_tokens)
 
         if not plan.strip():
             logs = _log_stage({**state, "stage_log": logs}, "Planning", "failed",
@@ -516,7 +639,7 @@ def plan_node(state: dict) -> dict:
             preview=plan[:500], round=2)
 
         steps = list(state.get("intermediate_steps") or []) + [
-            {"phase": "Planning", "output": plan[:30000]}
+            {"phase": "Planning", "output": plan[:MAX_PHASE_OUTPUT_CHARS]}
         ]
 
         logs = _log_stage({**state, "stage_log": logs}, "Planning", "completed",
@@ -527,6 +650,7 @@ def plan_node(state: dict) -> dict:
             "plan": plan,
             "intermediate_steps": steps,
             "stage_log": logs,
+            "tokens_used": total_tokens,
         }
     except Exception as e:
         log_agent_error(
