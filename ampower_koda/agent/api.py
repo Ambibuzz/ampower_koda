@@ -21,7 +21,6 @@ from ampower_koda.agent.git_ops import (
     run_git,
 )
 from ampower_koda.agent.graph import _get_bench_env
-from ampower_koda.agent.prompts import plan_has_open_questions
 
 DOCTYPE_NAME = "Agent Request"
 
@@ -90,6 +89,10 @@ def start_agent(request_name: str):
         "patch_diff": "",
         "conversation_log": "",
         "understanding_snapshot": "",
+        "change_summary": "",
+        # files_changed is a JSON column with a json_valid() CHECK constraint —
+        # "" is not valid JSON, so clear it with NULL (allowed) instead.
+        "files_changed": None,
     })
     frappe.db.commit()
 
@@ -205,12 +208,6 @@ def execute_existing_plan(request_name: str):
     if not (doc.agent_plan or "").strip():
         frappe.throw(_("No plan found for this request."))
 
-    if plan_has_open_questions(doc.agent_plan or ""):
-        frappe.throw(_(
-            "This plan has open questions in 'Questions for User'. "
-            "Resolve them before executing."
-        ))
-
     # Implementation can only start if we are at the approval stage or have finished a previous run.
     allowed = ("Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval")
     if doc.status not in allowed:
@@ -252,13 +249,6 @@ def approve_plan(request_name: str, edited_plan: str = None):
     plan_to_run = (edited_plan or doc.agent_plan or "").strip()
     if not plan_to_run:
         frappe.throw(_("No plan found for this request."))
-
-    if plan_has_open_questions(plan_to_run):
-        frappe.throw(_(
-            "This plan has open questions in 'Questions for User'. "
-            "Answer them in the request description, edit the plan to resolve them, "
-            "or replace that section with 'None — request is fully clear.' before approving."
-        ))
 
     if edited_plan is not None and edited_plan.strip():
         frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", edited_plan.strip()[:50000])

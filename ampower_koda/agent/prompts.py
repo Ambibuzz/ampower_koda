@@ -1,8 +1,6 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
 # System prompts for the AI coding agent — Cursor-inspired, anti-hallucination, production-grade
 
-import re
-
 import frappe
 
 from ampower_koda.agent.errors import log_agent_error
@@ -13,7 +11,6 @@ PROMPT_LABEL_MAP = {
     "understand_prompt": "Understand Prompt",
     "plan_prompt": "Plan Prompt",
     "implement_prompt": "Implement Prompt",
-    "review_prompt": "Review Prompt"
 }
 
 class SafeDict(dict):
@@ -319,36 +316,6 @@ Quote the EXACT code sections (with line numbers) that will need to be modified.
     return render_prompt_safe(template, context, default)
 
 
-def plan_has_open_questions(plan: str) -> bool:
-    """True when the plan lists unanswered Questions for User (not 'None — request is fully clear')."""
-    if not (plan or "").strip():
-        return False
-    match = re.search(
-        r"## Questions for User\s*\n(.*?)(?=\n## |\Z)",
-        plan,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if not match:
-        return False
-    body = match.group(1).strip()
-    if not body:
-        return False
-    lowered = body.lower()
-    clear_markers = (
-        "none — request is fully clear",
-        "none - request is fully clear",
-        "none. request is fully clear",
-        "no open questions",
-        "none — all requirements are clear",
-        "none - all requirements are clear",
-    )
-    if lowered in clear_markers or lowered.startswith("none —") and "fully clear" in lowered:
-        return False
-    if lowered.startswith("none") and len(body.split()) <= 6:
-        return False
-    return True
-
-
 def get_plan_prompt(understanding_summary: str, user_message: str = "", request_name: str = None) -> str:
     user_section = f"## USER REQUEST\n{user_message}\n\n" if user_message else ""
     default = """{user_section}## CODEBASE ANALYSIS
@@ -364,7 +331,7 @@ Your job now is to describe **what** must be done, not **how** in source code.
 
 ### Planning principles (Cursor / Antigravity style)
 1. **Todos, not code** — each item is a clear task with a detailed description and acceptance criteria.
-2. **No assumptions** — if scope, behavior, field names, or UX are unclear from the request or codebase analysis, ask the user in **Questions for User**. Do not guess.
+2. **State assumptions, don't block** — if scope, behavior, field names, or UX are unclear, make the most reasonable choice grounded in the codebase analysis and record it under **Assumptions**. Do not stop to ask the user.
 3. **Ground in analysis** — reference exact file paths and line ranges from the codebase analysis. Quote short excerpts (1–3 lines) only for context, never full replacements.
 4. **Minimal scope** — only tasks required for this request type. No drive-by refactors.
 5. **Exploration is done** — do not add read/inspect/explore tasks.
@@ -381,13 +348,9 @@ Your job now is to describe **what** must be done, not **how** in source code.
 **Out of scope:** bullet list of what is explicitly NOT included (prevents scope creep)
 
 ## Assumptions
-List assumptions you are making based on the codebase analysis.
+List the assumptions and decisions you are making based on the codebase analysis
+(including any ambiguity you resolved on the user's behalf).
 If you have none, write exactly: `None — all requirements verified from codebase analysis.`
-
-## Questions for User
-If ANYTHING is ambiguous, missing, or could be interpreted multiple ways, list numbered questions here.
-Be specific — reference what you found vs what you need.
-If the request is fully clear, write exactly: `None — request is fully clear.`
 
 ## Implementation Todos
 
@@ -431,13 +394,7 @@ Bullet list of potential issues and how to avoid them.
 - **NO** pseudocode or partial functions
 - **NO** "update as needed" or "add appropriate logic"
 - **NO** exploration/read-only tasks
-- **NO** guessing field names, API paths, or behavior — ask in Questions for User instead
-
-### When to ask questions (examples)
-- User request mentions a feature but analysis shows multiple valid places to implement it
-- Required field names or DocType names not found in analysis
-- UX behavior not specified (filters, permissions, defaults)
-- Conflict between user request and existing app patterns
+- **NO** open questions or requests for clarification — resolve ambiguity yourself and record it under Assumptions
 """
     template = get_config_prompt("plan_prompt", default, request_name)
 
@@ -489,12 +446,25 @@ For each TODO:
 - **Match existing app patterns** — copy structure from peer artifacts when creating new ones
 - **NEVER insert code inside JS template literals**
 - **NEVER guess** field names or API paths — read files first
-- List [MODIFIED] and [CREATED] files when done
+- Only edit/create the **code files required by the plan**
+
+### FORBIDDEN — do NOT create these files
+Do NOT create README, CHANGELOG, notes, summary, status, "done", "finalize", or
+metadata files (e.g. `*.md`, `*.txt`, `*_NOTE.txt`, `IMPLEMENTATION_DONE.txt`,
+`FINALIZE_*.txt`, `*_METADATA.txt`, `*_SUMMARY*`). Do NOT write your summary or
+progress notes into a file. The ONLY files you may touch are the actual source
+code files needed to satisfy the plan's todos. Put any explanation in your final
+message text — never in a new file.
 
 ### If problems
 - EDIT_FAILED → re-read file, use fresh line numbers
 - Line numbers shifted → search_code or re-read before retry
 - Todo description conflicts with file contents → follow the file, note in output
+
+### FINAL STEP — write a summary (in your message, not a file)
+After all edits are applied and validated, end with a concise plain-English
+summary titled `SUMMARY OF CHANGES:` — 3–8 sentences describing, per file, what
+you changed and why. Do not include code in the summary.
 """
     template = get_config_prompt("implement_prompt", default, request_name)
 
@@ -503,61 +473,6 @@ For each TODO:
         "understanding_summary": understanding_summary,
         "user_message": user_message,
         "file_contents": file_contents
-    }
-
-    return render_prompt_safe(template, context, default)
-
-
-def get_review_prompt(edits_made: list[dict], user_message: str, request_name: str = None) -> str:
-    paths = [e.get("path", "") for e in edits_made if e.get("path")]
-    paths_list = "\n".join(f"- {p}" for p in paths) if paths else "(no specific paths recorded)"
-
-    default = """## USER REQUEST
-{user_message_short}
-
-## FILES MODIFIED
-{paths_list}
-
-## TESTING INSTRUCTIONS (Frappe)
-
-Test whether the changes **satisfy the USER REQUEST above** and still keep existing behavior stable. Stay within request scope — do not audit fields, files, or features the user did not ask for.
-
-Read each modified file with `read_file(path)`. Call `validate_code(path)` on every .py and .js file.
-
-### Generic testing checklist
-1. **Request scope** — Matches what was asked (bug fixed / report added / feature built)? No unrelated files?
-2. **Syntax** — .py/.js pass validate_code; .json is valid JSON.
-3. **Imports** — frappe, json, datetime imported where used.
-4. **Wiring** — frappe.call ↔ @frappe.whitelist if client↔server; report execute() if Script Report; form handlers if DocType UI.
-5. **Consistency** — fieldnames/method paths match across files touched by THIS change only.
-
-### Testing by task type
-- **Bug fix**: original issue addressed; no scope creep.
-- **Report**: report files work together; don't fail for missing DocType fields unless part of request.
-- **DocType**: schema + controller + client consistent if all were in scope.
-- **Page/API/hook**: artifact loads or runs; hook keys not duplicated.
-
-### JSON — scoped only
-- Read actual file content. No field-by-field metadata audits.
-- Fail only blocking issues: invalid JSON, wrong doctype, missing fields required for THIS request.
-- Accept same metadata pattern as peer artifacts in the app.
-
-### Verdict rules
-- `REVIEW_PASSED=yes` — request implemented, syntax valid, no blocking Frappe bug.
-- `REVIEW_PASSED=no` — only real bugs: syntax errors, broken imports, code inside JS template literals, mismatched fieldnames, or JSON that would break migrate. List **at most 5** issues with concrete fixes.
-
-After reading ALL files, give your verdict IMMEDIATELY.
-
-### VERDICT FORMAT (REQUIRED):
-- All good: `REVIEW_PASSED=yes`
-- Issues found: `REVIEW_PASSED=no` then list each issue:
-  - File: path — Issue: (e.g. Missing import of 'json') — Fix: (e.g. Add import at line 2)
-"""
-    template = get_config_prompt("review_prompt", default, request_name)
-
-    context = {
-        "user_message_short": user_message[:800] if user_message else "",
-        "paths_list": paths_list
     }
 
     return render_prompt_safe(template, context, default)

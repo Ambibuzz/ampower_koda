@@ -39,11 +39,7 @@ class AgentState(TypedDict, total=False):
     # Implementation phase
     implemented_files: list
     edits_made: list  # [{path, summary}, ...]
-
-    # Review phase
-    review_passed: bool
-    review_notes: str
-    review_attempts: int
+    change_summary: str  # plain-English summary of what the implement phase changed
 
     # Pending approvals
     pending_bench_commands: str # JSON-encoded list[str] — always parse with json.loads before use

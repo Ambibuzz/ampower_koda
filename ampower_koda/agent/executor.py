@@ -1,10 +1,11 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# Executor phases: planning (understand + plan), execution (implement + review),
+# Executor phases: planning (understand + plan), execution (implement),
 # bench + commit, and deploy (push + PR). Enqueued as background jobs from api.py.
 
 import datetime
 import json
 import os
+import re
 import subprocess
 
 import frappe
@@ -15,7 +16,6 @@ from ampower_koda.agent.graph import (
     build_planning_graph,
     build_execution_graph,
 )
-from ampower_koda.agent.prompts import plan_has_open_questions
 from ampower_koda.agent.git_ops import (
     branch_exists,
     generate_branch_name,
@@ -145,7 +145,7 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
         "branch_name", "pr_url", "pr_number", "conversation_log",
         "agent_plan", "files_changed", "error_log", "tokens_used",
         "cost_estimate", "stage_log", "bench_log", "patch_diff",
-        "pending_bench_commands",
+        "pending_bench_commands", "change_summary",
     ]
     if kwargs:
         for k, v in kwargs.items():
@@ -224,13 +224,7 @@ def run_planning_phase(request_name: str) -> None:
         })
         frappe.db.commit()
 
-        if plan_has_open_questions(plan):
-            approval_msg = (
-                "Plan generated with open questions. Review 'Questions for User', "
-                "update the request or edit the plan, then approve."
-            )
-        else:
-            approval_msg = "Plan generated. Review the todos and approve to start implementation."
+        approval_msg = "Plan generated. Review the todos and approve to start implementation."
 
         _update_status(request_name, user, "Awaiting Approval", approval_msg,
             tokens_used=int(final_state.get("tokens_used") or 0))
@@ -242,11 +236,11 @@ def run_planning_phase(request_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Execution (Implement + Review)
+# Phase 2: Execution (Implement)
 # ---------------------------------------------------------------------------
 
 def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
-    """Create/reuse the working branch, run implement + review, then await bench approval.
+    """Create/reuse the working branch, run the implement pass, then await bench approval.
 
     When preserve_branch is set, reuse the request's existing branch for a follow-up
     fix instead of creating a fresh one.
@@ -355,6 +349,14 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
             return
 
         repo_root = get_repo_root(app_name)
+
+        # Drop throwaway notes/marker files the model may have created so they
+        # never reach the diff or PR.
+        stripped = _strip_agent_scratch_files(repo_root)
+        if stripped:
+            _update_status(request_name, user, "Implementing",
+                f"Removed {len(stripped)} stray file(s): {', '.join(stripped[:5])}")
+
         ok_diff, diff_out = run_git(["diff", "--stat"], cwd=repo_root)
         ok_ut, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
         has_changes = bool((diff_out or "").strip()) or bool((untracked or "").strip())
@@ -367,7 +369,13 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
 
         patch_diff = _generate_patch_diff(app_name)
 
-        edits = final_state.get("edits_made") or []
+        # Keep the recorded change set in sync with what actually remains on disk.
+        stripped_set = set(stripped)
+        edits = [
+            e for e in (final_state.get("edits_made") or [])
+            if e.get("path") not in stripped_set
+            and not (e.get("path") and _is_scratch_file(e["path"]))
+        ]
         bench_cmds = _compute_bench_commands(app_name, edits)
 
         _update_status(
@@ -375,6 +383,7 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
             f"Implementation complete. {len(bench_cmds)} bench commands need approval.",
             patch_diff=patch_diff,
             files_changed=dump_json_capped(edits),
+            change_summary=(final_state.get("change_summary") or "").strip(),
             pending_bench_commands=json.dumps(bench_cmds),
             tokens_used=int(final_state.get("tokens_used") or 0),
         )
@@ -388,6 +397,53 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0) -> None:
 # ---------------------------------------------------------------------------
 # Helpers: bench command computation
 # ---------------------------------------------------------------------------
+
+# Names/patterns that indicate throwaway "scratch" files the model sometimes
+# creates (progress notes, status markers, metadata dumps). These are never part
+# of a real code change and must not land in the PR.
+_SCRATCH_NAME_KEYWORDS = (
+    "note", "notes", "metadata", "summary", "readme", "changelog",
+    "finalize", "implementation_done", "done", "todo", "scratch",
+)
+
+
+def _is_scratch_file(rel_path: str) -> bool:
+    """True for agent-created doc/marker files that don't belong in the change set."""
+    name = os.path.basename(rel_path).lower()
+    _, ext = os.path.splitext(name)
+    # Loose .txt files are never a legitimate Frappe code artifact.
+    if ext == ".txt":
+        return True
+    # Markdown only when it looks like an agent note/marker (keep real code .md rare).
+    if ext == ".md" and any(k in name for k in _SCRATCH_NAME_KEYWORDS):
+        return True
+    if re.match(r"(?i)(implementation_done|finalize_|ai_feature|ai_progress)", name):
+        return True
+    return False
+
+
+def _strip_agent_scratch_files(repo_root: str) -> list[str]:
+    """Delete newly-created scratch/marker files from the working tree.
+
+    Returns the list of removed repo-relative paths. Only untracked files are
+    considered, so tracked source code is never touched.
+    """
+    ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
+    if not ok or not (untracked or "").strip():
+        return []
+    removed = []
+    for rel in untracked.splitlines():
+        rel = rel.strip()
+        if not rel or not _is_scratch_file(rel):
+            continue
+        try:
+            os.remove(os.path.join(repo_root, rel))
+            removed.append(rel)
+        except OSError:
+            log_agent_error("Agent Execution: strip scratch file",
+                f"could not remove {rel}\n{frappe.get_traceback()}")
+    return removed
+
 
 def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
     """Determine which bench commands are needed based on which file types were edited.

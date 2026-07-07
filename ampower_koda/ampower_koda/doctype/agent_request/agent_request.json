@@ -31,6 +31,8 @@
   "column_break_result",
   "branch_name",
   "pr_number",
+  "changes_summary_section",
+  "change_summary",
   "plan_section",
   "agent_plan",
   "diff_section",
@@ -212,6 +214,18 @@
    "fieldname": "pr_number",
    "fieldtype": "Int",
    "label": "PR Number",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.change_summary",
+   "fieldname": "changes_summary_section",
+   "fieldtype": "Section Break",
+   "label": "Summary of Changes"
+  },
+  {
+   "fieldname": "change_summary",
+   "fieldtype": "Long Text",
+   "label": "Summary of Changes",
    "read_only": 1
   },
   {

@@ -41,7 +41,7 @@ var REQUEST_TYPE_HELP = {
 
 var STATUS_FLOW = [
     'Queued', 'Understanding', 'Planning', 'Awaiting Approval',
-    'Implementing', 'Reviewing', 'Awaiting Bench Approval', 'Building',
+    'Implementing', 'Awaiting Bench Approval', 'Building',
     'Awaiting Push Approval', 'Pushing', 'Completed'
 ];
 
@@ -51,6 +51,7 @@ var STATUS_META = {
     'Planning': { color: 'blue', label: 'Creating Plan' },
     'Awaiting Approval': { color: 'orange', label: 'Review Plan' },
     'Implementing': { color: 'yellow', label: 'Implementing Changes' },
+    // 'Reviewing' is legacy — no longer produced, kept so historical records still render.
     'Reviewing': { color: 'yellow', label: 'Testing Changes' },
     'Awaiting Bench Approval': { color: 'orange', label: 'Approve Bench Commands' },
     'Building': { color: 'purple', label: 'Running Bench Commands' },
@@ -123,7 +124,6 @@ function render_status_dashboard(frm) {
         { key: 'Planning', short: 'Plan' },
         { key: 'Awaiting Approval', short: 'Review' },
         { key: 'Implementing', short: 'Build' },
-        { key: 'Reviewing', short: 'Test' },
         { key: 'Awaiting Bench Approval', short: 'Bench' },
         { key: 'Awaiting Push Approval', short: 'Push' },
         { key: 'Completed', short: 'Done' }
@@ -178,22 +178,12 @@ function render_status_dashboard(frm) {
 
     var plan_info_html = '';
     if (status === 'Awaiting Approval' && (frm.doc.agent_plan || '').trim()) {
-        if (plan_has_open_questions(frm.doc.agent_plan)) {
-            plan_info_html = '<div class="agent-push-info" style="border-left:3px solid var(--orange-500,#f97316);">'
-                + '<strong>Open questions — approval blocked</strong>'
-                + '<p style="margin:6px 0 0;font-size:12px;color:var(--text-muted);">'
-                + 'This plan lists questions under <b>Questions for User</b>. '
-                + 'Answer them in the request description, edit the plan, or set that section to '
-                + '<code>None — request is fully clear.</code> before approving.</p>'
-                + '</div>';
-        } else {
-            plan_info_html = '<div class="agent-push-info">'
-                + '<strong>Review the plan todos</strong>'
-                + '<p style="margin:6px 0 0;font-size:12px;color:var(--text-muted);">'
-                + 'The plan describes <b>what</b> to build — not source code. '
-                + 'Edit todos if needed, then click <b>Approve Plan</b> to start implementation.</p>'
-                + '</div>';
-        }
+        plan_info_html = '<div class="agent-push-info">'
+            + '<strong>Review the plan todos</strong>'
+            + '<p style="margin:6px 0 0;font-size:12px;color:var(--text-muted);">'
+            + 'The plan describes <b>what</b> to build — not source code. '
+            + 'Edit todos if needed, then click <b>Approve Plan</b> to start implementation.</p>'
+            + '</div>';
     }
 
     var push_info_html = '';
@@ -655,30 +645,7 @@ function execute_existing_plan(frm) {
     );
 }
 
-function plan_has_open_questions(plan) {
-    if (!plan || !plan.trim()) return false;
-    var match = plan.match(/## Questions for User\s*\n([\s\S]*?)(?=\n## |\s*$)/i);
-    if (!match) return false;
-    var body = (match[1] || '').trim();
-    if (!body) return false;
-    var lowered = body.toLowerCase();
-    if (lowered.indexOf('none — request is fully clear') !== -1) return false;
-    if (lowered.indexOf('none - request is fully clear') !== -1) return false;
-    if (lowered.indexOf('no open questions') !== -1) return false;
-    if (lowered.indexOf('none') === 0 && body.split(/\s+/).length <= 6) return false;
-    return true;
-}
-
 function approve_plan(frm) {
-    var plan = frm.doc.agent_plan || '';
-    if (plan_has_open_questions(plan)) {
-        frappe.msgprint({
-            title: __('Open Questions'),
-            message: __('This plan has unanswered questions. Edit the plan or update the request before approving.'),
-            indicator: 'orange'
-        });
-        return;
-    }
     frappe.confirm(
         __('Approve this plan and start implementation?<br><br>The agent will execute each todo, run bench commands, and prepare changes for push.'),
         function () {

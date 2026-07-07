@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# LangGraph workflows: Planning (Understand -> Plan) and Execution (Implement -> Review).
-# The bench and deploy steps run in executor.py, not in the graph.
+# LangGraph workflows: Planning (Understand -> Plan) and Execution (Implement).
+# A local syntax check gates the implement pass; bench and deploy run in executor.py.
 
 import os
 import re as _re
@@ -20,13 +20,13 @@ from ampower_koda.agent.prompts import (
     get_understand_prompt,
     get_plan_prompt,
     get_implement_prompt,
-    get_review_prompt,
 )
 
 
 MAX_TOOL_ROUNDS_PLANNING = 40
 MAX_TOOL_ROUNDS_EXECUTION = 30
-MAX_TOOL_ROUNDS_REVIEW = 10
+MAX_TOOL_ROUNDS_SYNTAX_FIX = 12   # rounds for a focused "fix the syntax errors" pass
+MAX_SYNTAX_FIX_ATTEMPTS = 2       # how many times to re-invoke to fix remaining syntax errors
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
 
 # Per-phase output stored in conversation_log. High so full phase text is retained
@@ -76,23 +76,8 @@ def _llm_response_text(response) -> str:
     return _message_content_to_str(getattr(response, "content", ""))
 
 
-def _parse_review_verdict(text: str) -> tuple[bool, str]:
-    """Parse explicit testing verdict from review output without an extra LLM call."""
-    notes = (text or "").strip()
-    upper = notes.upper()
-    if _re.search(r"REVIEW_PASSED\s*[=:]\s*YES\b", upper):
-        return True, notes
-    if _re.search(r"REVIEW_PASSED\s*[=:]\s*NO\b", upper):
-        return False, notes
-    if "REVIEW_PASSED=YES" in upper or "REVIEW PASSED: YES" in upper:
-        return True, notes
-    if "REVIEW_PASSED=NO" in upper or "REVIEW PASSED: NO" in upper:
-        return False, notes
-    return False, notes or "Testing verdict missing explicit REVIEW_PASSED=yes/no."
-
-
 def _syntax_check_edits(app_name: str, edits: list[dict]) -> tuple[bool, str]:
-    """Validate edited .py/.js locally before spending an LLM review turn."""
+    """Validate edited .py/.js locally so broken syntax never reaches bench."""
     paths = [e.get("path", "") for e in (edits or []) if e.get("path")]
     code_paths = [p for p in paths if p.endswith((".py", ".js"))]
     if not code_paths:
@@ -102,9 +87,14 @@ def _syntax_check_edits(app_name: str, edits: list[dict]) -> tuple[bool, str]:
     summary_lines = []
     for path in code_paths:
         result = agent_tools.validate_code(app_name, path)
+        # A path that doesn't resolve to a real file is not a syntax error — it's
+        # usually a phantom path parsed from the model's summary text. Skip it.
+        if "Not a file" in result:
+            continue
         first_line = (result or "").split("\n", 1)[0][:240]
         summary_lines.append(f"- {path}: {first_line}")
-        if "SYNTAX_ERROR" in result or "VALIDATION_FAILED" in result:
+        # Only genuine syntax problems should block the run.
+        if "SYNTAX_ERROR" in result:
             failures.append(result)
 
     summary = "\n".join(summary_lines)
@@ -185,6 +175,30 @@ def _extract_file_paths(text: str) -> list[str]:
         for m in _re.finditer(pat, text):
             paths.add(m.group(0))
     return sorted(paths)
+
+
+def _app_file_exists(app_name: str, rel_path: str) -> bool:
+    """True if rel_path resolves to a real file inside the app (best-effort)."""
+    try:
+        return os.path.isfile(agent_tools._resolve_path(app_name, rel_path))
+    except Exception:
+        return False
+
+
+def _extract_change_summary(text: str) -> str:
+    """Pull the plain-English 'SUMMARY OF CHANGES' the model writes at the end.
+
+    Falls back to the trailing prose of the final message if the explicit heading
+    is missing, so the request always shows a readable summary.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    m = _re.search(r"(?is)summary of changes\s*:?\s*(.+)$", text)
+    summary = (m.group(1) if m else text).strip()
+    # Drop leftover markdown fences / list bullets noise but keep readable text.
+    summary = summary.strip("`").strip()
+    return summary[:4000]
 
 
 def _pre_read_files(app_name: str, paths: list[str], max_files: int = 25) -> str:
@@ -372,7 +386,8 @@ def _compact_round_summary(round_entry: dict) -> list[str]:
 
 def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                            request_name: str = "", max_rounds: int = 20,
-                           state: dict = None, provider: str = "OpenAI") -> tuple[str, list[str], int]:
+                           state: dict = None, provider: str = "OpenAI",
+                           require_writes: bool = False) -> tuple[str, list[str], int]:
     """
     Run a tool-calling loop, publishing every tool call and LLM response via realtime.
     Returns (final_text, list_of_edited_file_paths, total_tokens_used).
@@ -386,6 +401,11 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     A "round" is one assistant tool-call message plus all of its tool results;
     rounds are trimmed atomically so no tool_call_id is ever left dangling.
 
+    When require_writes is set (implementation phase), the loop nudges the model
+    to stop exploring and actually edit files if it reads for too many rounds
+    without writing, or tries to finish without having made any edit. This
+    prevents the "read forever, never write" failure that yields no file changes.
+
     If max_rounds is reached without the LLM stopping, one final llm.invoke() is
     fired WITHOUT tools bound to force a plain-text conclusion.
     """
@@ -397,8 +417,24 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
 
     rounds: list[dict] = []      # each: {"ai": AIMessage, "tools": [ToolMessage], "summary": [str]}
     compacted: list[str] = []    # summary lines for dropped (older) rounds
+    injected: list = []          # directive nudges appended after the latest round
     edited_paths: list[str] = []
     total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
+
+    wrote_anything = False
+    read_only_streak = 0
+    write_nudges = 0
+    MAX_WRITE_NUDGES = 3
+    READ_STREAK_LIMIT = 5
+    NUDGE_TEXT = (
+        "STOP exploring. You have read enough — the files you need are already "
+        "in context (pre-loaded in the instructions and/or from the reads above). "
+        "Do NOT call read_file, search_code, list_directory, get_file_outline or "
+        "read_doctype_schema again unless an edit actually fails. Make the planned "
+        "changes NOW: call replace_lines, insert_lines, edit_file or write_file to "
+        "apply real edits, then validate_code on each changed .py/.js file. Your "
+        "next message MUST include an edit tool call."
+    )
 
     def build_messages():
         msgs = [system_msg, task_msg]
@@ -411,6 +447,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         for r in rounds:
             msgs.append(r["ai"])
             msgs.extend(r["tools"])
+        msgs.extend(injected)
         return msgs
 
     def estimate_chars():
@@ -455,9 +492,18 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             )
 
         if not getattr(response, "tool_calls", None):
+            # Model wants to finish. In the implement phase, don't let it stop
+            # without ever editing a file — push it to actually write.
+            if require_writes and not wrote_anything and write_nudges < MAX_WRITE_NUDGES:
+                write_nudges += 1
+                injected.append(HumanMessage(content=NUDGE_TEXT))
+                _publish_agent_log(request_name, "write_nudge",
+                    round=round_num + 1, attempt=write_nudges, trigger="no_tool_calls")
+                continue
             return response_text, edited_paths, total_tokens
 
         round_entry = {"ai": response, "tools": [], "summary": []}
+        round_had_write = False
         for tc in response.tool_calls:
             _publish_agent_log(request_name, "tool_call",
                 tool_name=tc["name"],
@@ -482,6 +528,8 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
 
             if tc["name"] in WRITE_TOOLS:
                 if not result.startswith("Tool error:") and not result.startswith("Error:"):
+                    round_had_write = True
+                    wrote_anything = True
                     path_arg = tc.get("args", {}).get("path", "")
                     if path_arg and path_arg not in edited_paths:
                         edited_paths.append(path_arg)
@@ -501,6 +549,21 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             )
 
         rounds.append(round_entry)
+
+        # Proactively break analysis-paralysis: if the model keeps only reading
+        # in the implement phase, tell it to start editing.
+        if round_had_write:
+            read_only_streak = 0
+        else:
+            read_only_streak += 1
+        if (require_writes and not wrote_anything
+                and read_only_streak >= READ_STREAK_LIMIT
+                and write_nudges < MAX_WRITE_NUDGES):
+            write_nudges += 1
+            read_only_streak = 0
+            injected.append(HumanMessage(content=NUDGE_TEXT))
+            _publish_agent_log(request_name, "write_nudge",
+                round=round_num + 1, attempt=write_nudges, trigger="read_streak")
 
     maybe_trim()
     final = llm.invoke(build_messages())
@@ -529,6 +592,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             max_rounds=max_rounds,
             state=state,
             provider=provider,
+            require_writes=not read_only_tools,
         )
         content = _message_content_to_str(content)
         max_output = MAX_PHASE_OUTPUT_CHARS
@@ -670,11 +734,14 @@ def plan_node(state: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def implement_node(state: dict) -> dict:
-    """Apply the approved plan by editing and creating files with write tools."""
+    """Apply the approved plan by editing and creating files with write tools.
+
+    Runs a single implementation pass, then a local syntax check on the edited
+    .py/.js files so broken code never reaches bench. There is no LLM review loop.
+    """
     if state.get("error"):
         return {"error": state["error"]}
-    attempt = (state.get("review_attempts") or 0) + 1
-    logs = _log_stage(state, "Implementing", "started", f"Applying code changes (attempt {attempt})")
+    logs = _log_stage(state, "Implementing", "started", "Applying code changes")
 
     app_name = state.get("target_app_name", "")
     plan_text = _message_content_to_str(state.get("plan", ""))
@@ -695,16 +762,6 @@ def implement_node(state: dict) -> dict:
         request_name=state.get("request_name"),
     )
 
-    review_notes = state.get("review_notes", "")
-    if attempt > 1 and review_notes:
-        base_prompt += f"""
-
-## PREVIOUS REVIEW FEEDBACK — FIX THESE ISSUES
-The previous implementation attempt was reviewed and FAILED. Here is what the reviewer found wrong:
-{review_notes}
-
-You MUST fix ALL of these issues in this attempt. Read the affected files first to see the current state."""
-
     updates = _run_agent_turn(state, "Implementing", base_prompt, read_only_tools=False, max_rounds=MAX_TOOL_ROUNDS_EXECUTION)
     if updates.get("error"):
         logs = _log_stage({**state, "stage_log": logs}, "Implementing", "failed", updates["error"][:200])
@@ -713,72 +770,88 @@ You MUST fix ALL of these issues in this attempt. Read the affected files first 
 
     tool_edited = updates.pop("_tool_edited_paths", [])
     steps = updates.get("intermediate_steps") or []
-    last_out = steps[-1].get("output", "") if steps else ""
-    text_paths = _extract_file_paths(last_out)
+    last_out = _message_content_to_str(steps[-1].get("output", "") if steps else "")
+    # Only keep summary-mentioned paths that actually exist on disk — the model
+    # often names files it merely considered, which would otherwise be recorded
+    # as phantom edits and break validation ("Not a file").
+    text_paths = [p for p in _extract_file_paths(last_out) if _app_file_exists(app_name, p)]
 
     all_paths = list(dict.fromkeys(tool_edited + text_paths))
 
     edits = list(state.get("edits_made") or [])
     for p in all_paths:
         if not any(e.get("path") == p for e in edits):
-            edits.append({"path": p, "summary": f"Modified in attempt {attempt}"})
+            edits.append({"path": p, "summary": "Modified"})
     if not all_paths:
         edits.append({"summary": last_out[:300]})
     updates["edits_made"] = edits
+    updates["change_summary"] = _extract_change_summary(last_out)
+
+    logs = _log_stage(
+        {**state, "stage_log": logs}, "Implementing", "progress",
+        f"Files edited: {', '.join(all_paths[:8]) if all_paths else 'see summary'}"
+    )
+
+    # Local syntax gate. If real syntax errors exist, try to auto-fix them by
+    # feeding the exact errors back to the model, then re-check — instead of
+    # failing the whole run on the first broken edit.
+    syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
+    fix_state = {
+        **state,
+        "tokens_used": updates.get("tokens_used", state.get("tokens_used", 0)),
+        "intermediate_steps": updates.get("intermediate_steps") or [],
+        "stage_log": logs,
+    }
+    attempt = 0
+    while not syntax_ok and attempt < MAX_SYNTAX_FIX_ATTEMPTS:
+        attempt += 1
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Implementing", "progress",
+            f"Auto-fixing syntax errors (attempt {attempt})"
+        )
+        fix_state["stage_log"] = logs
+        fix_prompt = (
+            "One or more files you just edited have SYNTAX ERRORS. Fix ONLY these "
+            "errors now. For each affected file: read it to see the current state, "
+            "correct the syntax with replace_lines/insert_lines/edit_file, then call "
+            "validate_code on it to confirm it passes. Do NOT change unrelated code "
+            "and do NOT create any new files.\n\n"
+            f"## SYNTAX ERRORS TO FIX\n{syntax_report}"
+        )
+        fix_updates = _run_agent_turn(
+            fix_state, "Implementing", fix_prompt,
+            read_only_tools=False, max_rounds=MAX_TOOL_ROUNDS_SYNTAX_FIX,
+        )
+        # Carry forward token/step accounting whatever the outcome.
+        fix_state["tokens_used"] = fix_updates.get("tokens_used", fix_state["tokens_used"])
+        fix_state["intermediate_steps"] = fix_updates.get("intermediate_steps") or fix_state["intermediate_steps"]
+        updates["tokens_used"] = fix_state["tokens_used"]
+        updates["intermediate_steps"] = fix_state["intermediate_steps"]
+        if fix_updates.get("error"):
+            break
+        for p in fix_updates.pop("_tool_edited_paths", []):
+            if not any(e.get("path") == p for e in edits):
+                edits.append({"path": p, "summary": "Modified (syntax fix)"})
+        updates["edits_made"] = edits
+        syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
+
+    if not syntax_ok:
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Implementing", "failed",
+            f"Syntax check failed: {syntax_report[:150]}"
+        )
+        updates["error"] = (
+            "Implementation produced invalid syntax that could not be auto-fixed:\n"
+            f"{syntax_report[:1000]}"
+        )
+        updates["stage_log"] = logs
+        return updates
 
     logs = _log_stage(
         {**state, "stage_log": logs}, "Implementing", "completed",
-        f"Files edited: {', '.join(all_paths[:8]) if all_paths else 'see summary'}"
+        "Changes applied and syntax validated"
+        + (f" (auto-fixed on attempt {attempt})" if attempt else "")
     )
-    updates["stage_log"] = logs
-    return updates
-
-
-def review_node(state: dict) -> dict:
-    """Validate the edits (syntax first, then a scoped LLM review) and set the verdict."""
-    if state.get("error"):
-        return {"error": state["error"]}
-    logs = _log_stage(state, "Reviewing", "started", "Testing implemented changes")
-    edits = state.get("edits_made", [])
-    app_name = state.get("target_app_name", "")
-
-    syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
-    if not syntax_ok:
-        updates = {
-            "review_passed": False,
-            "review_notes": syntax_report[:500],
-            "review_attempts": (state.get("review_attempts") or 0) + 1,
-        }
-        logs = _log_stage(
-            {**state, "stage_log": logs}, "Reviewing", "completed",
-            f"Testing FAILED (syntax): {syntax_report[:100]}"
-        )
-        updates["stage_log"] = logs
-        return updates
-
-    prompt = get_review_prompt(edits, state.get("user_message", ""), request_name=state.get("request_name"))
-    if syntax_report:
-        prompt += (
-            "\n\n## SYNTAX PRE-CHECK (already validated locally)\n"
-            f"{syntax_report}\n"
-            "Do not call validate_code unless you need to re-check after reasoning. "
-            "Focus on request scope, wiring, and regressions, then give REVIEW_PASSED=yes/no."
-        )
-    updates = _run_agent_turn(state, "Reviewing", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_REVIEW)
-    if updates.get("error"):
-        logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "failed", updates["error"][:200])
-        updates["stage_log"] = logs
-        return updates
-
-    steps = updates.get("intermediate_steps") or []
-    last_out = _message_content_to_str(steps[-1].get("output", "") if steps else "")
-
-    passed, notes = _parse_review_verdict(last_out)
-    updates["review_passed"] = passed
-    updates["review_notes"] = notes[:500]
-    updates["review_attempts"] = (state.get("review_attempts") or 0) + 1
-    result_msg = "Testing PASSED" if passed else f"Testing FAILED: {notes[:100]}"
-    logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "completed", result_msg)
     updates["stage_log"] = logs
     return updates
 
@@ -806,20 +879,6 @@ def _get_bench_env() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Conditional edge
-# ---------------------------------------------------------------------------
-
-def should_retry_implement(state: dict) -> str:
-    if state.get("error"):
-        return "done"
-    if state.get("review_passed"):
-        return "done"
-    if (state.get("review_attempts") or 0) >= 3:
-        return "done"
-    return "implement"
-
-
-# ---------------------------------------------------------------------------
 # Graph builders
 # ---------------------------------------------------------------------------
 
@@ -842,17 +901,12 @@ def build_planning_graph():
 def build_execution_graph():
     """
     Constructs the state machine for the Implementation Phase.
-    Flow: Implement Changes → Review Work → (Retry if needed).
+    Flow: Implement Changes (with a local syntax gate) → END.
     """
     workflow = StateGraph(AgentState)
     workflow.add_node("implement", implement_node)
-    workflow.add_node("review", review_node)
 
     workflow.set_entry_point("implement")
-    workflow.add_edge("implement", "review")
-    workflow.add_conditional_edges("review", should_retry_implement, {
-        "implement": "implement",
-        "done": END,
-    })
+    workflow.add_edge("implement", END)
 
     return workflow.compile()
