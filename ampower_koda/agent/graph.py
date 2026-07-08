@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# LangGraph workflows: Planning (Understand -> Plan) and Execution (Implement).
-# A local syntax check gates the implement pass; bench and deploy run in executor.py.
+# LangGraph workflows: Planning (Understand -> Plan) and Execution (Implement -> Review).
+# A local syntax check gates the implement pass; review validates clean code/Frappe
+# standards before bench and deploy run in executor.py.
 
 import os
 import re as _re
@@ -20,13 +21,17 @@ from ampower_koda.agent.prompts import (
     get_understand_prompt,
     get_plan_prompt,
     get_implement_prompt,
+    get_follow_up_implement_prompt,
+    get_review_prompt,
 )
 
 
 MAX_TOOL_ROUNDS_PLANNING = 40
 MAX_TOOL_ROUNDS_EXECUTION = 30
+MAX_TOOL_ROUNDS_REVIEW = 6        # keep review short to limit token usage
 MAX_TOOL_ROUNDS_SYNTAX_FIX = 12   # rounds for a focused "fix the syntax errors" pass
 MAX_SYNTAX_FIX_ATTEMPTS = 2       # how many times to re-invoke to fix remaining syntax errors
+MAX_REVIEW_ATTEMPTS = 2           # implement + review retries before failing
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
 
 # Per-phase output stored in conversation_log. High so full phase text is retained
@@ -74,6 +79,21 @@ def _message_content_to_str(content) -> str:
 def _llm_response_text(response) -> str:
     """Extract plain text from a LangChain chat model response."""
     return _message_content_to_str(getattr(response, "content", ""))
+
+
+def _parse_review_verdict(text: str) -> tuple[bool, str]:
+    """Parse explicit review verdict without extra LLM calls."""
+    notes = (text or "").strip()
+    upper = notes.upper()
+    if _re.search(r"REVIEW_PASSED\s*[=:]\s*YES\b", upper):
+        return True, notes
+    if _re.search(r"REVIEW_PASSED\s*[=:]\s*NO\b", upper):
+        return False, notes
+    if "REVIEW_PASSED=YES" in upper or "REVIEW PASSED: YES" in upper:
+        return True, notes
+    if "REVIEW_PASSED=NO" in upper or "REVIEW PASSED: NO" in upper:
+        return False, notes
+    return False, notes or "Review verdict missing explicit REVIEW_PASSED=yes/no."
 
 
 def _syntax_check_edits(app_name: str, edits: list[dict]) -> tuple[bool, str]:
@@ -736,31 +756,67 @@ def plan_node(state: dict) -> dict:
 def implement_node(state: dict) -> dict:
     """Apply the approved plan by editing and creating files with write tools.
 
-    Runs a single implementation pass, then a local syntax check on the edited
-    .py/.js files so broken code never reaches bench. There is no LLM review loop.
+    Runs an implementation pass, then a local syntax check on the edited
+    .py/.js files so broken code never reaches bench. A review stage can
+    send corrections back into a follow-up implement pass.
     """
     if state.get("error"):
         return {"error": state["error"]}
-    logs = _log_stage(state, "Implementing", "started", "Applying code changes")
+    is_follow_up = bool(state.get("is_follow_up"))
+    attempt = (state.get("review_attempts") or 0) + 1
+    logs = _log_stage(
+        state, "Implementing", "started",
+        "Applying follow-up patch" if is_follow_up else f"Applying code changes (attempt {attempt})"
+    )
 
     app_name = state.get("target_app_name", "")
     plan_text = _message_content_to_str(state.get("plan", ""))
     understanding_text = _message_content_to_str(state.get("understanding_summary", ""))
-    all_text = plan_text + "\n" + understanding_text
-    file_paths = _extract_file_paths(all_text)
-    file_contents = _pre_read_files(app_name, file_paths)
-    logs = _log_stage(
-        {**state, "stage_log": logs}, "Implementing", "progress",
-        f"Pre-loaded {len(file_paths)} files: {', '.join(file_paths[:5])}"
-    )
 
-    base_prompt = get_implement_prompt(
-        plan_text,
-        understanding_text,
-        state.get("user_message", ""),
-        file_contents,
-        request_name=state.get("request_name"),
-    )
+    if is_follow_up:
+        follow_up_message = _message_content_to_str(state.get("follow_up_message", ""))
+        prior_paths = list(state.get("prior_changed_paths") or [])
+        implementation_memory = _message_content_to_str(state.get("implementation_memory", ""))
+        context_paths = list(dict.fromkeys(prior_paths + _extract_file_paths(follow_up_message)))
+        file_contents = _pre_read_files(app_name, context_paths)
+        prior_files = "\n".join(f"- {p}" for p in context_paths) if context_paths else "- (none recorded)"
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Implementing", "progress",
+            f"Follow-up context: {len(context_paths)} files loaded"
+        )
+        base_prompt = get_follow_up_implement_prompt(
+            follow_up_message,
+            plan_text,
+            implementation_memory,
+            prior_files,
+            file_contents,
+            request_name=state.get("request_name"),
+        )
+    else:
+        all_text = plan_text + "\n" + understanding_text
+        file_paths = _extract_file_paths(all_text)
+        file_contents = _pre_read_files(app_name, file_paths)
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Implementing", "progress",
+            f"Pre-loaded {len(file_paths)} files: {', '.join(file_paths[:5])}"
+        )
+        base_prompt = get_implement_prompt(
+            plan_text,
+            understanding_text,
+            state.get("user_message", ""),
+            file_contents,
+            request_name=state.get("request_name"),
+        )
+        review_notes = (state.get("review_notes") or "").strip()
+        if attempt > 1 and review_notes:
+            base_prompt += f"""
+
+## PRIOR REVIEW FINDINGS — FIX THESE NOW
+The last test stage failed. Fix every issue listed below before doing anything else.
+Focus on the exact files and problems described; do not add new features.
+
+{review_notes}
+"""
 
     updates = _run_agent_turn(state, "Implementing", base_prompt, read_only_tools=False, max_rounds=MAX_TOOL_ROUNDS_EXECUTION)
     if updates.get("error"):
@@ -856,6 +912,60 @@ def implement_node(state: dict) -> dict:
     return updates
 
 
+def review_node(state: dict) -> dict:
+    """Test the implementation for clean code and Frappe standards."""
+    if state.get("error"):
+        return {"error": state["error"]}
+    logs = _log_stage(state, "Reviewing", "started", "Testing implementation quality")
+    edits = state.get("edits_made", [])
+    app_name = state.get("target_app_name", "")
+
+    syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
+    attempt = (state.get("review_attempts") or 0) + 1
+    if not syntax_ok:
+        updates = {
+            "review_passed": False,
+            "review_notes": syntax_report[:1000],
+            "review_attempts": attempt,
+        }
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Reviewing", "completed",
+            f"Testing FAILED (syntax): {syntax_report[:120]}"
+        )
+        if attempt >= MAX_REVIEW_ATTEMPTS:
+            updates["error"] = f"Syntax errors remain after {attempt} test attempt(s)."
+        updates["stage_log"] = logs
+        return updates
+
+    prompt = get_review_prompt(edits, state.get("user_message", ""), request_name=state.get("request_name"))
+    if syntax_report:
+        short_report = "\n".join(syntax_report.splitlines()[:6])
+        prompt += (
+            "\n\n## LOCAL SYNTAX PRE-CHECK (already passed)\n"
+            f"{short_report}\n"
+            "Do not re-run validate_code unless you need to re-check after reasoning."
+        )
+    updates = _run_agent_turn(state, "Reviewing", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_REVIEW)
+    if updates.get("error"):
+        logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "failed", updates["error"][:200])
+        updates["stage_log"] = logs
+        return updates
+
+    steps = updates.get("intermediate_steps") or []
+    last_out = _message_content_to_str(steps[-1].get("output", "") if steps else "")
+    passed, notes = _parse_review_verdict(last_out)
+    updates["review_passed"] = passed
+    updates["review_notes"] = notes[:1200]
+    updates["review_attempts"] = attempt
+
+    result_msg = "Testing PASSED" if passed else f"Testing FAILED: {notes[:100]}"
+    logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "completed", result_msg)
+    if not passed and attempt >= MAX_REVIEW_ATTEMPTS:
+        updates["error"] = f"Review failed after {attempt} attempt(s)."
+    updates["stage_log"] = logs
+    return updates
+
+
 def _get_bench_env() -> dict:
     """Build a subprocess environment with the correct Node.js on PATH.
     nvm installs Node under ~/.nvm/versions/node/<version>/bin but background
@@ -876,6 +986,20 @@ def _get_bench_env() -> dict:
                 env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
                 break
     return env
+
+
+# ---------------------------------------------------------------------------
+# Conditional edge
+# ---------------------------------------------------------------------------
+
+def should_retry_implement(state: dict) -> str:
+    if state.get("error"):
+        return "done"
+    if state.get("review_passed"):
+        return "done"
+    if (state.get("review_attempts") or 0) >= MAX_REVIEW_ATTEMPTS:
+        return "done"
+    return "implement"
 
 
 # ---------------------------------------------------------------------------
@@ -901,12 +1025,17 @@ def build_planning_graph():
 def build_execution_graph():
     """
     Constructs the state machine for the Implementation Phase.
-    Flow: Implement Changes (with a local syntax gate) → END.
+    Flow: Implement Changes → Review/Testing → (Retry if needed).
     """
     workflow = StateGraph(AgentState)
     workflow.add_node("implement", implement_node)
+    workflow.add_node("review", review_node)
 
     workflow.set_entry_point("implement")
-    workflow.add_edge("implement", END)
+    workflow.add_edge("implement", "review")
+    workflow.add_conditional_edges("review", should_retry_implement, {
+        "implement": "implement",
+        "done": END,
+    })
 
     return workflow.compile()

@@ -41,6 +41,17 @@ class AgentState(TypedDict, total=False):
     edits_made: list  # [{path, summary}, ...]
     change_summary: str  # plain-English summary of what the implement phase changed
 
+    # Follow-up patch mode
+    is_follow_up: bool
+    follow_up_message: str
+    prior_changed_paths: list
+    implementation_memory: str
+
+    # Review/Test phase
+    review_passed: bool
+    review_notes: str
+    review_attempts: int
+
     # Pending approvals
     pending_bench_commands: str # JSON-encoded list[str] — always parse with json.loads before use
 

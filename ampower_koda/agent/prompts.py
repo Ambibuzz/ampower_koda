@@ -11,6 +11,8 @@ PROMPT_LABEL_MAP = {
     "understand_prompt": "Understand Prompt",
     "plan_prompt": "Plan Prompt",
     "implement_prompt": "Implement Prompt",
+    "review_prompt": "Review Prompt",
+    "follow_up_prompt": "Follow-up Prompt",
 }
 
 class SafeDict(dict):
@@ -475,4 +477,100 @@ you changed and why. Do not include code in the summary.
         "file_contents": file_contents
     }
 
+    return render_prompt_safe(template, context, default)
+
+
+def get_follow_up_implement_prompt(
+    follow_up_message: str,
+    original_plan: str,
+    implementation_memory: str,
+    prior_files: str,
+    file_contents: str,
+    request_name: str = None,
+) -> str:
+    """Patch-only prompt for follow-up runs — fix the bug, don't re-implement."""
+    default = """## FOLLOW-UP BUG FIX (PATCH MODE — NOT A RE-IMPLEMENTATION)
+
+The user tested the previous implementation and reported a specific issue below.
+Your job is to **fix only that issue** with minimal, surgical edits.
+
+### USER FOLLOW-UP ISSUE
+{follow_up_message}
+
+### ORIGINAL APPROVED PLAN (for context only — do NOT re-execute from scratch)
+{original_plan}
+
+### WHAT WAS ALREADY BUILT (memory from the last run)
+{implementation_memory}
+
+### FILES CHANGED IN THE PREVIOUS RUN
+{prior_files}
+
+### CURRENT FILE CONTENTS (pre-loaded)
+{file_contents}
+
+## PATCH RULES (CRITICAL)
+1. **Fix the follow-up issue only** — do not rebuild features that already work.
+2. **Do NOT re-implement the full plan** — read the pre-loaded files and patch what is broken.
+3. **Minimal diff** — change only the lines needed; no drive-by refactors.
+4. **Read → edit → validate** — read_file first, then replace_lines/insert_lines/edit_file.
+5. Run validate_code on every changed .py/.js file.
+6. Do NOT create README, notes, .txt markers, or scratch files.
+7. If the bug is in a file not pre-loaded, read that file first — do not guess.
+
+### FINAL STEP
+End with `SUMMARY OF CHANGES:` — 2–5 sentences on what you fixed for this follow-up only.
+"""
+    template = get_config_prompt("follow_up_prompt", default, request_name)
+    context = {
+        "follow_up_message": follow_up_message,
+        "original_plan": original_plan,
+        "implementation_memory": implementation_memory or "(no prior implementation summary recorded)",
+        "prior_files": prior_files,
+        "file_contents": file_contents,
+    }
+    return render_prompt_safe(template, context, default)
+
+
+def get_review_prompt(edits_made: list[dict], user_message: str, request_name: str = None) -> str:
+    """Prompt for the test stage focused on clean code + Frappe standards."""
+    paths = [e.get("path", "") for e in edits_made if e.get("path")]
+    paths_list = "\n".join(f"- {p}" for p in paths) if paths else "(no specific paths recorded)"
+
+    default = """## USER REQUEST
+{user_message_short}
+
+## FILES MODIFIED
+{paths_list}
+
+You are in the TEST STAGE. Validate that the implementation is correct, clean, and
+meets Frappe standards. Keep this review brief and focused.
+
+### Scope & efficiency rules (keep tokens low)
+- ONLY inspect the files listed above.
+- Prefer `read_file(path, start_line, end_line)` with targeted line ranges.
+- Call `validate_code(path)` for each modified .py/.js file.
+- Do NOT explore unrelated files or modules.
+- Limit your output to at most 5 issues.
+
+### Clean code & Frappe standards checklist
+1. **No hallucinations** — fieldnames, methods, DocTypes, and routes match real files.
+2. **Server/client wiring** — frappe.call ↔ @frappe.whitelist() paths match.
+3. **Frappe patterns** — use frappe.db/orm methods; avoid raw SQL unless necessary.
+4. **No debug artifacts** — no print/console.log, no leftover TODOs, no scratch files.
+5. **DocType consistency** — JSON/py/js changes agree on fieldnames & behavior.
+6. **Style** — consistent naming, no dead code, no unused imports.
+
+### Verdict format (REQUIRED)
+- All good: `REVIEW_PASSED=yes`
+- Issues found: `REVIEW_PASSED=no` then list each issue:
+  - File: path — Issue: ... — Fix: ...
+
+After reading the files, output the verdict immediately.
+"""
+    template = get_config_prompt("review_prompt", default, request_name)
+    context = {
+        "user_message_short": user_message[:800] if user_message else "",
+        "paths_list": paths_list,
+    }
     return render_prompt_safe(template, context, default)

@@ -45,6 +45,9 @@
   "pending_bench_commands",
   "conversation_log",
   "understanding_snapshot",
+  "implementation_snapshot",
+  "follow_up_message",
+  "follow_up_count",
   "files_changed",
   "tokens_used",
   "cost_estimate",
@@ -306,6 +309,28 @@
    "fieldtype": "Long Text",
    "hidden": 1,
    "label": "Understanding Snapshot",
+   "read_only": 1
+  },
+  {
+   "description": "What the last implementation run built — used as memory for follow-up patches.",
+   "fieldname": "implementation_snapshot",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Implementation Snapshot",
+   "read_only": 1
+  },
+  {
+   "fieldname": "follow_up_message",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Follow-up Message",
+   "read_only": 1
+  },
+  {
+   "fieldname": "follow_up_count",
+   "fieldtype": "Int",
+   "hidden": 1,
+   "label": "Follow-up Count",
    "read_only": 1
   },
   {

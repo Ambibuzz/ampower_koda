@@ -41,7 +41,7 @@ var REQUEST_TYPE_HELP = {
 
 var STATUS_FLOW = [
     'Queued', 'Understanding', 'Planning', 'Awaiting Approval',
-    'Implementing', 'Awaiting Bench Approval', 'Building',
+    'Implementing', 'Reviewing', 'Awaiting Bench Approval', 'Building',
     'Awaiting Push Approval', 'Pushing', 'Completed'
 ];
 
@@ -51,7 +51,6 @@ var STATUS_META = {
     'Planning': { color: 'blue', label: 'Creating Plan' },
     'Awaiting Approval': { color: 'orange', label: 'Review Plan' },
     'Implementing': { color: 'yellow', label: 'Implementing Changes' },
-    // 'Reviewing' is legacy — no longer produced, kept so historical records still render.
     'Reviewing': { color: 'yellow', label: 'Testing Changes' },
     'Awaiting Bench Approval': { color: 'orange', label: 'Approve Bench Commands' },
     'Building': { color: 'purple', label: 'Running Bench Commands' },
@@ -124,6 +123,7 @@ function render_status_dashboard(frm) {
         { key: 'Planning', short: 'Plan' },
         { key: 'Awaiting Approval', short: 'Review' },
         { key: 'Implementing', short: 'Build' },
+        { key: 'Reviewing', short: 'Test' },
         { key: 'Awaiting Bench Approval', short: 'Bench' },
         { key: 'Awaiting Push Approval', short: 'Push' },
         { key: 'Completed', short: 'Done' }
@@ -576,7 +576,7 @@ function open_follow_up_dialog(frm) {
                 callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
-                            message: __('Follow-up submitted. Agent started targeted fix on same branch.'),
+                            message: __('Follow-up patch started on same branch (plan preserved).'),
                             indicator: 'blue'
                         });
                         dialog.hide();

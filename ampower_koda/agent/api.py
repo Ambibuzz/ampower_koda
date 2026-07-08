@@ -10,7 +10,7 @@ import frappe
 from frappe import _
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.executor import _generate_patch_diff, as_json_list
+from ampower_koda.agent.executor import _generate_patch_diff
 from ampower_koda.agent.git_ops import (
     branch_exists,
     checkout_base,
@@ -90,6 +90,9 @@ def start_agent(request_name: str):
         "conversation_log": "",
         "understanding_snapshot": "",
         "change_summary": "",
+        "follow_up_message": "",
+        "follow_up_count": 0,
+        "implementation_snapshot": "",
         # files_changed is a JSON column with a json_valid() CHECK constraint —
         # "" is not valid JSON, so clear it with NULL (allowed) instead.
         "files_changed": None,
@@ -125,59 +128,15 @@ def submit_follow_up(request_name: str, follow_up_message: str):
 
     _validate_provider_key(doc)
 
-    base_request = (doc.user_message or "").strip()
     follow_up = (follow_up_message or "").strip()
+    follow_up_count = int(doc.follow_up_count or 0) + 1
 
-    context_lines = []
-    if doc.status:
-        context_lines.append(f"- Previous status: {doc.status}")
-    if doc.branch_name:
-        context_lines.append(f"- Previous branch: {doc.branch_name}")
-    if doc.pr_url:
-        context_lines.append(f"- Previous PR: {doc.pr_url}")
-    if doc.error_log:
-        context_lines.append(f"- Previous error snapshot: {(doc.error_log or '')[:400]}")
-    context_text = "\n".join(context_lines) if context_lines else "- No additional run metadata recorded."
-
-    changed_paths = []
-    try:
-        for row in as_json_list(doc.files_changed):
-            p = (row or {}).get("path") if isinstance(row, dict) else None
-            if p:
-                changed_paths.append(p)
-    except Exception:
-        log_agent_error(
-            "Agent API: submit_follow_up files_changed",
-            f"request={request_name}\n{frappe.get_traceback()}",
-        )
-    changed_hint = "\n".join(f"- {p}" for p in changed_paths[:20]) if changed_paths else "- (not recorded)"
-
-    merged_message = (
-        f"{base_request}\n\n"
-        "## FOLLOW-UP ISSUE AFTER USER TESTING\n"
-        f"{follow_up}\n\n"
-        "## CONTEXT FROM PREVIOUS RUN\n"
-        f"{context_text}\n\n"
-        "### Instructions for follow-up\n"
-        "- Fix the follow-up issue precisely.\n"
-        "- Keep all previously working functionality intact.\n"
-        "- Prefer surgical changes over broad rewrites.\n"
-    )
-    focused_plan = (
-        "Follow-up fix plan (same branch, no re-explore):\n"
-        "1) Reproduce the exact follow-up issue from USER REQUEST.\n"
-        "2) Inspect only the files directly related to the issue first.\n"
-        "3) Apply minimal targeted edits.\n"
-        "4) Run validate_code on changed .py/.js and verify no regressions in touched flows.\n"
-        "5) Report precise files changed and why.\n\n"
-        "Likely affected files from previous run:\n"
-        f"{changed_hint}"
-    )
-
+    # Preserve the approved plan and original user_message. Follow-up context is
+    # stored separately and passed into the execution graph as a patch-only run.
     frappe.db.set_value(DOCTYPE_NAME, request_name, {
         "status": "Implementing",
-        "user_message": merged_message[:50000],
-        "agent_plan": focused_plan[:50000],
+        "follow_up_message": follow_up[:50000],
+        "follow_up_count": follow_up_count,
         "error_log": "",
         "bench_log": "",
         "patch_diff": "",
@@ -190,8 +149,9 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         timeout=1800,
         request_name=request_name,
         preserve_branch=1,
+        is_follow_up=1,
     )
-    return {"status": "ok", "message": _("Follow-up run started on existing branch (explore/plan skipped).")}
+    return {"status": "ok", "message": _("Follow-up patch started on existing branch (plan preserved).")}
 
 
 @frappe.whitelist()
