@@ -13,7 +13,7 @@
             "fieldtype": "Select",
             "in_list_view": 1,
             "label": "Prompt Type",
-            "options": "System Prompt\nUnderstand Prompt\nPlan Prompt\nImplement Prompt\nReview Prompt",
+            "options": "System Prompt\nUnderstand Prompt\nPlan Prompt\nImplement Prompt\nReview Prompt\nFollow-up Prompt",
             "reqd": 1,
             "description": "Each prompt type should be added only once."
         },
@@ -27,6 +27,6 @@
     ],
     "istable": 1,
     "module": "Ampower Koda",
-    "name": "AI Agent Prompt Configuration",
+    "name": "Agent Prompt Configuration",
     "owner": "Administrator"
 }

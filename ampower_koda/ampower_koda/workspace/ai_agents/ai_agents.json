@@ -1,6 +1,6 @@
 {
     "charts": [],
-    "content": "[{\"id\":\"shortcut-section\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"AI Agents Help\",\"col\":12}},{\"id\":\"shortcut-section-2\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"AI Agent Request\",\"col\":12}},{\"id\":\"shortcut-section-3\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"AI Agent Settings\",\"col\":12}}]",
+    "content": "[{\"id\":\"shortcut-section\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Koda Docs\",\"col\":12}},{\"id\":\"shortcut-section-2\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Agent Request\",\"col\":12}},{\"id\":\"shortcut-section-3\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Agent Settings\",\"col\":12}}]",
     "creation": "2026-03-05 12:00:00.000000",
     "custom_blocks": [],
     "docstatus": 0,
@@ -15,9 +15,9 @@
         {
             "hidden": 0,
             "is_query_report": 0,
-            "label": "AI Agents Help",
+            "label": "Koda Docs",
             "link_count": 0,
-            "link_to": "ai-agents-help",
+            "link_to": "koda-docs",
             "link_type": "Page",
             "onboard": 1,
             "type": "Link"
@@ -25,9 +25,9 @@
         {
             "hidden": 0,
             "is_query_report": 0,
-            "label": "AI Agent Request",
+            "label": "Agent Request",
             "link_count": 0,
-            "link_to": "AI Agent Request",
+            "link_to": "Agent Request",
             "link_type": "DocType",
             "onboard": 0,
             "type": "Link"
@@ -35,15 +35,15 @@
         {
             "hidden": 0,
             "is_query_report": 0,
-            "label": "Settings",
+            "label": "Agent Settings",
             "link_count": 0,
-            "link_to": "AI Agent Settings",
+            "link_to": "Agent Settings",
             "link_type": "DocType",
             "onboard": 0,
             "type": "Link"
         }
     ],
-    "modified": "2026-05-14 12:05:00.000000",
+    "modified": "2026-07-02 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "Ampower Koda",
     "name": "AI Agents",
@@ -58,24 +58,24 @@
         {
             "color": "Blue",
             "doc_view": "",
-            "label": "AI Agents Help",
-            "link_to": "ai-agents-help",
+            "label": "Koda Docs",
+            "link_to": "koda-docs",
             "stats_filter": "",
             "type": "Page"
         },
         {
             "color": "Grey",
             "doc_view": "List",
-            "label": "AI Agent Request",
-            "link_to": "AI Agent Request",
+            "label": "Agent Request",
+            "link_to": "Agent Request",
             "stats_filter": "",
             "type": "DocType"
         },
         {
             "color": "Grey",
             "doc_view": "",
-            "label": "AI Agent Settings",
-            "link_to": "AI Agent Settings",
+            "label": "Agent Settings",
+            "link_to": "Agent Settings",
             "stats_filter": "",
             "type": "DocType"
         }
