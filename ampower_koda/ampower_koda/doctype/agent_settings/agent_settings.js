@@ -1,12 +1,14 @@
 // Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-// AI Agent Settings — client script
+// Agent Settings — client script
 
 var PROVIDER_MODELS = {
     'OpenAI': [
         { value: 'gpt-4o-mini', label: 'GPT-4o Mini — fast, cost-effective' },
-        { value: 'gpt-4o', label: 'GPT-4o — best overall' },
         { value: 'gpt-5-mini', label: 'GPT-5 Mini — next-gen, efficient' },
-        { value: 'o3-mini', label: 'o3-mini — reasoning model' }
+        { value: 'gpt-5.1-codex-mini', label: 'GPT-5.1 Codex Mini — compact coding' },
+        { value: 'gpt-5-codex', label: 'GPT-5 Codex — coding model' },
+        { value: 'gpt-5.1-codex', label: 'GPT-5.1 Codex — coding model' },
+        { value: 'gpt-5.2-codex', label: 'GPT-5.2 Codex — latest coding model' }
     ],
     'Gemini': [
         { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash — fast, multimodal' },
@@ -25,7 +27,7 @@ var DEFAULT_MODELS = {
     'Claude': 'claude-sonnet-4-20250514'
 };
 
-frappe.ui.form.on('AI Agent Settings', {
+frappe.ui.form.on('Agent Settings', {
     refresh: function(frm) {
         set_model_options_for_provider(frm);
     },

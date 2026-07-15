@@ -8,6 +8,7 @@ AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improve
 - **Live Monitoring**: Track agent progress in real-time with an auto-scrolling log console and visual status dashboard.
 - **Human-in-the-loop**: Full control over every phase. Review and edit implementation plans and bench commands before they run.
 - **Smart Exploration**: Powered by LangGraph, the agent performs deep codebase analysis to minimize hallucinations.
+- **Koda IDE**: Browse the changed files, edit code in a built-in editor, view diffs, and save, deploy, or push changes without leaving Frappe.
 - **Git Native**: Automatically manages branches and creates clean Pull Requests on GitHub.
 - **Multi-Model Support**: Choose between OpenAI, Google Gemini, or Anthropic Claude.
 
@@ -36,7 +37,7 @@ Python dependencies :
 
 ## Setup
 
-1. Open AI Agent Settings from the search bar.
+1. Open Agent Settings from the search bar.
 2. Check Enable AI Agent.
 3. Enter your API key for the provider you want to use (OpenAI, Gemini, or Claude).
 4. Optionally set a default provider and model.
@@ -59,7 +60,7 @@ Each request goes through a multi-step pipeline with human approval gates. You c
 
 ## Creating a Request
 
-1. Go to AI Agent Request list (search for it or find it under the AI Agents module).
+1. Go to Agent Request list (search for it or find it under the AI Agents module).
 2. Click New.
 3. Fill in:
    - Title -- short summary of what you need.
@@ -74,7 +75,7 @@ Each request goes through a multi-step pipeline with human approval gates. You c
 5. Click Start Agent.
 
 ### Persistence
-The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in AI Agent Settings as the encrypted default).
+The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in Agent Settings as the encrypted default).
 
 ## Approval Steps
 
@@ -123,7 +124,7 @@ These fields (except the GitHub Token) are remembered across requests using user
 
 For advanced use cases, you can override the agent's default logic on a per-request basis:
 
-1. Open an **AI Agent Request**.
+1. Open an **Agent Request**.
 2. Go to the **Prompts** tab.
 3. Uncheck **Use Default Prompts**.
 4. In the **Custom Prompts** table, add one or more overrides:
@@ -134,6 +135,19 @@ For advanced use cases, you can override the agent's default logic on a per-requ
    - **Review Prompt**: Criteria for self-review and verification.
 
 If a prompt type is not explicitly added to the table, the agent will fall back to its internal system default for that phase.
+
+## Koda IDE
+
+Once a request has an agent branch or a generated diff, open the **Koda IDE** from the Actions dropdown on the Agent Request (**Open Koda IDE**). The IDE lets you:
+
+- Browse the changed files in a file explorer, with change badges (added / modified / deleted).
+- Edit any file in a full code editor with syntax highlighting and a light/dark theme toggle.
+- Switch between **Code** and **Diff** views to inspect exactly what changed.
+- **Save** edits directly to the agent branch on disk.
+- **Deploy** the selected bench commands (migrate, build, clear-cache, restart).
+- **Push** the branch and create a pull request on GitHub.
+
+Open tabs can be closed via the close (×) control that appears on hover.
 
 ## Data Security
 
@@ -147,7 +161,7 @@ Please note that we use LLMs, and the data (repositories) will be processed by a
 
 ## In-App Help
 
-For more detailed guidance and tips, search for **AI Agents Help** in your Frappe search bar.
+For more detailed guidance and tips, search for **Koda Docs** in your Frappe search bar.
 
 ## License
 

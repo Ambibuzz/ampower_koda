@@ -1,19 +1,19 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# LangGraph workflows: Planning (Understand→Plan) and Execution (Implement→Review→Bench→Deploy)
+# LangGraph workflows: Planning (Understand -> Plan) and Execution (Implement -> Review).
+# A local syntax check gates the implement pass; review validates clean code/Frappe
+# standards before bench and deploy run in executor.py.
 
-import json
 import os
 import re as _re
-import subprocess
 from datetime import datetime
-from functools import partial
 
 import frappe
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langchain_openai import ChatOpenAI
 
+from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.prompts import (
@@ -21,36 +21,120 @@ from ampower_koda.agent.prompts import (
     get_understand_prompt,
     get_plan_prompt,
     get_implement_prompt,
+    get_follow_up_implement_prompt,
     get_review_prompt,
-)
-from ampower_koda.agent.git_ops import (
-    create_branch,
-    commit_changes,
-    push_branch,
-    create_pull_request,
-    generate_branch_name,
-    run_git,
-    get_repo_root,
 )
 
 
 MAX_TOOL_ROUNDS_PLANNING = 40
 MAX_TOOL_ROUNDS_EXECUTION = 30
-MAX_TOOL_ROUNDS_REVIEW = 10
+MAX_TOOL_ROUNDS_REVIEW = 6        # keep review short to limit token usage
+MAX_TOOL_ROUNDS_SYNTAX_FIX = 12   # rounds for a focused "fix the syntax errors" pass
+MAX_SYNTAX_FIX_ATTEMPTS = 2       # how many times to re-invoke to fix remaining syntax errors
+MAX_REVIEW_ATTEMPTS = 2           # implement + review retries before failing
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
 
-DOCTYPE_NAME = "AI Agent Request"
+# Per-phase output stored in conversation_log. High so full phase text is retained
+# (phase outputs are LLM summaries and are naturally well under this in practice).
+MAX_PHASE_OUTPUT_CHARS = 60000
+
+# History trimming: keep recent tool rounds verbatim, compact older ones to text.
+# A "round" is one assistant tool-call message plus all of its tool results.
+KEEP_TOOL_ROUNDS = 8          # recent rounds retained in full
+MIN_KEEP_ROUNDS = 3           # never trim below this many, even under char pressure
+TRIM_CHAR_BUDGET = 100000     # approx history chars before char-based trimming kicks in
+COMPACT_RESULT_PREVIEW = 200  # chars of each tool result kept in the compact summary
+
+# Provider-native prompt caching for the stable system prefix (safe no-op when unsupported).
+ENABLE_PROMPT_CACHE = True
+
+DOCTYPE_NAME = "Agent Request"
+
+
+def _message_content_to_str(content) -> str:
+    """Normalize AIMessage content to plain text (Responses API returns list blocks)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif block.get("type") == "refusal" and block.get("refusal"):
+                    parts.append(str(block["refusal"]))
+            else:
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
+def _llm_response_text(response) -> str:
+    """Extract plain text from a LangChain chat model response."""
+    return _message_content_to_str(getattr(response, "content", ""))
+
+
+def _parse_review_verdict(text: str) -> tuple[bool, str]:
+    """Parse explicit review verdict without extra LLM calls."""
+    notes = (text or "").strip()
+    upper = notes.upper()
+    if _re.search(r"REVIEW_PASSED\s*[=:]\s*YES\b", upper):
+        return True, notes
+    if _re.search(r"REVIEW_PASSED\s*[=:]\s*NO\b", upper):
+        return False, notes
+    if "REVIEW_PASSED=YES" in upper or "REVIEW PASSED: YES" in upper:
+        return True, notes
+    if "REVIEW_PASSED=NO" in upper or "REVIEW PASSED: NO" in upper:
+        return False, notes
+    return False, notes or "Review verdict missing explicit REVIEW_PASSED=yes/no."
+
+
+def _syntax_check_edits(app_name: str, edits: list[dict]) -> tuple[bool, str]:
+    """Validate edited .py/.js locally so broken syntax never reaches bench."""
+    paths = [e.get("path", "") for e in (edits or []) if e.get("path")]
+    code_paths = [p for p in paths if p.endswith((".py", ".js"))]
+    if not code_paths:
+        return True, ""
+
+    failures = []
+    summary_lines = []
+    for path in code_paths:
+        result = agent_tools.validate_code(app_name, path)
+        # A path that doesn't resolve to a real file is not a syntax error — it's
+        # usually a phantom path parsed from the model's summary text. Skip it.
+        if "Not a file" in result:
+            continue
+        first_line = (result or "").split("\n", 1)[0][:240]
+        summary_lines.append(f"- {path}: {first_line}")
+        # Only genuine syntax problems should block the run.
+        if "SYNTAX_ERROR" in result:
+            failures.append(result)
+
+    summary = "\n".join(summary_lines)
+    if failures:
+        return False, "\n\n".join(failures)
+    return True, summary
 
 
 # ---------------------------------------------------------------------------
 # LLM factory — supports OpenAI and Gemini
 # ---------------------------------------------------------------------------
 
+def _openai_uses_responses_api(model: str) -> bool:
+    """Codex and newer pro models require OpenAI's /v1/responses endpoint."""
+    name = (model or "").lower()
+    return "codex" in name or "gpt-5.2-pro" in name or name.startswith("gpt-5.4")
+
+
 def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
-    """
-    Factory function to initialize the appropriate Large Language Model (LLM) 
-    based on the user's preferred provider and model.
-    """
+    """Build the chat model for the given provider and model."""
     provider = (provider or "OpenAI").strip()
     model = (model or "gpt-4o-mini").strip()
     if provider == "Gemini":
@@ -60,8 +144,38 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(model=model, temperature=0)
     if provider not in ("OpenAI", "Gemini", "Claude"):
-        frappe.log_error(f"Unknown AI provider '{provider}', defaulting to OpenAI", "Agent LLM Warning")
-    return ChatOpenAI(model=model, temperature=0)
+        log_agent_error(
+            "Agent LLM Warning",
+            f"Unknown AI provider '{provider}', defaulting to OpenAI",
+        )
+    openai_kwargs = {"model": model, "temperature": 0}
+    if _openai_uses_responses_api(model):
+        openai_kwargs["use_responses_api"] = True
+    return ChatOpenAI(**openai_kwargs)
+
+
+def _build_system_message(provider: str, system_prompt: str) -> SystemMessage:
+    """Build the system message, adding provider-native prompt caching where supported.
+
+    Anthropic supports an explicit `cache_control` breakpoint on the system block,
+    which caches the large, stable instruction prefix (big cost saver on repeated
+    tool rounds). OpenAI caches stable prefixes automatically, so a plain system
+    message is enough there. Gemini/others fall back to a plain system message.
+    Caching only reduces cost; it never changes model output.
+    """
+    if ENABLE_PROMPT_CACHE and (provider or "").strip() == "Claude":
+        try:
+            return SystemMessage(content=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }])
+        except Exception:
+            log_agent_error(
+                "Agent Graph: anthropic cache system message",
+                frappe.get_traceback(),
+            )
+    return SystemMessage(content=system_prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +195,30 @@ def _extract_file_paths(text: str) -> list[str]:
         for m in _re.finditer(pat, text):
             paths.add(m.group(0))
     return sorted(paths)
+
+
+def _app_file_exists(app_name: str, rel_path: str) -> bool:
+    """True if rel_path resolves to a real file inside the app (best-effort)."""
+    try:
+        return os.path.isfile(agent_tools._resolve_path(app_name, rel_path))
+    except Exception:
+        return False
+
+
+def _extract_change_summary(text: str) -> str:
+    """Pull the plain-English 'SUMMARY OF CHANGES' the model writes at the end.
+
+    Falls back to the trailing prose of the final message if the explicit heading
+    is missing, so the request always shows a readable summary.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    m = _re.search(r"(?is)summary of changes\s*:?\s*(.+)$", text)
+    summary = (m.group(1) if m else text).strip()
+    # Drop leftover markdown fences / list bullets noise but keep readable text.
+    summary = summary.strip("`").strip()
+    return summary[:4000]
 
 
 def _pre_read_files(app_name: str, paths: list[str], max_files: int = 25) -> str:
@@ -140,7 +278,10 @@ def _log_stage(state: dict, stage: str, status: str, summary: str) -> list:
                 "message": summary[:200],
             }, user=user)
         except Exception:
-            pass
+            log_agent_error(
+                "Agent Graph: stage log persist",
+                f"request={request_name}\nstage={stage}\n{frappe.get_traceback()}",
+            )
 
     return logs
 
@@ -159,12 +300,24 @@ def _publish_agent_log(request_name: str, log_type: str, **kwargs):
         }
         frappe.publish_realtime("agent_log", payload, user=user)
     except Exception:
-        pass
+        log_agent_error(
+            "Agent Graph: publish agent_log",
+            f"request={request_name}\ntype={log_type}\n{frappe.get_traceback()}",
+        )
 
+def _persist_token_usage(request_name: str, total_tokens: int):
+    """Write the running token total to the request so the form shows live usage."""
+    if not request_name:
+        return
+    try:
+        frappe.db.set_value(DOCTYPE_NAME, request_name, "tokens_used", int(total_tokens or 0))
+        frappe.db.commit()
+    except Exception:
+        log_agent_error(
+            "Agent Graph: persist token usage",
+            f"request={request_name}\n{frappe.get_traceback()}",
+        )
 
-# ---------------------------------------------------------------------------
-# Tool builders — closure over app_name
-# ---------------------------------------------------------------------------
 
 def _make_tools(app_name: str, read_only: bool = False):
     """Build LangChain tools bound to a specific app_name."""
@@ -246,40 +399,112 @@ def _make_tools(app_name: str, read_only: bool = False):
 # Tool-calling loop with detailed realtime logging
 # ---------------------------------------------------------------------------
 
-def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_rounds: int = 20,state: dict = None) -> tuple[str, list[str], int]:
+def _compact_round_summary(round_entry: dict) -> list[str]:
+    """One short line per tool call in a round, for the compacted-history block."""
+    return round_entry.get("summary", [])
+
+
+def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
+                           request_name: str = "", max_rounds: int = 20,
+                           state: dict = None, provider: str = "OpenAI",
+                           require_writes: bool = False) -> tuple[str, list[str], int]:
     """
     Run a tool-calling loop, publishing every tool call and LLM response via realtime.
     Returns (final_text, list_of_edited_file_paths, total_tokens_used).
 
-    On each round the LLM is invoked with the full message history. If the LLM
-    returns no tool calls, the loop exits early and returns that response as the
-    final text.
+    Context control (token savings without quality loss):
+      - The stable system prompt is a separate, cache-friendly message.
+      - Older tool rounds are compacted to a short text summary while the most
+        recent rounds are kept verbatim, so the model keeps working context but
+        we stop re-sending large, already-consumed tool outputs every round.
 
-    If max_rounds is reached without the LLM stopping, one final llm.invoke()
-    is fired WITHOUT tools bound — this forces a plain text conclusion rather
-    than an infinite loop. Edited paths and token counts collected up to that
-    point are still returned.
+    A "round" is one assistant tool-call message plus all of its tool results;
+    rounds are trimmed atomically so no tool_call_id is ever left dangling.
+
+    When require_writes is set (implementation phase), the loop nudges the model
+    to stop exploring and actually edit files if it reads for too many rounds
+    without writing, or tries to finish without having made any edit. This
+    prevents the "read forever, never write" failure that yields no file changes.
+
+    If max_rounds is reached without the LLM stopping, one final llm.invoke() is
+    fired WITHOUT tools bound to force a plain-text conclusion.
     """
     tool_map = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
-    messages = [HumanMessage(content=prompt)]
-    edited_paths = []
-    total_tokens = (state or {}).get("tokens_used", 0) # carry forward from prior phases
 
-    for round_num in range(max_rounds):
-        response = llm_with_tools.invoke(messages)
-        messages.append(response)
+    system_msg = _build_system_message(provider, system_prompt)
+    task_msg = HumanMessage(content=task_prompt)
 
+    rounds: list[dict] = []      # each: {"ai": AIMessage, "tools": [ToolMessage], "summary": [str]}
+    compacted: list[str] = []    # summary lines for dropped (older) rounds
+    injected: list = []          # directive nudges appended after the latest round
+    edited_paths: list[str] = []
+    total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
+
+    wrote_anything = False
+    read_only_streak = 0
+    write_nudges = 0
+    MAX_WRITE_NUDGES = 3
+    READ_STREAK_LIMIT = 5
+    NUDGE_TEXT = (
+        "STOP exploring. You have read enough — the files you need are already "
+        "in context (pre-loaded in the instructions and/or from the reads above). "
+        "Do NOT call read_file, search_code, list_directory, get_file_outline or "
+        "read_doctype_schema again unless an edit actually fails. Make the planned "
+        "changes NOW: call replace_lines, insert_lines, edit_file or write_file to "
+        "apply real edits, then validate_code on each changed .py/.js file. Your "
+        "next message MUST include an edit tool call."
+    )
+
+    def build_messages():
+        msgs = [system_msg, task_msg]
+        if compacted:
+            msgs.append(HumanMessage(content=(
+                "## Earlier tool activity (older rounds, summarized to save context)\n"
+                "These tools already ran; re-read a file only if you need details not captured here.\n"
+                + "\n".join(compacted)
+            )))
+        for r in rounds:
+            msgs.append(r["ai"])
+            msgs.extend(r["tools"])
+        msgs.extend(injected)
+        return msgs
+
+    def estimate_chars():
+        return sum(len(str(getattr(m, "content", ""))) for r in rounds for m in [r["ai"], *r["tools"]])
+
+    def maybe_trim():
+        trimmed = False
+        while len(rounds) > KEEP_TOOL_ROUNDS:
+            compacted.extend(_compact_round_summary(rounds.pop(0)))
+            trimmed = True
+        while len(rounds) > MIN_KEEP_ROUNDS and estimate_chars() > TRIM_CHAR_BUDGET:
+            compacted.extend(_compact_round_summary(rounds.pop(0)))
+            trimmed = True
+        if trimmed:
+            _publish_agent_log(request_name, "history_trim",
+                kept_rounds=len(rounds),
+                compacted_lines=len(compacted),
+            )
+
+    def account_tokens(response, round_label):
+        nonlocal total_tokens
         usage = getattr(response, "usage_metadata", None)
         if usage:
             total_tokens += int(usage.get("total_tokens") or 0)
             _publish_agent_log(request_name, "token_usage",
-                round=round_num + 1,
+                round=round_label,
                 tokens_this_round=usage.get("total_tokens", 0),
                 tokens_total=total_tokens,
             )
+            _persist_token_usage(request_name, total_tokens)
 
-        response_text = getattr(response, "content", "") or ""
+    for round_num in range(max_rounds):
+        maybe_trim()
+        response = llm_with_tools.invoke(build_messages())
+        account_tokens(response, round_num + 1)
+
+        response_text = _llm_response_text(response)
         if response_text:
             _publish_agent_log(request_name, "llm_response",
                 preview=response_text[:4000],
@@ -287,8 +512,18 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
             )
 
         if not getattr(response, "tool_calls", None):
+            # Model wants to finish. In the implement phase, don't let it stop
+            # without ever editing a file — push it to actually write.
+            if require_writes and not wrote_anything and write_nudges < MAX_WRITE_NUDGES:
+                write_nudges += 1
+                injected.append(HumanMessage(content=NUDGE_TEXT))
+                _publish_agent_log(request_name, "write_nudge",
+                    round=round_num + 1, attempt=write_nudges, trigger="no_tool_calls")
+                continue
             return response_text, edited_paths, total_tokens
 
+        round_entry = {"ai": response, "tools": [], "summary": []}
+        round_had_write = False
         for tc in response.tool_calls:
             _publish_agent_log(request_name, "tool_call",
                 tool_name=tc["name"],
@@ -303,12 +538,18 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
                     if len(result) > 15000:
                         result = result[:15000] + "\n... (truncated)"
                 except Exception as e:
+                    log_agent_error(
+                        f"Agent Graph: tool {tc['name']}",
+                        f"request={request_name}\n{e}\n{frappe.get_traceback()}",
+                    )
                     result = f"Tool error: {e}"
             else:
                 result = f"Unknown tool: {tc['name']}"
 
             if tc["name"] in WRITE_TOOLS:
                 if not result.startswith("Tool error:") and not result.startswith("Error:"):
+                    round_had_write = True
+                    wrote_anything = True
                     path_arg = tc.get("args", {}).get("path", "")
                     if path_arg and path_arg not in edited_paths:
                         edited_paths.append(path_arg)
@@ -318,13 +559,36 @@ def _run_tool_calling_loop(llm, tools, prompt: str, request_name: str = "", max_
                 result_preview=result[:500],
                 round=round_num + 1,
             )
-            messages.append(ToolMessage(content=result, tool_call_id=tc["id"]))
+            round_entry["tools"].append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
-    final = llm.invoke(messages)
-    usage = getattr(final, "usage_metadata", None)
-    if usage:
-        total_tokens += int(usage.get("total_tokens") or 0)
-    return (getattr(final, "content", "") or ""), edited_paths, total_tokens
+            arg_preview = ", ".join(
+                f"{k}={str(v)[:60]}" for k, v in list(tc.get("args", {}).items())[:3]
+            )
+            round_entry["summary"].append(
+                f"[r{round_num + 1}] {tc['name']}({arg_preview}) -> {result[:COMPACT_RESULT_PREVIEW]}"
+            )
+
+        rounds.append(round_entry)
+
+        # Proactively break analysis-paralysis: if the model keeps only reading
+        # in the implement phase, tell it to start editing.
+        if round_had_write:
+            read_only_streak = 0
+        else:
+            read_only_streak += 1
+        if (require_writes and not wrote_anything
+                and read_only_streak >= READ_STREAK_LIMIT
+                and write_nudges < MAX_WRITE_NUDGES):
+            write_nudges += 1
+            read_only_streak = 0
+            injected.append(HumanMessage(content=NUDGE_TEXT))
+            _publish_agent_log(request_name, "write_nudge",
+                round=round_num + 1, attempt=write_nudges, trigger="read_streak")
+
+    maybe_trim()
+    final = llm.invoke(build_messages())
+    account_tokens(final, max_rounds + 1)
+    return _llm_response_text(final), edited_paths, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -342,14 +606,16 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
         tools = _make_tools(app_name, read_only=read_only_tools)
         llm = _get_llm(provider=provider, model=model)
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
-        full_prompt = f"{system_prompt}\n\n{prompt}"
         content, tool_edited_paths, total_tokens = _run_tool_calling_loop(
-            llm, tools, full_prompt,
+            llm, tools, system_prompt, prompt,
             request_name=request_name,
             max_rounds=max_rounds,
-            state=state,      
+            state=state,
+            provider=provider,
+            require_writes=not read_only_tools,
         )
-        max_output = 30000 if phase in ("Understanding", "Planning") else 8000
+        content = _message_content_to_str(content)
+        max_output = MAX_PHASE_OUTPUT_CHARS
         steps = list(state.get("intermediate_steps") or []) + [
             {"phase": phase, "output": (content[:max_output] if content else "")}
         ]
@@ -362,6 +628,10 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             result["_tool_edited_paths"] = tool_edited_paths
         return result
     except Exception as e:
+        log_agent_error(
+            f"Agent Graph: {phase}",
+            f"request={state.get('request_name')}\n{e}\n{frappe.get_traceback()}",
+        )
         steps = list(state.get("intermediate_steps") or []) + [
             {"phase": phase, "output": f"Error: {e}"}
         ]
@@ -377,11 +647,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 # ---------------------------------------------------------------------------
 
 def understand_node(state: dict) -> dict:
-    """
-    The 'Understanding' node. Here, the agent explores the codebase to build 
-     a comprehensive mental model of the relevant files and logic before 
-     attempting any planning.
-    """
+    """Explore the codebase with read-only tools to gather context for planning."""
     if state.get("error"):
         return {"error": state["error"]}
     logs = _log_stage(state, "Understanding", "started", "Exploring codebase to understand the request")
@@ -390,14 +656,14 @@ def understand_node(state: dict) -> dict:
         state.get("request_type", "Improvement"),
         request_name=state.get("request_name"),
     )
-    # The agent is given read-only tools for this phase to ensure a safe exploration.
+    # Read-only tools keep exploration side-effect free.
     updates = _run_agent_turn(state, "Understanding", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_PLANNING)
     if updates.get("error"):
         logs = _log_stage({**state, "stage_log": logs}, "Understanding", "failed", updates["error"][:200])
         updates["stage_log"] = logs
         return updates
     steps = updates.get("intermediate_steps") or []
-    summary = steps[-1].get("output", "") if steps else ""
+    summary = _message_content_to_str(steps[-1].get("output", "") if steps else "")
     updates["understanding_summary"] = summary
     logs = _log_stage({**state, "stage_log": logs}, "Understanding", "completed", summary[:200])
     updates["stage_log"] = logs
@@ -405,21 +671,18 @@ def understand_node(state: dict) -> dict:
 
 
 def plan_node(state: dict) -> dict:
-    """
-    The 'Planning' node. The agent synthesizes its discoveries from the 
-    Understanding phase into a concrete, step-by-step implementation plan.
-    """
+    """Turn the understanding summary into a step-by-step implementation plan."""
     if state.get("error"):
         return {"error": state["error"]}
 
-    logs = _log_stage(state, "Planning", "started", "Creating detailed implementation plan from codebase analysis")
+    logs = _log_stage(state, "Planning", "started", "Creating todo-based implementation plan")
 
     try:
         provider = state.get("ai_provider", "OpenAI")
         model = state.get("ai_model", "gpt-4o-mini")
         app_name = state.get("target_app_name", "target_app")
         request_name = state.get("request_name", "")
-        understanding = state.get("understanding_summary", "")
+        understanding = _message_content_to_str(state.get("understanding_summary", ""))
         user_message = state.get("user_message", "")
 
         if not understanding.strip():
@@ -430,13 +693,26 @@ def plan_node(state: dict) -> dict:
         llm = _get_llm(provider=provider, model=model)
         system_prompt = get_system_prompt(app_name, request_name=request_name)
         plan_prompt = get_plan_prompt(understanding, user_message, request_name=request_name)
-        full_prompt = f"{system_prompt}\n\n{plan_prompt}"
 
         _publish_agent_log(request_name, "llm_response",
-            preview="Generating detailed plan from codebase analysis...", round=1)
+            preview="Generating todo-based plan from codebase analysis...", round=1)
 
-        response = llm.invoke([HumanMessage(content=full_prompt)])
-        plan = getattr(response, "content", "") or ""
+        response = llm.invoke([
+            _build_system_message(provider, system_prompt),
+            HumanMessage(content=plan_prompt),
+        ])
+        plan = _llm_response_text(response)
+
+        total_tokens = state.get("tokens_used", 0)
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            total_tokens += int(usage.get("total_tokens") or 0)
+            _publish_agent_log(request_name, "token_usage",
+                round=1,
+                tokens_this_round=usage.get("total_tokens", 0),
+                tokens_total=total_tokens,
+            )
+            _persist_token_usage(request_name, total_tokens)
 
         if not plan.strip():
             logs = _log_stage({**state, "stage_log": logs}, "Planning", "failed",
@@ -447,7 +723,7 @@ def plan_node(state: dict) -> dict:
             preview=plan[:500], round=2)
 
         steps = list(state.get("intermediate_steps") or []) + [
-            {"phase": "Planning", "output": plan[:30000]}
+            {"phase": "Planning", "output": plan[:MAX_PHASE_OUTPUT_CHARS]}
         ]
 
         logs = _log_stage({**state, "stage_log": logs}, "Planning", "completed",
@@ -458,8 +734,13 @@ def plan_node(state: dict) -> dict:
             "plan": plan,
             "intermediate_steps": steps,
             "stage_log": logs,
+            "tokens_used": total_tokens,
         }
     except Exception as e:
+        log_agent_error(
+            "Agent Graph: Planning",
+            f"request={state.get('request_name')}\n{e}\n{frappe.get_traceback()}",
+        )
         logs = _log_stage({**state, "stage_log": logs}, "Planning", "failed", str(e)[:200])
         return {
             "current_stage": "Planning",
@@ -473,41 +754,69 @@ def plan_node(state: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def implement_node(state: dict) -> dict:
-    """
-    The 'Implementing' node. In this phase, the agent applies the approved plan 
-    by writing code and creating new files as needed.
+    """Apply the approved plan by editing and creating files with write tools.
+
+    Runs an implementation pass, then a local syntax check on the edited
+    .py/.js files so broken code never reaches bench. A review stage can
+    send corrections back into a follow-up implement pass.
     """
     if state.get("error"):
         return {"error": state["error"]}
+    is_follow_up = bool(state.get("is_follow_up"))
     attempt = (state.get("review_attempts") or 0) + 1
-    logs = _log_stage(state, "Implementing", "started", f"Applying code changes (attempt {attempt})")
+    logs = _log_stage(
+        state, "Implementing", "started",
+        "Applying follow-up patch" if is_follow_up else f"Applying code changes (attempt {attempt})"
+    )
 
     app_name = state.get("target_app_name", "")
-    all_text = (state.get("plan", "") + "\n" + state.get("understanding_summary", ""))
-    file_paths = _extract_file_paths(all_text)
-    file_contents = _pre_read_files(app_name, file_paths)
-    logs = _log_stage(
-        {**state, "stage_log": logs}, "Implementing", "progress",
-        f"Pre-loaded {len(file_paths)} files: {', '.join(file_paths[:5])}"
-    )
+    plan_text = _message_content_to_str(state.get("plan", ""))
+    understanding_text = _message_content_to_str(state.get("understanding_summary", ""))
 
-    base_prompt = get_implement_prompt(
-        state.get("plan", ""),
-        state.get("understanding_summary", ""),
-        state.get("user_message", ""),
-        file_contents,
-        request_name=state.get("request_name"),
-    )
+    if is_follow_up:
+        follow_up_message = _message_content_to_str(state.get("follow_up_message", ""))
+        prior_paths = list(state.get("prior_changed_paths") or [])
+        implementation_memory = _message_content_to_str(state.get("implementation_memory", ""))
+        context_paths = list(dict.fromkeys(prior_paths + _extract_file_paths(follow_up_message)))
+        file_contents = _pre_read_files(app_name, context_paths)
+        prior_files = "\n".join(f"- {p}" for p in context_paths) if context_paths else "- (none recorded)"
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Implementing", "progress",
+            f"Follow-up context: {len(context_paths)} files loaded"
+        )
+        base_prompt = get_follow_up_implement_prompt(
+            follow_up_message,
+            plan_text,
+            implementation_memory,
+            prior_files,
+            file_contents,
+            request_name=state.get("request_name"),
+        )
+    else:
+        all_text = plan_text + "\n" + understanding_text
+        file_paths = _extract_file_paths(all_text)
+        file_contents = _pre_read_files(app_name, file_paths)
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Implementing", "progress",
+            f"Pre-loaded {len(file_paths)} files: {', '.join(file_paths[:5])}"
+        )
+        base_prompt = get_implement_prompt(
+            plan_text,
+            understanding_text,
+            state.get("user_message", ""),
+            file_contents,
+            request_name=state.get("request_name"),
+        )
+        review_notes = (state.get("review_notes") or "").strip()
+        if attempt > 1 and review_notes:
+            base_prompt += f"""
 
-    review_notes = state.get("review_notes", "")
-    if attempt > 1 and review_notes:
-        base_prompt += f"""
+## PRIOR REVIEW FINDINGS — FIX THESE NOW
+The last test stage failed. Fix every issue listed below before doing anything else.
+Focus on the exact files and problems described; do not add new features.
 
-## PREVIOUS REVIEW FEEDBACK — FIX THESE ISSUES
-The previous implementation attempt was reviewed and FAILED. Here is what the reviewer found wrong:
 {review_notes}
-
-You MUST fix ALL of these issues in this attempt. Read the affected files first to see the current state."""
+"""
 
     updates = _run_agent_turn(state, "Implementing", base_prompt, read_only_tools=False, max_rounds=MAX_TOOL_ROUNDS_EXECUTION)
     if updates.get("error"):
@@ -517,37 +826,125 @@ You MUST fix ALL of these issues in this attempt. Read the affected files first 
 
     tool_edited = updates.pop("_tool_edited_paths", [])
     steps = updates.get("intermediate_steps") or []
-    last_out = steps[-1].get("output", "") if steps else ""
-    text_paths = _extract_file_paths(last_out)
+    last_out = _message_content_to_str(steps[-1].get("output", "") if steps else "")
+    # Only keep summary-mentioned paths that actually exist on disk — the model
+    # often names files it merely considered, which would otherwise be recorded
+    # as phantom edits and break validation ("Not a file").
+    text_paths = [p for p in _extract_file_paths(last_out) if _app_file_exists(app_name, p)]
 
     all_paths = list(dict.fromkeys(tool_edited + text_paths))
 
     edits = list(state.get("edits_made") or [])
     for p in all_paths:
         if not any(e.get("path") == p for e in edits):
-            edits.append({"path": p, "summary": f"Modified in attempt {attempt}"})
+            edits.append({"path": p, "summary": "Modified"})
     if not all_paths:
         edits.append({"summary": last_out[:300]})
     updates["edits_made"] = edits
+    updates["change_summary"] = _extract_change_summary(last_out)
+
+    logs = _log_stage(
+        {**state, "stage_log": logs}, "Implementing", "progress",
+        f"Files edited: {', '.join(all_paths[:8]) if all_paths else 'see summary'}"
+    )
+
+    # Local syntax gate. If real syntax errors exist, try to auto-fix them by
+    # feeding the exact errors back to the model, then re-check — instead of
+    # failing the whole run on the first broken edit.
+    syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
+    fix_state = {
+        **state,
+        "tokens_used": updates.get("tokens_used", state.get("tokens_used", 0)),
+        "intermediate_steps": updates.get("intermediate_steps") or [],
+        "stage_log": logs,
+    }
+    attempt = 0
+    while not syntax_ok and attempt < MAX_SYNTAX_FIX_ATTEMPTS:
+        attempt += 1
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Implementing", "progress",
+            f"Auto-fixing syntax errors (attempt {attempt})"
+        )
+        fix_state["stage_log"] = logs
+        fix_prompt = (
+            "One or more files you just edited have SYNTAX ERRORS. Fix ONLY these "
+            "errors now. For each affected file: read it to see the current state, "
+            "correct the syntax with replace_lines/insert_lines/edit_file, then call "
+            "validate_code on it to confirm it passes. Do NOT change unrelated code "
+            "and do NOT create any new files.\n\n"
+            f"## SYNTAX ERRORS TO FIX\n{syntax_report}"
+        )
+        fix_updates = _run_agent_turn(
+            fix_state, "Implementing", fix_prompt,
+            read_only_tools=False, max_rounds=MAX_TOOL_ROUNDS_SYNTAX_FIX,
+        )
+        # Carry forward token/step accounting whatever the outcome.
+        fix_state["tokens_used"] = fix_updates.get("tokens_used", fix_state["tokens_used"])
+        fix_state["intermediate_steps"] = fix_updates.get("intermediate_steps") or fix_state["intermediate_steps"]
+        updates["tokens_used"] = fix_state["tokens_used"]
+        updates["intermediate_steps"] = fix_state["intermediate_steps"]
+        if fix_updates.get("error"):
+            break
+        for p in fix_updates.pop("_tool_edited_paths", []):
+            if not any(e.get("path") == p for e in edits):
+                edits.append({"path": p, "summary": "Modified (syntax fix)"})
+        updates["edits_made"] = edits
+        syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
+
+    if not syntax_ok:
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Implementing", "failed",
+            f"Syntax check failed: {syntax_report[:150]}"
+        )
+        updates["error"] = (
+            "Implementation produced invalid syntax that could not be auto-fixed:\n"
+            f"{syntax_report[:1000]}"
+        )
+        updates["stage_log"] = logs
+        return updates
 
     logs = _log_stage(
         {**state, "stage_log": logs}, "Implementing", "completed",
-        f"Files edited: {', '.join(all_paths[:8]) if all_paths else 'see summary'}"
+        "Changes applied and syntax validated"
+        + (f" (auto-fixed on attempt {attempt})" if attempt else "")
     )
     updates["stage_log"] = logs
     return updates
 
 
 def review_node(state: dict) -> dict:
-    """
-    The 'Reviewing' node. The agent takes an adversarial look at its own 
-    implementation to identify potential bugs, syntax errors, or missed requirements.
-    """
+    """Test the implementation for clean code and Frappe standards."""
     if state.get("error"):
         return {"error": state["error"]}
-    logs = _log_stage(state, "Reviewing", "started", "Reviewing implemented changes")
+    logs = _log_stage(state, "Reviewing", "started", "Testing implementation quality")
     edits = state.get("edits_made", [])
+    app_name = state.get("target_app_name", "")
+
+    syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
+    attempt = (state.get("review_attempts") or 0) + 1
+    if not syntax_ok:
+        updates = {
+            "review_passed": False,
+            "review_notes": syntax_report[:1000],
+            "review_attempts": attempt,
+        }
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Reviewing", "completed",
+            f"Testing FAILED (syntax): {syntax_report[:120]}"
+        )
+        if attempt >= MAX_REVIEW_ATTEMPTS:
+            updates["error"] = f"Syntax errors remain after {attempt} test attempt(s)."
+        updates["stage_log"] = logs
+        return updates
+
     prompt = get_review_prompt(edits, state.get("user_message", ""), request_name=state.get("request_name"))
+    if syntax_report:
+        short_report = "\n".join(syntax_report.splitlines()[:6])
+        prompt += (
+            "\n\n## LOCAL SYNTAX PRE-CHECK (already passed)\n"
+            f"{short_report}\n"
+            "Do not re-run validate_code unless you need to re-check after reasoning."
+        )
     updates = _run_agent_turn(state, "Reviewing", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_REVIEW)
     if updates.get("error"):
         logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "failed", updates["error"][:200])
@@ -555,35 +952,16 @@ def review_node(state: dict) -> dict:
         return updates
 
     steps = updates.get("intermediate_steps") or []
-    last_out = (steps[-1].get("output", "") if steps else "")
-
-    if "REVIEW_PASSED" not in last_out.upper():
-        try:
-            provider = state.get("ai_provider", "OpenAI")
-            model = state.get("ai_model", "gpt-4o-mini")
-            llm = _get_llm(provider=provider, model=model)
-            verdict_response = llm.invoke([HumanMessage(
-                content=(
-                    "Based on the review you just performed, give your final verdict.\n"
-                    "Reply with EXACTLY one of:\n"
-                    "- REVIEW_PASSED=yes (if all changes are correct)\n"
-                    "- REVIEW_PASSED=no (followed by what's wrong)\n\n"
-                    f"Review output so far: {last_out[:2000]}"
-                )
-            )])
-            verdict = getattr(verdict_response, "content", "") or ""
-            if verdict.strip():
-                last_out = verdict
-        except Exception:
-            pass
-
-    last_out_upper = last_out.upper()
-    passed = "REVIEW_PASSED=YES" in last_out_upper
+    last_out = _message_content_to_str(steps[-1].get("output", "") if steps else "")
+    passed, notes = _parse_review_verdict(last_out)
     updates["review_passed"] = passed
-    updates["review_notes"] = last_out[:500]
-    updates["review_attempts"] = (state.get("review_attempts") or 0) + 1
-    result_msg = "Review PASSED" if passed else f"Review FAILED: {last_out[:100]}"
+    updates["review_notes"] = notes[:1200]
+    updates["review_attempts"] = attempt
+
+    result_msg = "Testing PASSED" if passed else f"Testing FAILED: {notes[:100]}"
     logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "completed", result_msg)
+    if not passed and attempt >= MAX_REVIEW_ATTEMPTS:
+        updates["error"] = f"Review failed after {attempt} attempt(s)."
     updates["stage_log"] = logs
     return updates
 
@@ -610,175 +988,6 @@ def _get_bench_env() -> dict:
     return env
 
 
-def bench_node(state: dict) -> dict:
-    """
-    The 'Building' node. This node executes the necessary bench commands 
-    (like migrations or asset builds) to integrate the changes into the site.
-    """
-    if state.get("error"):
-        return {"error": state["error"]}
-    logs = _log_stage(state, "Building", "started", "Running bench commands to apply changes")
-
-    edits = state.get("edits_made", [])
-    edited_paths = [e.get("path", "") for e in edits if e.get("path")]
-    app_name = state.get("target_app_name", "")
-    request_name = state.get("request_name", "")
-
-    bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
-    bench_root = os.path.normpath(bench_root)
-
-    site_name = frappe.local.site
-    bench_env = _get_bench_env()
-
-    has_doctype_changes = any(
-        p.endswith(".json") and "/doctype/" in p for p in edited_paths
-    )
-    has_js_css_changes = any(
-        p.endswith((".js", ".css", ".html")) for p in edited_paths
-    )
-
-    cmds = []
-    if has_doctype_changes:
-        cmds.append(f"bench --site {site_name} migrate")
-    if has_js_css_changes:
-        cmds.append(f"bench build --app {app_name}")
-    cmds.append(f"bench --site {site_name} clear-cache")
-    cmds.append("supervisorctl restart all")
-
-    bench_output_parts = []
-    for cmd in cmds:
-        _log_stage({**state, "stage_log": logs}, "Building", "progress", f"Running: {cmd}")
-        _publish_agent_log(request_name, "bench_command", command=cmd)
-        try:
-            result = subprocess.run(
-                cmd.split(),
-                cwd=bench_root,
-                capture_output=True,
-                text=True,
-                timeout=900,
-                env=bench_env,
-            )
-            output = (result.stdout or "") + (result.stderr or "")
-            success = result.returncode == 0
-            status_str = "OK" if success else f"FAILED (exit {result.returncode})"
-            entry = f"$ {cmd}\n{status_str}\n{output.strip()}\n"
-            bench_output_parts.append(entry)
-            _publish_agent_log(request_name, "bench_result",
-                command=cmd,
-                success=success,
-                output_preview=output[:500],
-            )
-        except subprocess.TimeoutExpired:
-            entry = f"$ {cmd}\nTIMEOUT after 900s\n"
-            bench_output_parts.append(entry)
-            _publish_agent_log(request_name, "bench_result",
-                command=cmd, success=False, output_preview="Timed out after 900s")
-        except Exception as e:
-            entry = f"$ {cmd}\nERROR: {e}\n"
-            bench_output_parts.append(entry)
-
-    bench_log = "\n".join(bench_output_parts)
-
-    if request_name:
-        try:
-            frappe.db.set_value(DOCTYPE_NAME, request_name, "bench_log", bench_log[:50000])
-            frappe.db.commit()
-        except Exception:
-            pass
-
-    logs = _log_stage({**state, "stage_log": logs}, "Building", "completed",
-        f"Ran {len(cmds)} bench commands")
-    return {
-        "current_stage": "Building",
-        "bench_log": bench_log,
-        "stage_log": logs,
-    }
-
-
-def deploy_node(state: dict) -> dict:
-    """
-    The 'Pushing' node. Finalizes the work by committing the changes to a branch, 
-    pushing to the remote repository, and optionally opening a pull request.
-    """
-    if state.get("error"):
-        return {"error": state["error"]}
-    logs = _log_stage(state, "Pushing", "started", "Creating branch, committing, pushing and opening PR")
-
-    app_name = state.get("target_app_name", "")
-    request_name = state.get("request_name", "AGENT-0000")
-    request_type = state.get("request_type", "Improvement")
-    plan = state.get("plan", "")
-    user_message = state.get("user_message", "")[:500]
-    base_branch = state.get("base_branch", "main")
-    branch_prefix = state.get("branch_prefix", "ai-agent/")
-    repo_url = state.get("github_repo_url", "")
-    token = state.get("github_token", "")
-    git_user_name = state.get("git_user_name", "AI Agent")
-    git_user_email = state.get("git_user_email", "ai-agent@ampower.com")
-
-    branch_name = generate_branch_name(request_name, branch_prefix)
-
-    repo_root = get_repo_root(app_name)
-    ok, diff_out = run_git(["diff", "--stat", "HEAD"], cwd=repo_root)
-    ok2, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
-    has_changes = bool((diff_out or "").strip()) or bool((untracked or "").strip())
-    if not has_changes:
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed",
-            "No file changes detected on disk. The implement phase did not produce any actual edits.")
-        return {
-            "current_stage": "Pushing",
-            "error": "No code changes were produced. The implement phase did not modify any files on disk.",
-            "branch_name": "",
-            "stage_log": logs,
-        }
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "progress",
-        f"Verified file changes exist: {(diff_out or untracked or '')[:100]}")
-
-    ok, msg = create_branch(app_name, branch_name, base_branch)
-    if not ok:
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed", f"Branch creation failed: {msg[:150]}")
-        return {"current_stage": "Pushing", "error": f"create_branch: {msg}", "branch_name": branch_name, "stage_log": logs}
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "progress", f"Branch created: {branch_name}")
-
-    commit_msg = f"[AI Agent] {request_type}: {request_name}\n\n{user_message[:200]}"
-    ok, msg = commit_changes(app_name, commit_msg, git_user_name, git_user_email)
-    if not ok:
-        if "No changes" in msg:
-            logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed",
-                "No files were actually changed. The implement phase edits may have all failed.")
-            return {"current_stage": "Pushing", "error": "No code changes were produced.", "branch_name": branch_name, "stage_log": logs}
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed", f"Commit failed: {msg[:150]}")
-        return {"current_stage": "Pushing", "error": f"commit: {msg}", "branch_name": branch_name, "stage_log": logs}
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "progress", "Changes committed")
-
-    ok, msg = push_branch(app_name, branch_name, repo_url, token)
-    if not ok:
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed", f"Push failed: {msg[:150]}")
-        return {"current_stage": "Pushing", "error": f"push: {msg}", "branch_name": branch_name, "stage_log": logs}
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "progress", "Branch pushed to remote")
-
-    pr_title = f"[AI Agent] {request_type}: {request_name}"
-    pr_body = f"## Request\n{user_message}\n\n## Plan\n{plan}"
-    ok, msg, pr_url, pr_number = create_pull_request(pr_title, pr_body, branch_name, repo_url, token, base_branch)
-    if not ok:
-        logs = _log_stage({**state, "stage_log": logs}, "Pushing", "failed", f"PR creation failed: {msg[:150]}")
-        return {"current_stage": "Pushing", "error": f"PR: {msg}", "branch_name": branch_name, "pr_url": None, "pr_number": None, "stage_log": logs}
-
-    logs = _log_stage({**state, "stage_log": logs}, "Pushing", "completed", f"PR #{pr_number} created: {pr_url}")
-    return {
-        "current_stage": "Completed",
-        "branch_name": branch_name,
-        "pr_url": pr_url,
-        "pr_number": pr_number,
-        "error": None,
-        "stage_log": logs,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Conditional edge
 # ---------------------------------------------------------------------------
@@ -788,7 +997,7 @@ def should_retry_implement(state: dict) -> str:
         return "done"
     if state.get("review_passed"):
         return "done"
-    if (state.get("review_attempts") or 0) >= 3:
+    if (state.get("review_attempts") or 0) >= MAX_REVIEW_ATTEMPTS:
         return "done"
     return "implement"
 
@@ -816,7 +1025,7 @@ def build_planning_graph():
 def build_execution_graph():
     """
     Constructs the state machine for the Implementation Phase.
-    Flow: Implement Changes → Review Work → (Retry if needed).
+    Flow: Implement Changes → Review/Testing → (Retry if needed).
     """
     workflow = StateGraph(AgentState)
     workflow.add_node("implement", implement_node)
