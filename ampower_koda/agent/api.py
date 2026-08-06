@@ -10,7 +10,7 @@ import frappe
 from frappe import _
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.executor import _generate_patch_diff
+from ampower_koda.agent.executor import _generate_patch_diff, _update_status
 from ampower_koda.agent.git_ops import (
     branch_exists,
     checkout_base,
@@ -50,6 +50,48 @@ def _whitelist_logged(fn):
             raise
     return wrapper
 
+def _reconcile_if_dead(doc) -> bool:
+    """
+    If this request is sitting in a busy status but its background job is no
+    longer actually running (worker was killed — OOM, restart, RQ timeout —
+    causing a "workhorse terminated" failure that never reaches our own
+    try/except), flip it to Failed so the user isn't stuck forever.
+
+    Returns True if the request was reconciled (status changed under us).
+    """
+    if doc.status not in BUSY_STATUSES:
+        return False
+    if not (doc.rq_job_id or "").strip():
+        return False
+
+    try:
+        from rq.job import Job
+        from rq.exceptions import NoSuchJobError
+        from frappe.utils.background_jobs import get_redis_conn
+
+        job = Job.fetch(doc.rq_job_id, connection=get_redis_conn())
+        job_status = job.get_status(refresh=True)
+        if job_status in ("queued", "started", "scheduled", "deferred"):
+            return False  # still genuinely running/pending, leave it alone
+    except NoSuchJobError:
+        pass  # job record is gone entirely — the worker died and RQ lost track of it
+    except Exception:
+        # Can't reach Redis or inspect the job — don't guess, leave status as-is.
+        log_agent_error("Agent Reconcile: could not inspect RQ job", frappe.get_traceback())
+        return False
+
+    _update_status(
+        doc.name, doc.owner or frappe.session.user, "Failed",
+        "Background job was terminated unexpectedly (worker likely killed by "
+        "an OOM condition or a bench/service restart). Please retry.",
+        error_log=(
+            f"Reconciled stale status. Last known status: {doc.status}. "
+            f"RQ job id: {doc.rq_job_id} was not found running."
+        ),
+    )
+    doc.reload()
+    return True
+
 
 def _validate_provider_key(doc):
     """Ensure the AI provider is enabled and its API key is configured in settings."""
@@ -76,7 +118,9 @@ def start_agent(request_name: str):
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status not in RESTARTABLE_STATUSES:
-        frappe.throw(_("Agent is already busy (status: {0}).").format(doc.status))
+        _reconcile_if_dead(doc)  # self-heal a stuck request before giving up on it
+        if doc.status not in RESTARTABLE_STATUSES:
+            frappe.throw(_("Agent is already busy (status: {0}).").format(doc.status))
 
     _validate_provider_key(doc)
 
@@ -99,12 +143,14 @@ def start_agent(request_name: str):
     })
     frappe.db.commit()
 
-    frappe.enqueue(
+    job = frappe.enqueue(
         "ampower_koda.agent.executor.run_planning_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
     )
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
+    frappe.db.commit()
     return {"status": "ok", "message": _("Planning phase started.")}
 
 
@@ -122,7 +168,9 @@ def submit_follow_up(request_name: str, follow_up_message: str):
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status not in RESTARTABLE_STATUSES:
-        frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
+        _reconcile_if_dead(doc)  # self-heal a stuck request before giving up on it
+        if doc.status not in RESTARTABLE_STATUSES:
+            frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
     if not (doc.branch_name or "").strip():
         frappe.throw(_("Follow-up fix needs an existing branch on this request."))
 
@@ -151,6 +199,8 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         preserve_branch=1,
         is_follow_up=1,
     )
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
+    frappe.db.commit()
     return {"status": "ok", "message": _("Follow-up patch started on existing branch (plan preserved).")}
 
 
@@ -189,6 +239,8 @@ def execute_existing_plan(request_name: str):
         timeout=1800,
         request_name=request_name,
     )
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
+    frappe.db.commit()
     return {"status": "ok", "message": _("Implementation phase started.")}
 
 
@@ -225,6 +277,8 @@ def approve_plan(request_name: str, edited_plan: str = None):
         timeout=1800,
         request_name=request_name,
     )
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
+    frappe.db.commit()
     return {"status": "ok", "message": _("Plan approved. Starting implementation.")}
 
 
@@ -283,6 +337,9 @@ def approve_bench(request_name: str, commands: str = None):
         timeout=1800,
         request_name=request_name,
     )
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
+    frappe.db.commit()
+
 
     cmds = []
     try:
@@ -326,6 +383,8 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         do_push=bool(push_branch),
         do_pr=bool(create_pr),
     )
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
+    frappe.db.commit()
 
     if push_branch and create_pr:
         msg = _("Pushing branch and creating PR...")
@@ -454,6 +513,10 @@ def get_agent_status(request_name: str):
     if not request_name:
         frappe.throw(_("Request name is required."))
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    # This method is already polled every 5-10s by the frontend while a
+    # request is busy — piggyback the dead-job check on that existing poll
+    # instead of adding a separate scheduler job.
+    _reconcile_if_dead(doc)
     return {
         "name": doc.name,
         "status": doc.status,
@@ -855,7 +918,9 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         frappe.throw(_("No branch on this request."))
 
     if doc.status in BUSY_STATUSES:
-        frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
+        _reconcile_if_dead(doc)  # self-heal a stuck request before giving up on it
+        if doc.status in BUSY_STATUSES:
+            frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
     _require_request_branch(doc)
 
@@ -878,6 +943,8 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         do_push=bool(push_branch),
         do_pr=bool(create_pr),
     )
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
+    frappe.db.commit()
 
     if push_branch and create_pr:
         msg = _("Committing, pushing, and creating PR...")
