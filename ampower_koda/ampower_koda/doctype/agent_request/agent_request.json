@@ -43,7 +43,6 @@
   "error_log",
   "debug_section",
   "pending_bench_commands",
-  "rq_job_id",
   "conversation_log",
   "understanding_snapshot",
   "implementation_snapshot",
@@ -121,7 +120,7 @@
    "fieldname": "ai_provider",
    "fieldtype": "Select",
    "label": "Provider",
-   "options": "OpenAI\nGemini\nClaude",
+   "options": "OpenAI\nGemini\nClaude\nOpenRouter",
    "reqd": 1
   },
   {
@@ -131,9 +130,9 @@
   {
    "default": "gpt-4o-mini",
    "fieldname": "ai_model",
-   "fieldtype": "Select",
+   "fieldtype": "Data",
    "label": "Model",
-   "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022",
+   "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022\ndeepseek/deepseek-v4-flash-0731\ndeepseek/deepseek-chat\nanthropic/claude-sonnet-4\nopenai/gpt-4o-mini\nqwen/qwen-2.5-coder-32b-instruct",
    "reqd": 1
   },
   {
@@ -299,13 +298,6 @@
    "read_only": 1
   },
   {
-   "fieldname": "rq_job_id",
-   "fieldtype": "Data",
-   "hidden": 1,
-   "label": "RQ Job ID",
-   "read_only": 1
-  },
-  {
    "fieldname": "conversation_log",
    "fieldtype": "Long Text",
    "label": "Conversation Log",
@@ -320,7 +312,7 @@
    "read_only": 1
   },
   {
-   "description": "What the last implementation run built — used as memory for follow-up patches.",
+   "description": "What the last implementation run built \u2014 used as memory for follow-up patches.",
    "fieldname": "implementation_snapshot",
    "fieldtype": "Long Text",
    "hidden": 1,
@@ -387,11 +379,11 @@
   }
  ],
  "links": [],
- "modified": "2026-08-06 08:27:49.976627",
+ "modified": "2026-08-18 14:41:13.251303",
  "modified_by": "Administrator",
  "module": "Ampower Koda",
  "name": "Agent Request",
- "naming_rule": "Expression",
+ "naming_rule": "Expression (old style)",
  "owner": "Administrator",
  "permissions": [
   {
@@ -406,6 +398,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "modified",
  "sort_order": "DESC",
  "states": [],
