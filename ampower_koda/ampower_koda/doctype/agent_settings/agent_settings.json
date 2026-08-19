@@ -1,132 +1,201 @@
 {
-    "actions": [],
-    "creation": "2026-03-05 12:00:00.000000",
-    "doctype": "DocType",
-    "engine": "InnoDB",
-    "field_order": [
-        "settings_tab",
-        "general_section",
-        "enable_ai_agent",
-        "defaults_section",
-        "default_ai_provider",
-        "column_break_defaults",
-        "default_ai_model",
-        "openai_section",
-        "openai_api_key",
-        "gemini_section",
-        "google_api_key",
-        "claude_section",
-        "anthropic_api_key"
-    ],
-    "fields": [
-        {
-            "fieldname": "settings_tab",
-            "fieldtype": "Tab Break",
-            "label": "AI Provider Settings"
-        },
-        {
-            "fieldname": "general_section",
-            "fieldtype": "Section Break",
-            "label": "General"
-        },
-        {
-            "default": "0",
-            "fieldname": "enable_ai_agent",
-            "fieldtype": "Check",
-            "label": "Enable AI Agent"
-        },
-        {
-            "fieldname": "defaults_section",
-            "fieldtype": "Section Break",
-            "label": "Defaults",
-            "depends_on": "enable_ai_agent"
-        },
-        {
-            "fieldname": "default_ai_provider",
-            "fieldtype": "Select",
-            "label": "AI Provider",
-            "options": "OpenAI\nGemini\nClaude",
-            "default": "OpenAI",
-            "reqd": 0
-        },
-        {
-            "fieldname": "column_break_defaults",
-            "fieldtype": "Column Break"
-        },
-        {
-            "fieldname": "default_ai_model",
-            "fieldtype": "Select",
-            "label": "AI Model",
-            "default": "gpt-4o-mini",
-            "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022",
-            "description": "Default model for new requests. Changes with provider selection."
-        },
-        {
-            "fieldname": "openai_section",
-            "fieldtype": "Section Break",
-            "label": "OpenAI",
-            "depends_on": "enable_ai_agent",
-            "collapsible": 1,
-            "collapsible_depends_on": "eval:doc.default_ai_provider !== 'OpenAI'"
-        },
-        {
-            "fieldname": "openai_api_key",
-            "fieldtype": "Password",
-            "label": "OpenAI API Key",
-            "mandatory_depends_on": "eval:doc.default_ai_provider === 'OpenAI'"
-        },
-        {
-            "fieldname": "gemini_section",
-            "fieldtype": "Section Break",
-            "label": "Google Gemini",
-            "depends_on": "enable_ai_agent",
-            "collapsible": 1,
-            "collapsible_depends_on": "eval:doc.default_ai_provider !== 'Gemini'"
-        },
-        {
-            "fieldname": "google_api_key",
-            "fieldtype": "Password",
-            "label": "Google API Key",
-            "description": "API key from Google AI Studio",
-            "mandatory_depends_on": "eval:doc.default_ai_provider === 'Gemini'"
-        },
-        {
-            "fieldname": "claude_section",
-            "fieldtype": "Section Break",
-            "label": "Claude (Anthropic)",
-            "depends_on": "enable_ai_agent",
-            "collapsible": 1,
-            "collapsible_depends_on": "eval:doc.default_ai_provider !== 'Claude'"
-        },
-        {
-            "fieldname": "anthropic_api_key",
-            "fieldtype": "Password",
-            "label": "Anthropic API Key",
-            "description": "API key from Anthropic console",
-            "mandatory_depends_on": "eval:doc.default_ai_provider === 'Claude'"
-        }
-    ],
-    "issingle": 1,
-    "links": [],
-    "modified": "2026-03-31 20:30:00.000000",
-    "modified_by": "Administrator",
-    "module": "Ampower Koda",
-    "name": "Agent Settings",
-    "owner": "Administrator",
-    "permissions": [
-        {
-            "create": 1,
-            "delete": 1,
-            "email": 1,
-            "print": 1,
-            "read": 1,
-            "role": "System Manager",
-            "share": 1,
-            "write": 1
-        }
-    ],
-    "sort_field": "modified",
-    "sort_order": "DESC",
-    "states": [],
-    "track_changes": 1
+ "actions": [],
+ "creation": "2026-03-05 12:00:00",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "settings_tab",
+  "general_section",
+  "enable_ai_agent",
+  "defaults_section",
+  "default_ai_provider",
+  "column_break_defaults",
+  "default_ai_model",
+  "openai_section",
+  "openai_api_key",
+  "gemini_section",
+  "google_api_key",
+  "claude_section",
+  "anthropic_api_key",
+  "openrouter_section",
+  "openrouter_api_key",
+  "tracing_tab",
+  "langsmith_section",
+  "enable_langsmith",
+  "langsmith_api_key",
+  "column_break_langsmith",
+  "langsmith_project",
+  "langsmith_endpoint"
+ ],
+ "fields": [
+  {
+   "fieldname": "settings_tab",
+   "fieldtype": "Tab Break",
+   "label": "AI Provider Settings"
+  },
+  {
+   "fieldname": "general_section",
+   "fieldtype": "Section Break",
+   "label": "General"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_ai_agent",
+   "fieldtype": "Check",
+   "label": "Enable AI Agent"
+  },
+  {
+   "depends_on": "enable_ai_agent",
+   "fieldname": "defaults_section",
+   "fieldtype": "Section Break",
+   "label": "Defaults"
+  },
+  {
+   "default": "OpenAI",
+   "fieldname": "default_ai_provider",
+   "fieldtype": "Select",
+   "label": "AI Provider",
+   "options": "OpenAI\nGemini\nClaude\nOpenRouter"
+  },
+  {
+   "fieldname": "column_break_defaults",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "gpt-4o-mini",
+   "description": "Default model for new requests. Changes with provider selection.",
+   "fieldname": "default_ai_model",
+   "fieldtype": "Data",
+   "label": "AI Model",
+   "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022\ndeepseek/deepseek-v4-flash-0731\ndeepseek/deepseek-chat\nanthropic/claude-sonnet-4\nopenai/gpt-4o-mini\nqwen/qwen-2.5-coder-32b-instruct"
+  },
+  {
+   "collapsible": 1,
+   "collapsible_depends_on": "eval:doc.default_ai_provider !== 'OpenAI'",
+   "depends_on": "enable_ai_agent",
+   "fieldname": "openai_section",
+   "fieldtype": "Section Break",
+   "label": "OpenAI"
+  },
+  {
+   "fieldname": "openai_api_key",
+   "fieldtype": "Password",
+   "label": "OpenAI API Key",
+   "mandatory_depends_on": "eval:doc.default_ai_provider === 'OpenAI'"
+  },
+  {
+   "collapsible": 1,
+   "collapsible_depends_on": "eval:doc.default_ai_provider !== 'Gemini'",
+   "depends_on": "enable_ai_agent",
+   "fieldname": "gemini_section",
+   "fieldtype": "Section Break",
+   "label": "Google Gemini"
+  },
+  {
+   "description": "API key from Google AI Studio",
+   "fieldname": "google_api_key",
+   "fieldtype": "Password",
+   "label": "Google API Key",
+   "mandatory_depends_on": "eval:doc.default_ai_provider === 'Gemini'"
+  },
+  {
+   "collapsible": 1,
+   "collapsible_depends_on": "eval:doc.default_ai_provider !== 'Claude'",
+   "depends_on": "enable_ai_agent",
+   "fieldname": "claude_section",
+   "fieldtype": "Section Break",
+   "label": "Claude (Anthropic)"
+  },
+  {
+   "description": "API key from Anthropic console",
+   "fieldname": "anthropic_api_key",
+   "fieldtype": "Password",
+   "label": "Anthropic API Key",
+   "mandatory_depends_on": "eval:doc.default_ai_provider === 'Claude'"
+  },
+  {
+   "collapsible": 1,
+   "collapsible_depends_on": "eval:doc.default_ai_provider !== 'OpenRouter'",
+   "depends_on": "enable_ai_agent",
+   "fieldname": "openrouter_section",
+   "fieldtype": "Section Break",
+   "label": "OpenRouter"
+  },
+  {
+   "description": "API key from openrouter.ai. Models are namespaced, e.g. deepseek/deepseek-chat.",
+   "fieldname": "openrouter_api_key",
+   "fieldtype": "Password",
+   "label": "OpenRouter API Key",
+   "mandatory_depends_on": "eval:doc.default_ai_provider === 'OpenRouter'"
+  },
+  {
+   "fieldname": "tracing_tab",
+   "fieldtype": "Tab Break",
+   "label": "Tracing"
+  },
+  {
+   "fieldname": "langsmith_section",
+   "fieldtype": "Section Break",
+   "label": "LangSmith"
+  },
+  {
+   "default": "0",
+   "description": "Traces the LangChain calls made by the agent graph.",
+   "fieldname": "enable_langsmith",
+   "fieldtype": "Check",
+   "label": "Enable LangSmith Tracing"
+  },
+  {
+   "depends_on": "enable_langsmith",
+   "description": "API key from smith.langchain.com, starting with lsv2_.",
+   "fieldname": "langsmith_api_key",
+   "fieldtype": "Password",
+   "label": "LangSmith API Key",
+   "mandatory_depends_on": "enable_langsmith"
+  },
+  {
+   "fieldname": "column_break_langsmith",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "Koda",
+   "depends_on": "enable_langsmith",
+   "description": "Traces are grouped under this project name. Created on first trace if absent.",
+   "fieldname": "langsmith_project",
+   "fieldtype": "Data",
+   "label": "LangSmith Project"
+  },
+  {
+   "default": "https://api.smith.langchain.com",
+   "depends_on": "enable_langsmith",
+   "description": "Change only for self-hosted LangSmith.",
+   "fieldname": "langsmith_endpoint",
+   "fieldtype": "Data",
+   "label": "LangSmith Endpoint"
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-08-18 14:41:59.902978",
+ "modified_by": "Administrator",
+ "module": "Ampower Koda",
+ "name": "Agent Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
 }

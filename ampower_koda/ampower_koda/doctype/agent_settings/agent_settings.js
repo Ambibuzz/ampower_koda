@@ -18,42 +18,58 @@ var PROVIDER_MODELS = {
         { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4 — balanced' },
         { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet — proven' },
         { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku — fast, light' }
+    ],
+    'OpenRouter': [
+        { value: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash — fast, cheap' },
+        { value: 'deepseek/deepseek-chat', label: 'DeepSeek Chat — general' },
+        { value: 'anthropic/claude-sonnet-4', label: 'Claude Sonnet 4 — via OpenRouter' },
+        { value: 'openai/gpt-4o-mini', label: 'GPT-4o Mini — via OpenRouter' },
+        { value: 'qwen/qwen-2.5-coder-32b-instruct', label: 'Qwen 2.5 Coder 32B — coding' }
     ]
 };
 
 var DEFAULT_MODELS = {
     'OpenAI': 'gpt-4o-mini',
     'Gemini': 'gemini-2.0-flash',
-    'Claude': 'claude-sonnet-4-20250514'
+    'Claude': 'claude-sonnet-4-20250514',
+    'OpenRouter': 'deepseek/deepseek-v4-flash-0731'
 };
 
 frappe.ui.form.on('Agent Settings', {
     refresh: function(frm) {
-        set_model_options_for_provider(frm);
+        set_model_options_for_provider(frm, false);
     },
 
     default_ai_provider: function(frm) {
+        // The one place a reset is correct: the user changed provider, so a
+        // model belonging to the old one is genuinely no longer valid.
         var provider = frm.doc.default_ai_provider || 'OpenAI';
-        set_model_options_for_provider(frm);
+        set_model_options_for_provider(frm, true);
         frm.set_value('default_ai_model', DEFAULT_MODELS[provider] || DEFAULT_MODELS['OpenAI']);
     },
 
     onload: function(frm) {
-        set_model_options_for_provider(frm);
+        set_model_options_for_provider(frm, false);
     }
 });
 
-function set_model_options_for_provider(frm) {
+
+function set_model_options_for_provider(frm, reset) {
     var provider = frm.doc.default_ai_provider || 'OpenAI';
     var entries = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
     var model_ids = entries.map(function(m) { return m.value; });
-    var options_str = model_ids.join('\n');
+    var current = frm.doc.default_ai_model || '';
 
-    frm.set_df_property('default_ai_model', 'options', options_str);
+    // Keep an unlisted saved model selectable, so the Select can render it
+    // instead of falling back to showing the first option as if it were set.
+    if (!reset && current && model_ids.indexOf(current) === -1) {
+        model_ids = model_ids.concat([current]);
+    }
+
+    frm.set_df_property('default_ai_model', 'options', model_ids.join('\n'));
     frm.refresh_field('default_ai_model');
 
-    var current = frm.doc.default_ai_model || '';
-    if (model_ids.indexOf(current) === -1) {
-        frm.set_value('default_ai_model', model_ids[0]);
+    if (reset && model_ids.indexOf(current) === -1) {
+        frm.set_value('default_ai_model', DEFAULT_MODELS[provider] || model_ids[0]);
     }
 }
