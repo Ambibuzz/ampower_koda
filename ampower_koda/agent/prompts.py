@@ -197,6 +197,37 @@ Before creating DocType, Report, or Page JSON: read an existing artifact of the 
     return render_prompt_safe(template, context, default)
 
 
+def get_understand_system_prompt(app_name: str, request_name: str = None) -> str:
+    """Small, read-only system prompt for the retrieval-backed understand pass.
+
+    The implementation system prompt contains editing, validation, artifact and
+    Frappe workflow rules. None of those rules can be acted on in the read-only
+    phase, yet they used to be re-sent on every discovery round. A request-level
+    System Prompt override is still honoured; only the built-in default is
+    phase-specific.
+    """
+    default = """You are a senior Frappe engineer performing a read-only code investigation.
+
+Find the smallest amount of verified repository evidence needed to plan the user's
+request accurately. Stay inside the requested feature or failure path. Do not survey
+the whole app, propose unrelated improvements, or infer details you have not read.
+
+## Investigation discipline
+- Start from the automatically retrieved working set; do not remap the repository.
+- Prefer search and outline over full-file reads.
+- Read targeted line ranges. Read a whole file only when it is small and all of it matters.
+- Never repeat a tool call with the same arguments. Never re-read an unchanged span.
+- Batch independent lookups in one response when possible.
+- Stop calling tools as soon as the change surface, current behavior, and verification path are clear.
+- Cite evidence as `path:line` and distinguish verified facts from assumptions.
+
+## Target app: {app_name}
+Tool paths are relative to this app's root.
+"""
+    template = get_config_prompt("system_prompt", default, request_name)
+    return render_prompt_safe(template, {"app_name": app_name}, default)
+
+
 
 def get_understand_prompt(user_message: str, request_type: str, request_name: str = None) -> str:
     default = """## USER REQUEST
@@ -204,110 +235,43 @@ def get_understand_prompt(user_message: str, request_type: str, request_name: st
 **Description:**
 {user_message}
 
-## YOUR TASK: Comprehensive Codebase Exploration
+## TASK
 
-Explore based on the **request type** ({request_type}) and description. Match depth to the task — a bug fix needs the failure path, not every DocType in the app.
+Gather only the evidence needed to create an implementation plan for this request.
+Trace the relevant failure path or feature path, identify the files that must change,
+and verify the local pattern the implementation should follow.
 
-### Exploration by request type
+### Tool budget and stopping rule
 
-**Bug Fix** — isolate the failure path first:
-1. `find_files()` + `read_file("hooks.py")`
-2. `search_code` for error text, function names, or fieldnames from the description
-3. Trace: UI/client `.js` → `frappe.call` → Python `@frappe.whitelist` / controller → DB query
-4. Read failing file(s) fully; read ONE similar working example for pattern
+- Use the automatically supplied working set before calling another discovery tool.
+- Prefer `search`, `outline`, `definition`, `symbols`, and `refs` over `read`.
+- Use `read` for the smallest useful span; avoid whole-file reads above 300 lines.
+- Do not call the same tool with the same arguments twice or read overlapping spans
+  unless the first result explicitly says it was incomplete.
+- Batch independent calls. Aim for at most 8 discovery calls total.
+- Stop when you can name the exact change surface and a concrete verification path.
+- Inspect `hooks.py`, schemas, peer artifacts, client/server wiring, or migrations only
+  when the user request makes them relevant.
 
-**Reports & analytics** — use peer reports as templates:
-1. Find a similar Report in the app
-2. Read report `.json`, `.py` (execute), and `.js` (filters) fully
-3. Confirm `ref_doctype`, columns, and filters
+### OUTPUT (maximum 1,000 words; no code blocks)
 
-**DocTypes & data model** — schema first:
-1. `read_doctype_schema` for the target DocType
-2. Read `.json` + controller `.py` + client `.js` together
-3. Note child tables, permissions, and naming rules
+#### 1. Request interpretation and current behavior
+State the scoped goal and the verified flow or root cause.
 
-**Forms & desk UI** — focus on client files:
-1. Read the DocType client `.js` or page `.js` fully
-2. Trace `frappe.call` methods back to Python
-3. Identify UI patterns in similar forms/pages
+#### 2. Evidence
+List at most 8 relevant files. For each, give exact `path:line-range`, the symbol or
+section that matters, and one sentence explaining why. Use very short excerpts only
+when a name cannot be communicated otherwise.
 
-**Server & business logic** — validate server path:
-1. Read controller `.py`, whitelisted methods, and helper modules
-2. Trace validation hooks and DB queries
-3. Check `hooks.py` if events are involved
+#### 3. Change surface
+Name files to modify/create, the behavior each change owns, existing patterns to
+follow, and any assumptions that could not be verified.
 
-**Documents & output** — templates and formats:
-1. Find peer Print Formats or output templates
-2. Read JSON/HTML/Jinja and any helper `.py` scripts
+#### 4. Verification
+List focused tests/checks and any migration, build, or cache step actually required.
 
-**Integrations** — external IO:
-1. Read existing integration modules or API clients
-2. Trace auth, request/response handling, and data mapping
-
-**Platform & maintenance** — infra inside app:
-1. Read `hooks.py`, `patches.txt`, scheduled jobs, and patch files
-2. Trace migrations or background jobs related to the request
-
-**ERPNext-flavored** — extend standard flows:
-1. Identify the ERPNext DocType and the custom override area
-2. Read custom controllers, hooks, or scripts that touch standard flows
-
-### File-type reading rules
-
-**`.py`** — get_file_outline then read_file (chunks if >500 lines). Controllers, report execute(), whitelisted APIs, patches.
-
-**`.js`** — read FULL file for form scripts, report JS, page JS. Watch template literals, frappe.call, frm handlers.
-
-**`.json`** — DocType: `read_doctype_schema`. Report/Page: read_file on the JSON. Never guess fieldnames.
-
-**`.html` / `.css`** — read if UI/page task.
-
-**`hooks.py`** — always read early for any server-side or event-related task.
-
-### Search patterns
-- `frappe.call`, `@frappe.whitelist`, `doc_events`, fieldnames, function names from the request
-- JS-to-Python: every `frappe.call({{ method: '...' }})` → search method in Python
-
-### OUTPUT FORMAT
-
-Produce a detailed analysis with ALL of these sections:
-
-### 1. App Overview
-Brief description of the app's purpose, modules, and architecture.
-
-### 2. Relevant Files — DETAILED Inventory
-For EVERY file relevant to the request:
-- **Path**: exact path
-- **Total lines**: how many lines the file has
-- **Key functions/classes**: list with line numbers
-- **Relevant code sections**: describe the specific sections that matter, with line number ranges
-- **Relevance**: why this file matters
-
-### 3. Current State — What Exists Today
-- Exact description of current functionality
-- How the feature area currently works (step by step)
-- Current UI layout and user interactions
-- Current server endpoints and what they return
-- Current database queries and filters
-
-### 4. Code Patterns & Conventions
-- How are existing similar features implemented? (With specific examples from the codebase)
-- What CSS classes/styles are used?
-- What frappe.call patterns are used?
-- What jQuery patterns are used?
-- How are filters/dropdowns currently implemented elsewhere in this app?
-
-### 5. Impact Analysis
-- Files that MUST be modified (with exact line ranges where changes are needed)
-- Files that MUST be created
-- Server-side changes needed (new API endpoints, modified queries)
-- Client-side changes needed (UI elements, event handlers, data binding)
-- Potential side effects and how to avoid them
-
-### 6. Key Code Excerpts
-Quote the EXACT code sections (with line numbers) that will need to be modified. This is critical — the planner needs to see the real code to write accurate instructions.
-
-**IMPORTANT**: Read MORE rather than less. Read FULL files when in doubt. The #1 cause of bad plans is insufficient exploration. If you haven't read a file that's relevant, read it NOW."""
+Do not include a generic app overview, exhaustive inventory, unrelated conventions,
+or repeated evidence. The planner needs precise conclusions, not a transcript."""
     template = get_config_prompt("understand_prompt", default, request_name)
 
     context = {
@@ -397,6 +361,9 @@ Bullet list of potential issues and how to avoid them.
 - **NO** "update as needed" or "add appropriate logic"
 - **NO** exploration/read-only tasks
 - **NO** open questions or requests for clarification — resolve ambiguity yourself and record it under Assumptions
+
+Keep the complete plan under 1,200 words. Prefer fewer, concrete todos over splitting
+one change into many narrative steps.
 """
     template = get_config_prompt("plan_prompt", default, request_name)
 
@@ -418,18 +385,21 @@ def get_implement_prompt(plan: str, understanding_summary: str, user_message: st
 
 The plan contains **todo descriptions only** — no pre-written code. You must read the codebase, follow each TODO's description and acceptance criteria, and write production-ready code yourself.
 
-## CODEBASE CONTEXT FROM EXPLORATION
+## CONCISE CODEBASE FINDINGS
 {understanding_summary}
 
-## PRE-LOADED FILE CONTENTS (with line numbers)
+## TARGET FILE MANIFEST
 {file_contents}
+
+File bodies are intentionally not duplicated in this prompt. Read each required
+span once with the tools, then keep using the result already present in context.
 
 ## IMPLEMENTATION INSTRUCTIONS
 
 Work through every **TODO** in the approved plan, in the stated execution order.
 
 For each TODO:
-1. **Read** the files listed in the todo (use read_file at the exact line ranges mentioned)
+1. **Read once** — batch independent files and use the smallest line ranges that cover the change
 2. **Verify** anchors match the codebase — re-read if line numbers shifted
 3. **Implement** the described change with replace_lines (preferred) or write_file for new files
 4. **Validate** with validate_code on every .py and .js edit
@@ -444,6 +414,7 @@ For each TODO:
 
 ### CRITICAL RULES
 - **Read → Anchor → Edit → Validate → Verify** for every change
+- Never repeat an unchanged read or search. Re-read only after an edit or an explicit incomplete-result marker.
 - **Implement ALL todos** — don't skip; don't add unplanned files
 - **Match existing app patterns** — copy structure from peer artifacts when creating new ones
 - **NEVER insert code inside JS template literals**
@@ -506,17 +477,20 @@ Your job is to **fix only that issue** with minimal, surgical edits.
 ### FILES CHANGED IN THE PREVIOUS RUN
 {prior_files}
 
-### CURRENT FILE CONTENTS (pre-loaded)
+### CURRENT TARGET FILE MANIFEST
 {file_contents}
+
+File bodies are not pre-loaded. Read the smallest relevant ranges once, then use
+those tool results already present in context.
 
 ## PATCH RULES (CRITICAL)
 1. **Fix the follow-up issue only** — do not rebuild features that already work.
-2. **Do NOT re-implement the full plan** — read the pre-loaded files and patch what is broken.
+2. **Do NOT re-implement the full plan** — read the listed target spans and patch what is broken.
 3. **Minimal diff** — change only the lines needed; no drive-by refactors.
-4. **Read → edit → validate** — read_file first, then replace_lines/insert_lines/edit_file.
+4. **Read once → edit → validate** — batch independent reads and do not repeat unchanged spans.
 5. Run validate_code on every changed .py/.js file.
 6. Do NOT create README, notes, .txt markers, or scratch files.
-7. If the bug is in a file not pre-loaded, read that file first — do not guess.
+7. If the bug is in a file not listed, locate it narrowly and read it before editing — do not guess.
 
 ### FINAL STEP
 End with `SUMMARY OF CHANGES:` — 2–5 sentences on what you fixed for this follow-up only.
@@ -549,7 +523,8 @@ meets Frappe standards. Keep this review brief and focused.
 ### Scope & efficiency rules (keep tokens low)
 - ONLY inspect the files listed above.
 - Prefer `read_file(path, start_line, end_line)` with targeted line ranges.
-- Call `validate_code(path)` for each modified .py/.js file.
+- Syntax validation already runs locally before this stage. Call `validate_code` only
+  if a finding requires a fresh check after additional reasoning or edits.
 - Do NOT explore unrelated files or modules.
 - Limit your output to at most 5 issues.
 
