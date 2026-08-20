@@ -43,6 +43,7 @@
   "error_log",
   "debug_section",
   "pending_bench_commands",
+  "rq_job_id",
   "conversation_log",
   "understanding_snapshot",
   "implementation_snapshot",
@@ -298,6 +299,13 @@
    "read_only": 1
   },
   {
+   "fieldname": "rq_job_id",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "RQ Job ID",
+   "read_only": 1
+  },
+  {
    "fieldname": "conversation_log",
    "fieldtype": "Long Text",
    "label": "Conversation Log",
@@ -379,7 +387,7 @@
   }
  ],
  "links": [],
- "modified": "2026-08-18 14:41:13.251303",
+ "modified": "2026-08-20 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "Ampower Koda",
  "name": "Agent Request",

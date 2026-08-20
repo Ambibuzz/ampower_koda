@@ -10,7 +10,11 @@ import frappe
 from frappe import _
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.executor import _generate_patch_diff, validate_target_app
+from ampower_koda.agent.executor import (
+    _generate_patch_diff,
+    _update_status,
+    validate_target_app,
+)
 from ampower_koda.ampower_koda.doctype.agent_settings.agent_settings import (
     PROVIDER_KEY_FIELDS,
 )
@@ -70,6 +74,41 @@ def _remember_job(request_name: str, job) -> None:
         )
 
 
+def _reconcile_if_dead(doc) -> bool:
+    """Flip a busy request to Failed when its RQ job is no longer running."""
+    if doc.status not in BUSY_STATUSES:
+        return False
+    if not (doc.rq_job_id or "").strip():
+        return False
+
+    try:
+        from rq.job import Job
+        from rq.exceptions import NoSuchJobError
+        from frappe.utils.background_jobs import get_redis_conn
+
+        job = Job.fetch(doc.rq_job_id, connection=get_redis_conn())
+        job_status = job.get_status(refresh=True)
+        if job_status in ("queued", "started", "scheduled", "deferred"):
+            return False
+    except NoSuchJobError:
+        pass
+    except Exception:
+        log_agent_error("Agent Reconcile: could not inspect RQ job", frappe.get_traceback())
+        return False
+
+    _update_status(
+        doc.name, doc.owner or frappe.session.user, "Failed",
+        "Background job was terminated unexpectedly (worker likely killed by "
+        "an OOM condition or a bench/service restart). Please retry.",
+        error_log=(
+            f"Reconciled stale status. Last known status: {doc.status}. "
+            f"RQ job id: {doc.rq_job_id} was not found running."
+        ),
+    )
+    doc.reload()
+    return True
+
+
 def _whitelist_logged(fn):
     """Log unexpected API failures to Frappe Error Log before re-raising."""
     @wraps(fn)
@@ -121,7 +160,9 @@ def start_agent(request_name: str):
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status not in RESTARTABLE_STATUSES:
-        frappe.throw(_("Agent is already busy (status: {0}).").format(doc.status))
+        _reconcile_if_dead(doc)
+        if doc.status not in RESTARTABLE_STATUSES:
+            frappe.throw(_("Agent is already busy (status: {0}).").format(doc.status))
 
     _validate_provider_key(doc)
 
@@ -170,7 +211,9 @@ def submit_follow_up(request_name: str, follow_up_message: str):
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status not in RESTARTABLE_STATUSES:
-        frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
+        _reconcile_if_dead(doc)
+        if doc.status not in RESTARTABLE_STATUSES:
+            frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
     if not (doc.branch_name or "").strip():
         frappe.throw(_("Follow-up fix needs an existing branch on this request."))
 
@@ -542,6 +585,7 @@ def get_agent_status(request_name: str):
     if not request_name:
         frappe.throw(_("Request name is required."))
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    _reconcile_if_dead(doc)
     return {
         "name": doc.name,
         "status": doc.status,
@@ -943,7 +987,9 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         frappe.throw(_("No branch on this request."))
 
     if doc.status in BUSY_STATUSES:
-        frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
+        _reconcile_if_dead(doc)
+        if doc.status in BUSY_STATUSES:
+            frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
     _require_request_branch(doc)
 
