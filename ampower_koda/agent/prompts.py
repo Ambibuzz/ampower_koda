@@ -26,9 +26,10 @@ def render_prompt_safe(template: str, context: dict, default_template: str) -> s
     """
     Render a prompt template using context variables.
     Uses SafeDict so missing placeholders are left as-is rather than raising KeyError.
-    If rendering fails entirely, falls back to the raw template.
+    If the template cannot be rendered at all, falls back to default_template.
     Context keys not present in the template are appended as titled sections.
     """
+    used = template
     try:
         result = template.format_map(SafeDict(context))
     except Exception as e:
@@ -36,10 +37,14 @@ def render_prompt_safe(template: str, context: dict, default_template: str) -> s
             "Prompt Render Error",
             f"{e}\nTemplate preview: {template[:200]}\n{frappe.get_traceback()}",
         )
-        result = template
+        used = default_template
+        try:
+            result = default_template.format_map(SafeDict(context))
+        except Exception:
+            result = default_template
 
     for key, value in context.items():
-        if f"{{{key}}}" not in template and isinstance(value, str) and len(value) < 500:
+        if f"{{{key}}}" not in used and isinstance(value, str) and len(value) < 500:
             result += f"\n\n## {key.upper().replace('_', ' ')}\n{value}"
 
     return result

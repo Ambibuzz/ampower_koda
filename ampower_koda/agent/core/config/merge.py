@@ -16,19 +16,23 @@ def merge_config(
     *overrides: Mapping[str, Any] | None,
     base: CoreConfig | None = None,
 ) -> CoreConfig:
-    """Apply sparse ``overrides`` over ``base``, lowest precedence first."""
+    """Apply sparse ``overrides`` over ``base``, lowest precedence first.
+
+    Returns what ``_apply`` built rather than re-listing the groups. The old
+    rebuild named six of the seven and dropped ``escalation`` on the last line,
+    so a site could set ``escalation.max_rewrites``, have it accepted, validated
+    against its bounds — and then silently receive the default. A hand-written
+    field list here is a second copy of :class:`CoreConfig` that nothing checks,
+    and the next group added would have been dropped the same way.
+
+    ``_apply`` returns ``replace(node, **updates)``, which is a complete config
+    and re-runs ``__post_init__``, so every group is still validated.
+    """
     config = base if base is not None else config_defaults()
     for override in overrides:
         if override:
             config = _apply(config, override, prefix="")
-    return CoreConfig(
-        indexing=config.indexing,
-        context=config.context,
-        history=config.history,
-        models=config.models,
-        retrieval=config.retrieval,
-        security=config.security,
-    )
+    return config
 
 
 def _apply(node: T, override: Mapping[str, Any], *, prefix: str) -> T:
