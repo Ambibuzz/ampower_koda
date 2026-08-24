@@ -101,6 +101,90 @@ def _revert_previous_changes(app_name: str, base_branch: str, request_name: str 
     return ""
 
 
+#: The variables LangChain reads to decide whether, and where, to trace.
+#: ``LANGCHAIN_*`` rather than the newer ``LANGSMITH_*`` spelling: both are
+#: honoured by current releases, and the older pair is the one every installed
+#: version understands.
+LANGSMITH_ENV = {
+    "enabled": "LANGCHAIN_TRACING_V2",
+    "key": "LANGCHAIN_API_KEY",
+    "project": "LANGCHAIN_PROJECT",
+    "endpoint": "LANGCHAIN_ENDPOINT",
+}
+
+
+def _apply_langsmith(settings) -> None:
+    """Turn tracing on or off in this worker, from settings.
+
+    Background jobs do not inherit the web process's environment, so tracing has
+    to be configured per job rather than once at boot.
+
+    Both directions matter. A worker is long-lived and serves many requests, so
+    the variables set for one of them are still set for the next — and tracing
+    left on after it was switched off would keep shipping transcripts to an
+    external service the site believes it has stopped using. Clearing is the half
+    that makes the checkbox mean what it says.
+
+    Never raises: tracing is an observability nicety, and a request that dies
+    because its *tracer* could not be configured has failed for the least
+    important reason available.
+    """
+    try:
+        if not getattr(settings, "enable_langsmith", 0):
+            for variable in LANGSMITH_ENV.values():
+                os.environ.pop(variable, None)
+            return
+
+        api_key = (settings.get_password("langsmith_api_key", raise_exception=False) or "").strip()
+        if not api_key:
+            # Validation blocks this combination on save, but a row written
+            # before the field existed can still reach here. Tracing without a
+            # key silently drops every trace, so say so rather than pretend.
+            for variable in LANGSMITH_ENV.values():
+                os.environ.pop(variable, None)
+            log_agent_error(
+                "Agent LangSmith",
+                "LangSmith tracing is enabled but no API key is set — tracing stays off.",
+            )
+            return
+
+        os.environ[LANGSMITH_ENV["enabled"]] = "true"
+        os.environ[LANGSMITH_ENV["key"]] = api_key
+        os.environ[LANGSMITH_ENV["project"]] = (
+            getattr(settings, "langsmith_project", "") or "Koda"
+        ).strip()
+        os.environ[LANGSMITH_ENV["endpoint"]] = (
+            getattr(settings, "langsmith_endpoint", "") or "https://api.smith.langchain.com"
+        ).strip().rstrip("/")
+    except Exception:
+        log_agent_error("Agent LangSmith", frappe.get_traceback())
+
+
+def validate_target_app(app_name: str) -> str:
+    """Fail on an app that is not on this bench, before anything touches git.
+
+    Without this the first thing to notice is ``get_repo_root``, three frames
+    inside the revert step, and what surfaces is ``ModuleNotFoundError: No
+    module named 'ampower_visualize'`` — which reads like a broken install
+    rather than a typo in a form field, and names nothing the user can act on.
+
+    Checked against ``apps.txt`` rather than the site's *installed* list: an app
+    can be present on the bench and legitimately not installed on this site, and
+    the agent only ever reads and edits files.
+    """
+    app_name = (app_name or "").strip()
+    if not app_name:
+        frappe.throw("Target App Name is required.")
+
+    available = sorted(frappe.get_all_apps(with_internal_apps=False))
+    if app_name not in available:
+        frappe.throw(
+            f"App '{app_name}' is not on this bench. "
+            f"Available apps: {', '.join(available) or '(none)'}."
+        )
+    return app_name
+
+
 def _get_doc_config(request_name: str) -> dict:
     """Load the Agent Request document and return config needed for the graph state."""
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
@@ -115,6 +199,7 @@ def _get_doc_config(request_name: str) -> dict:
         "OpenAI": ("openai_api_key", "OPENAI_API_KEY", "OpenAI API key"),
         "Gemini": ("google_api_key", "GOOGLE_API_KEY", "Google API key"),
         "Claude": ("anthropic_api_key", "ANTHROPIC_API_KEY", "Anthropic API key"),
+        "OpenRouter": ("openrouter_api_key", "OPENROUTER_API_KEY", "OpenRouter API key"),
     }
     cfg = provider_config.get(provider, provider_config["OpenAI"])
     field_name, env_var, label = cfg
@@ -123,10 +208,14 @@ def _get_doc_config(request_name: str) -> dict:
         frappe.throw(f"{label} not set in Agent Settings")
     os.environ[env_var] = api_key.strip()
 
+    _apply_langsmith(settings)
+
     return {
         "doc": doc,
         "user": doc.owner or frappe.session.user,
-        "target_app_name": (doc.target_app_name or "").strip(),
+        # Validated here as well as at the API, because a queued job can be
+        # retried or replayed without passing back through start_agent.
+        "target_app_name": validate_target_app(doc.target_app_name),
         "ai_provider": provider,
         "ai_model": (doc.ai_model or settings.default_ai_model or "gpt-4o-mini").strip(),
         "github_repo_url": (doc.github_repo_url or "").strip(),
@@ -652,6 +741,7 @@ def run_bench_and_commit(request_name: str) -> None:
                 immediate_cmds.append(cmd)
 
         bench_output_parts = []
+        failed_cmds = []
         for cmd in immediate_cmds:
             _publish_bench_log(user, request_name, cmd, True, "Running...")
             try:
@@ -668,9 +758,12 @@ def run_bench_and_commit(request_name: str) -> None:
                 status_str = "OK" if ok else f"FAILED (exit {result.returncode})"
                 bench_output_parts.append(f"$ {cmd}\n{status_str}\n{out.strip()}\n")
                 _publish_bench_log(user, request_name, cmd, ok, out[:180])
+                if not ok:
+                    failed_cmds.append(f"{cmd} (exit {result.returncode})")
             except subprocess.TimeoutExpired:
                 bench_output_parts.append(f"$ {cmd}\nTIMEOUT after 900s\n")
                 _publish_bench_log(user, request_name, cmd, False, "TIMEOUT after 900s")
+                failed_cmds.append(f"{cmd} (timeout)")
                 log_agent_error(
                     "Agent Executor: bench command timeout",
                     f"request={request_name}\ncmd={cmd}",
@@ -678,6 +771,7 @@ def run_bench_and_commit(request_name: str) -> None:
             except Exception as e:
                 bench_output_parts.append(f"$ {cmd}\nERROR: {e}\n")
                 _publish_bench_log(user, request_name, cmd, False, str(e))
+                failed_cmds.append(f"{cmd} ({e})")
                 log_agent_error(
                     "Agent Executor: bench command",
                     f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
@@ -689,10 +783,29 @@ def run_bench_and_commit(request_name: str) -> None:
 
         bench_log = "\n".join(bench_output_parts)
 
+        # `ok` was computed per command, written into the log text, published to
+        # the form — and then dropped. A failing `bench migrate` still arrived
+        # here as "Bench commands done", so the status said the build succeeded
+        # and only the log said otherwise. The pause for human testing is kept
+        # either way: a failed command is exactly when someone should look before
+        # pushing, and marking the request Failed would take that choice away.
+        extra = {"bench_log": bench_log[:50000]}
+        if failed_cmds:
+            message = (
+                f"{len(failed_cmds)} of {len(immediate_cmds)} bench command(s) FAILED on "
+                f"branch '{branch_name}': {', '.join(failed_cmds[:3])}"
+                f"{'…' if len(failed_cmds) > 3 else ''}. "
+                "Check the bench log before approving push."
+            )
+            extra["error_log"] = "\n".join(failed_cmds)
+        else:
+            message = (
+                f"Bench commands done on branch '{branch_name}'. "
+                "Test the changes, then approve push to commit and push."
+            )
+
         _update_status(
-            request_name, user, "Awaiting Push Approval",
-            f"Bench commands done on branch '{branch_name}'. Test the changes, then approve push to commit and push.",
-            bench_log=bench_log[:50000],
+            request_name, user, "Awaiting Push Approval", message, **extra
         )
 
         frappe.db.commit()

@@ -10,7 +10,14 @@ import frappe
 from frappe import _
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.executor import _generate_patch_diff, _update_status
+from ampower_koda.agent.executor import (
+    _generate_patch_diff,
+    _update_status,
+    validate_target_app,
+)
+from ampower_koda.ampower_koda.doctype.agent_settings.agent_settings import (
+    PROVIDER_KEY_FIELDS,
+)
 from ampower_koda.agent.git_ops import (
     branch_exists,
     checkout_base,
@@ -36,29 +43,39 @@ BUSY_STATUSES = (
     "Reviewing", "Building", "Pushing",
 )
 
+# Cap on the request's bench log. Matches the field's own 50k truncation, named
+# here because two endpoints now append to the same field and a cap that only
+# one of them applied would let the other grow past it.
+BENCH_LOG_MAX_CHARS = 50000
 
-def _whitelist_logged(fn):
-    """Log unexpected API failures to Frappe Error Log before re-raising."""
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except (frappe.ValidationError, frappe.PermissionError, frappe.DoesNotExistError):
-            raise
-        except Exception:
-            log_agent_error(f"Agent API: {fn.__name__}")
-            raise
-    return wrapper
+
+def _remember_job(request_name: str, job) -> None:
+    """Record which RQ job is running this request.
+
+    Without it ``cancel_agent_request`` could only relabel the row: the worker
+    kept editing files, running bench commands and pushing branches, and the
+    next ``_update_status`` from that still-running job overwrote "Cancelled"
+    with whatever phase it had reached. The id is the only handle on the worker,
+    and it exists for exactly as long as it takes to write it down.
+
+    Never raises. Losing the handle degrades cancel back to a status change; it
+    must not fail the enqueue that just succeeded.
+    """
+    job_id = getattr(job, "id", None)
+    if not job_id:
+        return
+    try:
+        frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", str(job_id))
+        frappe.db.commit()
+    except Exception:
+        log_agent_error(
+            "Agent API: persist rq_job_id",
+            f"request={request_name}\njob={job_id}\n{frappe.get_traceback()}",
+        )
+
 
 def _reconcile_if_dead(doc) -> bool:
-    """
-    If this request is sitting in a busy status but its background job is no
-    longer actually running (worker was killed — OOM, restart, RQ timeout —
-    causing a "workhorse terminated" failure that never reaches our own
-    try/except), flip it to Failed so the user isn't stuck forever.
-
-    Returns True if the request was reconciled (status changed under us).
-    """
+    """Flip a busy request to Failed when its RQ job is no longer running."""
     if doc.status not in BUSY_STATUSES:
         return False
     if not (doc.rq_job_id or "").strip():
@@ -72,11 +89,10 @@ def _reconcile_if_dead(doc) -> bool:
         job = Job.fetch(doc.rq_job_id, connection=get_redis_conn())
         job_status = job.get_status(refresh=True)
         if job_status in ("queued", "started", "scheduled", "deferred"):
-            return False  # still genuinely running/pending, leave it alone
+            return False
     except NoSuchJobError:
-        pass  # job record is gone entirely — the worker died and RQ lost track of it
+        pass
     except Exception:
-        # Can't reach Redis or inspect the job — don't guess, leave status as-is.
         log_agent_error("Agent Reconcile: could not inspect RQ job", frappe.get_traceback())
         return False
 
@@ -93,20 +109,46 @@ def _reconcile_if_dead(doc) -> bool:
     return True
 
 
+def _whitelist_logged(fn):
+    """Log unexpected API failures to Frappe Error Log before re-raising."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (frappe.ValidationError, frappe.PermissionError, frappe.DoesNotExistError):
+            raise
+        except Exception:
+            log_agent_error(f"Agent API: {fn.__name__}")
+            raise
+    return wrapper
+
+
 def _validate_provider_key(doc):
-    """Ensure the AI provider is enabled and its API key is configured in settings."""
+    """Ensure the AI provider is enabled and its API key is configured in settings.
+
+    The mapping is imported rather than restated. Three copies of it used to
+    exist — here, in the executor, and in the settings controller — and a
+    provider added to the Select but missed in one of them fails as *"OpenAI API
+    key is not set"*, naming a provider the user never chose and sending them to
+    fill in a key they do not need.
+    """
     settings = frappe.get_single("Agent Settings")
     if not settings.enable_ai_agent:
         frappe.throw(_("AI Coding Agent is disabled in Agent Settings."))
+
     provider = (doc.ai_provider or settings.default_ai_provider or "OpenAI").strip()
-    key_checks = {
-        "OpenAI": ("openai_api_key", "OpenAI API key"),
-        "Gemini": ("google_api_key", "Google API key"),
-        "Claude": ("anthropic_api_key", "Anthropic API key"),
-    }
-    field, label = key_checks.get(provider, key_checks["OpenAI"])
+    if provider not in PROVIDER_KEY_FIELDS:
+        frappe.throw(
+            _("Unknown AI provider {0}. Known providers: {1}.").format(
+                provider, ", ".join(PROVIDER_KEY_FIELDS)
+            )
+        )
+
+    field, label = PROVIDER_KEY_FIELDS[provider]
     if not getattr(settings, field, None):
         frappe.throw(_("{0} is not set in Agent Settings.").format(label))
+
+    validate_target_app(doc.target_app_name)
 
 
 @frappe.whitelist()
@@ -118,7 +160,7 @@ def start_agent(request_name: str):
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status not in RESTARTABLE_STATUSES:
-        _reconcile_if_dead(doc)  # self-heal a stuck request before giving up on it
+        _reconcile_if_dead(doc)
         if doc.status not in RESTARTABLE_STATUSES:
             frappe.throw(_("Agent is already busy (status: {0}).").format(doc.status))
 
@@ -137,6 +179,8 @@ def start_agent(request_name: str):
         "follow_up_message": "",
         "follow_up_count": 0,
         "implementation_snapshot": "",
+        "tokens_used": 0,
+        "cost_estimate": 0,
         # files_changed is a JSON column with a json_valid() CHECK constraint —
         # "" is not valid JSON, so clear it with NULL (allowed) instead.
         "files_changed": None,
@@ -149,8 +193,7 @@ def start_agent(request_name: str):
         timeout=1800,
         request_name=request_name,
     )
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
-    frappe.db.commit()
+    _remember_job(request_name, job)
     return {"status": "ok", "message": _("Planning phase started.")}
 
 
@@ -168,7 +211,7 @@ def submit_follow_up(request_name: str, follow_up_message: str):
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
     if doc.status not in RESTARTABLE_STATUSES:
-        _reconcile_if_dead(doc)  # self-heal a stuck request before giving up on it
+        _reconcile_if_dead(doc)
         if doc.status not in RESTARTABLE_STATUSES:
             frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
     if not (doc.branch_name or "").strip():
@@ -191,7 +234,7 @@ def submit_follow_up(request_name: str, follow_up_message: str):
     })
     frappe.db.commit()
 
-    frappe.enqueue(
+    job = frappe.enqueue(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
@@ -199,8 +242,7 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         preserve_branch=1,
         is_follow_up=1,
     )
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
-    frappe.db.commit()
+    _remember_job(request_name, job)
     return {"status": "ok", "message": _("Follow-up patch started on existing branch (plan preserved).")}
 
 
@@ -233,14 +275,13 @@ def execute_existing_plan(request_name: str):
     })
     frappe.db.commit()
 
-    frappe.enqueue(
+    job = frappe.enqueue(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
     )
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
-    frappe.db.commit()
+    _remember_job(request_name, job)
     return {"status": "ok", "message": _("Implementation phase started.")}
 
 
@@ -271,14 +312,13 @@ def approve_plan(request_name: str, edited_plan: str = None):
     })
     frappe.db.commit()
 
-    frappe.enqueue(
+    job = frappe.enqueue(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
     )
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
-    frappe.db.commit()
+    _remember_job(request_name, job)
     return {"status": "ok", "message": _("Plan approved. Starting implementation.")}
 
 
@@ -331,15 +371,13 @@ def approve_bench(request_name: str, commands: str = None):
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Building")
     frappe.db.commit()
 
-    frappe.enqueue(
+    job = frappe.enqueue(
         "ampower_koda.agent.executor.run_bench_and_commit",
         queue="default",
         timeout=1800,
         request_name=request_name,
     )
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
-    frappe.db.commit()
-
+    _remember_job(request_name, job)
 
     cmds = []
     try:
@@ -375,7 +413,7 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
     frappe.db.commit()
 
-    frappe.enqueue(
+    job = frappe.enqueue(
         "ampower_koda.agent.executor.run_deploy_phase",
         queue="default",
         timeout=600,
@@ -383,8 +421,7 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         do_push=bool(push_branch),
         do_pr=bool(create_pr),
     )
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
-    frappe.db.commit()
+    _remember_job(request_name, job)
 
     if push_branch and create_pr:
         msg = _("Pushing branch and creating PR...")
@@ -413,6 +450,13 @@ def checkout_base_branch(request_name: str):
     if not ok:
         frappe.throw(_("Failed to checkout base branch: {0}").format(msg))
 
+    # Persisted, not just broadcast. This discards uncommitted work in the target
+    # app, and a realtime alert is gone on the next reload — which left the one
+    # destructive step in the bench flow as the only one with no record that it
+    # ran. Appended rather than assigned so it survives the bench commands the
+    # form runs straight afterwards, which write the same field.
+    _append_bench_log(request_name, f"$ git checkout {base_branch}\nOK\n{(msg or '').strip()}\n")
+
     frappe.publish_realtime("agent_progress", {
         "request_name": request_name,
         "status": doc.status,
@@ -420,6 +464,20 @@ def checkout_base_branch(request_name: str):
     }, user=doc.owner)
 
     return {"status": "ok", "message": msg}
+
+
+def _append_bench_log(request_name: str, block: str) -> str:
+    """Append a block to the request's bench log and commit it.
+
+    Keeps the tail when the cap is reached: the newest output is the one someone
+    is looking at, and truncating the front loses a run nobody is reading yet.
+    """
+    existing = (frappe.db.get_value(DOCTYPE_NAME, request_name, "bench_log") or "").rstrip()
+    combined = f"{existing}\n\n{block}".strip() if existing else block.strip()
+    combined = combined[-BENCH_LOG_MAX_CHARS:]
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "bench_log", combined)
+    frappe.db.commit()
+    return combined
 
 
 @frappe.whitelist()
@@ -471,6 +529,7 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
     bench_env = _get_bench_env()
 
     output_parts = []
+    failed = []
     for cmd in cmds:
         if not isinstance(cmd, str) or not cmd.strip():
             continue
@@ -486,24 +545,37 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
             out = (result.stdout or "") + (result.stderr or "")
             status_str = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
             output_parts.append(f"$ {cmd}\n{status_str}\n{out.strip()}\n")
+            if result.returncode != 0:
+                failed.append(f"{cmd} (exit {result.returncode})")
         except subprocess.TimeoutExpired:
             output_parts.append(f"$ {cmd}\nTIMEOUT after 900s\n")
+            failed.append(f"{cmd} (timeout)")
             log_agent_error(
                 "Agent API: run_selected_bench_commands timeout",
                 f"request={request_name}\ncmd={cmd}",
             )
         except Exception as e:
             output_parts.append(f"$ {cmd}\nERROR: {e}\n")
+            failed.append(f"{cmd} ({e})")
             log_agent_error(
                 "Agent API: run_selected_bench_commands",
                 f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
             )
 
     bench_log = "\n".join(output_parts)
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "bench_log", bench_log[:50000])
-    frappe.db.commit()
+    # Appended, not assigned. This used to replace the field, so the checkout
+    # that precedes it in the form's own flow was overwritten by the commands it
+    # led to, and a second run erased the first.
+    _append_bench_log(request_name, bench_log)
 
-    return {"status": "ok", "log": bench_log}
+    # "ok" used to mean "the endpoint reached the end", not "the commands
+    # worked" — a failing `bench migrate` returned ok and the form showed a
+    # green alert. The exit codes were already known here and simply not read.
+    return {
+        "status": "ok" if not failed else "error",
+        "failed": failed,
+        "log": bench_log,
+    }
 
 
 @frappe.whitelist()
@@ -513,9 +585,6 @@ def get_agent_status(request_name: str):
     if not request_name:
         frappe.throw(_("Request name is required."))
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    # This method is already polled every 5-10s by the frontend while a
-    # request is busy — piggyback the dead-job check on that existing poll
-    # instead of adding a separate scheduler job.
     _reconcile_if_dead(doc)
     return {
         "name": doc.name,
@@ -918,7 +987,7 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         frappe.throw(_("No branch on this request."))
 
     if doc.status in BUSY_STATUSES:
-        _reconcile_if_dead(doc)  # self-heal a stuck request before giving up on it
+        _reconcile_if_dead(doc)
         if doc.status in BUSY_STATUSES:
             frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
@@ -935,7 +1004,7 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
     frappe.db.commit()
 
-    frappe.enqueue(
+    job = frappe.enqueue(
         "ampower_koda.agent.executor.run_deploy_phase",
         queue="default",
         timeout=600,
@@ -943,8 +1012,7 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         do_push=bool(push_branch),
         do_pr=bool(create_pr),
     )
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", getattr(job, "id", None))
-    frappe.db.commit()
+    _remember_job(request_name, job)
 
     if push_branch and create_pr:
         msg = _("Committing, pushing, and creating PR...")

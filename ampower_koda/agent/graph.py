@@ -3,6 +3,7 @@
 # A local syntax check gates the implement pass; review validates clean code/Frappe
 # standards before bench and deploy run in executor.py.
 
+import json
 import os
 import re as _re
 from datetime import datetime
@@ -15,9 +16,11 @@ from langchain_openai import ChatOpenAI
 
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
+from ampower_koda.agent import koda_core
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.prompts import (
     get_system_prompt,
+    get_understand_system_prompt,
     get_understand_prompt,
     get_plan_prompt,
     get_implement_prompt,
@@ -26,13 +29,16 @@ from ampower_koda.agent.prompts import (
 )
 
 
-MAX_TOOL_ROUNDS_PLANNING = 40
-MAX_TOOL_ROUNDS_EXECUTION = 30
-MAX_TOOL_ROUNDS_REVIEW = 6        # keep review short to limit token usage
-MAX_TOOL_ROUNDS_SYNTAX_FIX = 12   # rounds for a focused "fix the syntax errors" pass
+MAX_TOOL_ROUNDS_EXECUTION = 18
+MAX_TOOL_ROUNDS_REVIEW = 4        # local checks already ran; keep model review surgical
+MAX_TOOL_ROUNDS_SYNTAX_FIX = 6    # focused "fix the syntax errors" pass
 MAX_SYNTAX_FIX_ATTEMPTS = 2       # how many times to re-invoke to fix remaining syntax errors
 MAX_REVIEW_ATTEMPTS = 2           # implement + review retries before failing
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
+REPLAYABLE_TOOLS = {
+    "find_files", "list_directory", "read_file", "search_code",
+    "read_doctype_schema", "get_file_outline", "validate_code",
+}
 
 # Per-phase output stored in conversation_log. High so full phase text is retained
 # (phase outputs are LLM summaries and are naturally well under this in practice).
@@ -40,15 +46,44 @@ MAX_PHASE_OUTPUT_CHARS = 60000
 
 # History trimming: keep recent tool rounds verbatim, compact older ones to text.
 # A "round" is one assistant tool-call message plus all of its tool results.
-KEEP_TOOL_ROUNDS = 8          # recent rounds retained in full
-MIN_KEEP_ROUNDS = 3           # never trim below this many, even under char pressure
-TRIM_CHAR_BUDGET = 100000     # approx history chars before char-based trimming kicks in
-COMPACT_RESULT_PREVIEW = 200  # chars of each tool result kept in the compact summary
+KEEP_TOOL_ROUNDS = 4          # recent rounds retained in full
+MIN_KEEP_ROUNDS = 1           # latest call/result pair must survive into the next request
+TRIM_CHAR_BUDGET = 48000      # includes tool-call arguments, not only result text
+COMPACT_RESULT_PREVIEW = 140  # chars of each tool result kept in the compact summary
+MAX_COMPACTED_HISTORY_CHARS = 12000
+MAX_TASK_PROMPT_CHARS = 60000
+MAX_TOOL_RESULT_CHARS = 8000
+MAX_UNDERSTANDING_CONTEXT_CHARS = 8000
+MODEL_ROUND_OUTPUT_TOKENS = 4096
+MODEL_FINAL_OUTPUT_TOKENS = 2048
 
 # Provider-native prompt caching for the stable system prefix (safe no-op when unsupported).
 ENABLE_PROMPT_CACHE = True
 
 DOCTYPE_NAME = "Agent Request"
+
+# Appended to the understanding prompt. That prompt is configurable per request
+# ("Understand Prompt"), so a site's customized copy still names the old explore
+# tools — and a model told to call find_files() calls it and gets nothing back.
+# Stating the mapping is cheaper than migrating every customized prompt, and it
+# is correct for the ones nobody customized too.
+CORE_TOOL_NOTE = """
+
+## TOOLS AVAILABLE IN THIS PHASE
+`search` (ranked — start here) · `grep` (literal) · `glob` (paths) · `outline`
+(signatures, no bodies — PREFER over read) · `symbols` · `refs` · `definition`
+(pass `path` when a name is shadowed) · `read` (a `path`, or a `symbol` to resolve;
+optional `start`/`end`) · `explore` · `recall` (a ledger id such as L7) ·
+`read_doctype_schema`.
+
+If the instructions above name a different tool, use these instead:
+find_files / list_directory -> glob, search_code -> search, read_file -> read,
+get_file_outline -> outline.
+
+There is no shell and no editing in this phase. Describe the change; do not make it.
+Results you have already seen may be replaced by a pointer like [search "x" -> L14];
+that is not a loss — call `recall` with the id to get the full text back.
+"""
 
 
 def _message_content_to_str(content) -> str:
@@ -124,8 +159,11 @@ def _syntax_check_edits(app_name: str, edits: list[dict]) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# LLM factory — supports OpenAI and Gemini
+# LLM factory — supports OpenAI, OpenRouter, Gemini and Claude
 # ---------------------------------------------------------------------------
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 
 def _openai_uses_responses_api(model: str) -> bool:
     """Codex and newer pro models require OpenAI's /v1/responses endpoint."""
@@ -143,7 +181,20 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
     if provider == "Claude":
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(model=model, temperature=0)
-    if provider not in ("OpenAI", "Gemini", "Claude"):
+    if provider == "OpenRouter":
+        # OpenRouter speaks the OpenAI wire format, so ChatOpenAI drives it — only
+        # the base URL and key differ. `usage.include` asks OpenRouter to return the
+        # real billed cost of each call in the usage block; without it there is no
+        # cost field at all. Never enable the Responses API here: OpenRouter only
+        # implements /v1/chat/completions.
+        return ChatOpenAI(
+            model=model,
+            temperature=0,
+            base_url=OPENROUTER_BASE_URL,
+            api_key=os.environ.get("OPENROUTER_API_KEY") or "",
+            extra_body={"usage": {"include": True}},
+        )
+    if provider not in ("OpenAI", "Gemini", "Claude", "OpenRouter"):
         log_agent_error(
             "Agent LLM Warning",
             f"Unknown AI provider '{provider}', defaulting to OpenAI",
@@ -154,7 +205,30 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
     return ChatOpenAI(**openai_kwargs)
 
 
-def _build_system_message(provider: str, system_prompt: str) -> SystemMessage:
+def _uses_explicit_prompt_cache(provider: str, model: str = "") -> bool:
+    """Whether this route needs Anthropic-style cache breakpoints.
+
+    Model identity matters as well as the direct provider: Claude reached via
+    OpenRouter still needs the same marker.
+    """
+    provider_name = (provider or "").strip().lower()
+    model_name = (model or "").strip().lower()
+    return (
+        provider_name == "claude"
+        or "claude" in model_name
+        or "anthropic/" in model_name
+    )
+
+
+def _cacheable_content(text: str) -> list[dict]:
+    return [{
+        "type": "text",
+        "text": text,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _build_system_message(provider: str, system_prompt: str, model: str = "") -> SystemMessage:
     """Build the system message, adding provider-native prompt caching where supported.
 
     Anthropic supports an explicit `cache_control` breakpoint on the system block,
@@ -163,19 +237,61 @@ def _build_system_message(provider: str, system_prompt: str) -> SystemMessage:
     message is enough there. Gemini/others fall back to a plain system message.
     Caching only reduces cost; it never changes model output.
     """
-    if ENABLE_PROMPT_CACHE and (provider or "").strip() == "Claude":
+    if ENABLE_PROMPT_CACHE and _uses_explicit_prompt_cache(provider, model):
         try:
-            return SystemMessage(content=[{
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }])
+            return SystemMessage(content=_cacheable_content(system_prompt))
         except Exception:
             log_agent_error(
                 "Agent Graph: anthropic cache system message",
                 frappe.get_traceback(),
             )
     return SystemMessage(content=system_prompt)
+
+
+def _build_task_message(provider: str, task_prompt: str, model: str = "") -> HumanMessage:
+    """Cache the stable task body too; it is often much larger than system text."""
+    if ENABLE_PROMPT_CACHE and _uses_explicit_prompt_cache(provider, model):
+        try:
+            return HumanMessage(content=_cacheable_content(task_prompt))
+        except Exception:
+            log_agent_error(
+                "Agent Graph: anthropic cache task message",
+                frappe.get_traceback(),
+            )
+    return HumanMessage(content=task_prompt)
+
+
+def _bounded_text(text: str, limit: int) -> str:
+    """Keep the actionable beginning and instructions at the end of long prompts."""
+    text = text or ""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    marker = f"\n\n... ({len(text) - limit:,} middle characters omitted for context budget) ...\n\n"
+    available = max(0, limit - len(marker))
+    head = int(available * 0.65)
+    tail = available - head
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
+def _tool_call_key(name: str, arguments: dict) -> str:
+    """Stable identity for a replayable call, normalizing omitted defaults."""
+    normalized = {
+        key: value for key, value in (arguments or {}).items()
+        if value not in (None, "", [], {})
+    }
+    if name == "read_file":
+        for key in ("start_line", "end_line"):
+            if normalized.get(key) == 0:
+                normalized.pop(key)
+    return f"{name}\0{json.dumps(normalized, sort_keys=True, separators=(',', ':'), default=repr)}"
+
+
+def _invoke_limited(model, messages: list, max_tokens: int):
+    """Apply an output ceiling where the provider supports a per-call limit."""
+    try:
+        return model.invoke(messages, max_tokens=max_tokens)
+    except TypeError:
+        return model.invoke(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -221,26 +337,19 @@ def _extract_change_summary(text: str) -> str:
     return summary[:4000]
 
 
-def _pre_read_files(app_name: str, paths: list[str], max_files: int = 25) -> str:
-    """Read files by path with line numbers for prompt injection.
-    Large files are read in full — the agent needs complete context to avoid bad edits."""
-    sections = []
-    total_chars = 0
-    max_per_file = 20000
-    max_total = 120000
+def _file_manifest(paths: list[str], max_files: int = 25) -> str:
+    """Name likely files without injecting their bodies into every model round.
 
-    for path in paths[:max_files]:
-        content = agent_tools.read_file(app_name, path)
-        if content.startswith("Error:") or content.startswith("Not a file:"):
-            continue
-        if len(content) > max_per_file:
-            content = content[:max_per_file] + f"\n... (truncated at {max_per_file} chars — call read_file for remaining lines)"
-        total_chars += len(content)
-        if total_chars > max_total:
-            sections.append(f"(skipping remaining files — {max_total} char limit reached, use read_file for more)")
-            break
-        sections.append(f"### FILE: {path}\n```\n{content}\n```")
-    return "\n\n".join(sections) if sections else "(no files pre-loaded)"
+    The old preloader inserted up to 120k characters and the implementation
+    prompt then told the model to call ``read_file`` for those same files. A
+    manifest preserves routing while one targeted tool read supplies the bytes.
+    """
+    unique = list(dict.fromkeys(path for path in paths if path))
+    shown = unique[:max_files]
+    lines = [f"- {path}" for path in shown]
+    if len(unique) > len(shown):
+        lines.append(f"- ... ({len(unique) - len(shown)} additional paths omitted)")
+    return "\n".join(lines) if lines else "(no target files identified yet)"
 
 
 def _log_stage(state: dict, stage: str, status: str, summary: str) -> list:
@@ -432,29 +541,45 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     tool_map = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
 
-    system_msg = _build_system_message(provider, system_prompt)
-    task_msg = HumanMessage(content=task_prompt)
+    model_id = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
+    original_task_chars = len(task_prompt or "")
+    task_prompt = _bounded_text(task_prompt, MAX_TASK_PROMPT_CHARS)
+    if len(task_prompt) < original_task_chars:
+        _publish_agent_log(
+            request_name, "prompt_trim",
+            original_chars=original_task_chars,
+            kept_chars=len(task_prompt),
+        )
+    system_msg = _build_system_message(provider, system_prompt, model_id)
+    task_msg = _build_task_message(provider, task_prompt, model_id)
 
-    rounds: list[dict] = []      # each: {"ai": AIMessage, "tools": [ToolMessage], "summary": [str]}
+    rounds: list[dict] = []      # each: {"number", "ai", "tools", "summary"}
     compacted: list[str] = []    # summary lines for dropped (older) rounds
     injected: list = []          # directive nudges appended after the latest round
     edited_paths: list[str] = []
+    seen_calls: dict[str, int] = {}
+    seen_results: dict[str, int] = {}
     total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
 
     wrote_anything = False
     read_only_streak = 0
     write_nudges = 0
     MAX_WRITE_NUDGES = 3
-    READ_STREAK_LIMIT = 5
+    READ_STREAK_LIMIT = 3
     NUDGE_TEXT = (
         "STOP exploring. You have read enough — the files you need are already "
-        "in context (pre-loaded in the instructions and/or from the reads above). "
+        "identified by the approved plan and the reads above. "
         "Do NOT call read_file, search_code, list_directory, get_file_outline or "
         "read_doctype_schema again unless an edit actually fails. Make the planned "
         "changes NOW: call replace_lines, insert_lines, edit_file or write_file to "
         "apply real edits, then validate_code on each changed .py/.js file. Your "
         "next message MUST include an edit tool call."
     )
+
+    def inject_nudge(text: str) -> None:
+        # The latest directive supersedes an earlier identical one. Accumulating
+        # three copies makes every later request larger without adding a rule.
+        injected[:] = [HumanMessage(content=text)]
 
     def build_messages():
         msgs = [system_msg, task_msg]
@@ -470,8 +595,19 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         msgs.extend(injected)
         return msgs
 
-    def estimate_chars():
-        return sum(len(str(getattr(m, "content", ""))) for r in rounds for m in [r["ai"], *r["tools"]])
+    def message_chars(message) -> int:
+        size = len(str(getattr(message, "content", "")))
+        calls = getattr(message, "tool_calls", None) or []
+        if calls:
+            size += len(json.dumps(calls, sort_keys=True, default=repr))
+        return size
+
+    def estimate_chars() -> int:
+        return sum(message_chars(m) for r in rounds for m in [r["ai"], *r["tools"]])
+
+    def cap_compacted() -> None:
+        while compacted and sum(len(line) + 1 for line in compacted) > MAX_COMPACTED_HISTORY_CHARS:
+            compacted.pop(0)
 
     def maybe_trim():
         trimmed = False
@@ -482,27 +618,45 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             compacted.extend(_compact_round_summary(rounds.pop(0)))
             trimmed = True
         if trimmed:
+            cap_compacted()
             _publish_agent_log(request_name, "history_trim",
                 kept_rounds=len(rounds),
                 compacted_lines=len(compacted),
+                retained_chars=estimate_chars(),
             )
 
-    def account_tokens(response, round_label):
+    def account_tokens(response, round_label, context_chars: int = 0):
         nonlocal total_tokens
         usage = getattr(response, "usage_metadata", None)
         if usage:
             total_tokens += int(usage.get("total_tokens") or 0)
+            details = usage.get("input_token_details") or {}
+            cache_read = int(details.get("cache_read") or 0)
+            cache_write = int(details.get("cache_creation") or 0)
+            uncached_input = max(
+                0, int(usage.get("input_tokens") or 0) - cache_read - cache_write
+            )
             _publish_agent_log(request_name, "token_usage",
                 round=round_label,
                 tokens_this_round=usage.get("total_tokens", 0),
                 tokens_total=total_tokens,
+                input_tokens=uncached_input,
+                output_tokens=usage.get("output_tokens", 0),
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                context_chars=context_chars,
             )
             _persist_token_usage(request_name, total_tokens)
 
     for round_num in range(max_rounds):
         maybe_trim()
-        response = llm_with_tools.invoke(build_messages())
-        account_tokens(response, round_num + 1)
+        messages = build_messages()
+        context_chars = (
+            len(system_prompt) + len(task_prompt) + estimate_chars()
+            + sum(len(line) + 1 for line in compacted)
+        )
+        response = _invoke_limited(llm_with_tools, messages, MODEL_ROUND_OUTPUT_TOKENS)
+        account_tokens(response, round_num + 1, context_chars)
 
         response_text = _llm_response_text(response)
         if response_text:
@@ -516,13 +670,13 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             # without ever editing a file — push it to actually write.
             if require_writes and not wrote_anything and write_nudges < MAX_WRITE_NUDGES:
                 write_nudges += 1
-                injected.append(HumanMessage(content=NUDGE_TEXT))
+                inject_nudge(NUDGE_TEXT)
                 _publish_agent_log(request_name, "write_nudge",
                     round=round_num + 1, attempt=write_nudges, trigger="no_tool_calls")
                 continue
             return response_text, edited_paths, total_tokens
 
-        round_entry = {"ai": response, "tools": [], "summary": []}
+        round_entry = {"number": round_num + 1, "ai": response, "tools": [], "summary": []}
         round_had_write = False
         for tc in response.tool_calls:
             _publish_agent_log(request_name, "tool_call",
@@ -531,12 +685,41 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 round=round_num + 1,
             )
 
-            fn = tool_map.get(tc["name"])
-            if fn:
+            name = tc["name"]
+            arguments = tc.get("args", {})
+            retained_numbers = {entry["number"] for entry in rounds}
+            call_key = _tool_call_key(name, arguments)
+            prior_round = seen_calls.get(call_key) if name in REPLAYABLE_TOOLS else None
+            duplicate_call = prior_round is not None and prior_round in retained_numbers
+
+            fn = tool_map.get(name)
+            if duplicate_call:
+                result = (
+                    f"[{name} with these exact arguments already returned in round "
+                    f"{prior_round}; use that result. Nothing has changed.]"
+                )
+                _publish_agent_log(
+                    request_name, "duplicate_tool_call",
+                    tool_name=name, original_round=prior_round, round=round_num + 1,
+                )
+            elif fn:
                 try:
-                    result = str(fn.invoke(tc["args"]))
-                    if len(result) > 15000:
-                        result = result[:15000] + "\n... (truncated)"
+                    result = str(fn.invoke(arguments))
+                    if name in REPLAYABLE_TOOLS and len(result) >= 400:
+                        result_round = seen_results.get(result)
+                        if result_round is not None and result_round in retained_numbers:
+                            result = (
+                                f"[{name} returned bytes identical to round {result_round}; "
+                                "use the earlier result and move on.]"
+                            )
+                        else:
+                            seen_results[result] = round_num + 1
+                    if len(result) > MAX_TOOL_RESULT_CHARS:
+                        result = (
+                            result[:MAX_TOOL_RESULT_CHARS]
+                            + f"\n... (truncated at {MAX_TOOL_RESULT_CHARS} characters; "
+                              "request a narrower path or line range for anything missing)"
+                        )
                 except Exception as e:
                     log_agent_error(
                         f"Agent Graph: tool {tc['name']}",
@@ -544,28 +727,34 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                     )
                     result = f"Tool error: {e}"
             else:
-                result = f"Unknown tool: {tc['name']}"
+                result = f"Unknown tool: {name}"
 
-            if tc["name"] in WRITE_TOOLS:
+            if name in REPLAYABLE_TOOLS and not duplicate_call:
+                seen_calls[call_key] = round_num + 1
+
+            if name in WRITE_TOOLS:
                 if not result.startswith("Tool error:") and not result.startswith("Error:"):
                     round_had_write = True
                     wrote_anything = True
-                    path_arg = tc.get("args", {}).get("path", "")
+                    # Every cached read/search is stale after a mutation.
+                    seen_calls.clear()
+                    seen_results.clear()
+                    path_arg = arguments.get("path", "")
                     if path_arg and path_arg not in edited_paths:
                         edited_paths.append(path_arg)
 
             _publish_agent_log(request_name, "tool_result",
-                tool_name=tc["name"],
+                tool_name=name,
                 result_preview=result[:500],
                 round=round_num + 1,
             )
             round_entry["tools"].append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
             arg_preview = ", ".join(
-                f"{k}={str(v)[:60]}" for k, v in list(tc.get("args", {}).items())[:3]
+                f"{k}={str(v)[:60]}" for k, v in list(arguments.items())[:3]
             )
             round_entry["summary"].append(
-                f"[r{round_num + 1}] {tc['name']}({arg_preview}) -> {result[:COMPACT_RESULT_PREVIEW]}"
+                f"[r{round_num + 1}] {name}({arg_preview}) -> {result[:COMPACT_RESULT_PREVIEW]}"
             )
 
         rounds.append(round_entry)
@@ -581,13 +770,17 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 and write_nudges < MAX_WRITE_NUDGES):
             write_nudges += 1
             read_only_streak = 0
-            injected.append(HumanMessage(content=NUDGE_TEXT))
+            inject_nudge(NUDGE_TEXT)
             _publish_agent_log(request_name, "write_nudge",
                 round=round_num + 1, attempt=write_nudges, trigger="read_streak")
 
     maybe_trim()
-    final = llm.invoke(build_messages())
-    account_tokens(final, max_rounds + 1)
+    final_context_chars = (
+        len(system_prompt) + len(task_prompt) + estimate_chars()
+        + sum(len(line) + 1 for line in compacted)
+    )
+    final = _invoke_limited(llm, build_messages(), MODEL_FINAL_OUTPUT_TOKENS)
+    account_tokens(final, max_rounds + 1, final_context_chars)
     return _llm_response_text(final), edited_paths, total_tokens
 
 
@@ -647,27 +840,115 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 # ---------------------------------------------------------------------------
 
 def understand_node(state: dict) -> dict:
-    """Explore the codebase with read-only tools to gather context for planning."""
+    """Explore the codebase with the retrieval core and summarize it for planning.
+
+    This is the one node backed by ``agent/core`` rather than by the tool-calling
+    loop the other phases use, and the difference is worth naming because it is
+    the difference between *searching* and *retrieving*.
+
+    The old loop handed the model five read tools and trimmed its history when it
+    got long. This one opens a session — a tree-sitter index of the app, a
+    PageRank'd repo map in the cached prefix, a fused BM25 + graph retriever —
+    then runs one turn against it. Before the model says anything, a retrieval
+    pass has already put the files this request is about in front of it. Every
+    finding goes to an append-only ledger, so an old tool result becomes
+    ``[search "reminders" -> L14]`` instead of being cut; and a turn is
+    summarized into SESSION STATE *before* anything is dropped rather than after.
+
+    Read-only structurally, not by review: the writing tools are in the frozen
+    array (removing them would invalidate the cached prefix) and the host
+    declines every one of them by name.
+    """
     if state.get("error"):
         return {"error": state["error"]}
-    logs = _log_stage(state, "Understanding", "started", "Exploring codebase to understand the request")
-    prompt = get_understand_prompt(
-        state.get("user_message", ""),
-        state.get("request_type", "Improvement"),
-        request_name=state.get("request_name"),
-    )
-    # Read-only tools keep exploration side-effect free.
-    updates = _run_agent_turn(state, "Understanding", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_PLANNING)
-    if updates.get("error"):
-        logs = _log_stage({**state, "stage_log": logs}, "Understanding", "failed", updates["error"][:200])
+
+    logs = _log_stage(state, "Understanding", "started", "Indexing the app and exploring")
+    request_name = state.get("request_name", "")
+    try:
+        app_name = state.get("target_app_name", "")
+        provider = state.get("ai_provider", "OpenAI")
+        spent = int(state.get("tokens_used") or 0)
+
+        llm = _get_llm(provider=provider, model=state.get("ai_model", "gpt-4o-mini"))
+        # A planning run is explicitly from scratch. The process-local core cache is
+        # useful for multi-turn chat, but this graph has one understanding turn; if
+        # the same request is restarted, reusing that entry imports the old run's
+        # transcript and tool results into a supposedly fresh request.
+        koda_core.forget_session(request_name)
+        try:
+            result = koda_core.understand(
+                question=(
+                    get_understand_prompt(
+                        state.get("user_message", ""),
+                        state.get("request_type", "Improvement"),
+                        request_name=request_name,
+                    )
+                    + CORE_TOOL_NOTE
+                ),
+                app_name=app_name,
+                llm=llm,
+                provider=provider,
+                request_name=request_name,
+                system_prompt=get_understand_system_prompt(
+                    app_name or "target_app", request_name=request_name
+                ),
+                retrieval_query=state.get("user_message", ""),
+                utility_llm=llm,
+                spent=spent,
+            )
+        finally:
+            koda_core.forget_session(request_name)
+
+        steps = list(state.get("intermediate_steps") or []) + [
+            {"phase": "Understanding", "output": result.summary[:MAX_PHASE_OUTPUT_CHARS]}
+        ]
+        updates = {
+            "current_stage": "Understanding",
+            "intermediate_steps": steps,
+            "tokens_used": result.tokens,
+            "understanding_summary": result.summary,
+            "explored_paths": list(result.explored_paths),
+        }
+
+        if not result.ok:
+            # Fail here rather than letting the plan node discover an empty summary,
+            # and name the stop reason while doing it: `why` reports the rounds
+            # ceiling, a late tool call or the provider error, where this used to
+            # report only "produced no output" and send someone to look at nothing.
+            #
+            # And the summary is cleared. `result.summary` on a failed turn is the
+            # error rendered as prose - "[the model call failed: 429]" - and leaving
+            # that in the field the plan phase reads is how an outage becomes a plan.
+            updates["understanding_summary"] = ""
+            updates["error"] = result.why
+            logs = _log_stage({**state, "stage_log": logs}, "Understanding", "failed",
+                              updates["error"][:200])
+            updates["stage_log"] = logs
+            return updates
+
+        summary = (
+            f"{result.summary}\n\n"
+            f"[explored {len(result.explored_paths)} file(s) over {result.rounds} round(s)]"
+        )
+        updates["understanding_summary"] = summary
+        logs = _log_stage({**state, "stage_log": logs}, "Understanding", "completed",
+                          result.summary[:200])
         updates["stage_log"] = logs
         return updates
-    steps = updates.get("intermediate_steps") or []
-    summary = _message_content_to_str(steps[-1].get("output", "") if steps else "")
-    updates["understanding_summary"] = summary
-    logs = _log_stage({**state, "stage_log": logs}, "Understanding", "completed", summary[:200])
-    updates["stage_log"] = logs
-    return updates
+    except Exception as e:
+        log_agent_error(
+            "Agent Graph: Understanding",
+            f"request={request_name}\n{e}\n{frappe.get_traceback()}",
+        )
+        logs = _log_stage({**state, "stage_log": logs}, "Understanding", "failed",
+                          str(e)[:200])
+        return {
+            "current_stage": "Understanding",
+            "intermediate_steps": list(state.get("intermediate_steps") or [])
+            + [{"phase": "Understanding", "output": f"Error: {e}"}],
+            "error": str(e),
+            "stage_log": logs,
+        }
 
 
 def plan_node(state: dict) -> dict:
@@ -697,10 +978,10 @@ def plan_node(state: dict) -> dict:
         _publish_agent_log(request_name, "llm_response",
             preview="Generating todo-based plan from codebase analysis...", round=1)
 
-        response = llm.invoke([
-            _build_system_message(provider, system_prompt),
+        response = _invoke_limited(llm, [
+            _build_system_message(provider, system_prompt, model),
             HumanMessage(content=plan_prompt),
-        ])
+        ], MODEL_ROUND_OUTPUT_TOKENS)
         plan = _llm_response_text(response)
 
         total_tokens = state.get("tokens_used", 0)
@@ -778,16 +1059,16 @@ def implement_node(state: dict) -> dict:
         prior_paths = list(state.get("prior_changed_paths") or [])
         implementation_memory = _message_content_to_str(state.get("implementation_memory", ""))
         context_paths = list(dict.fromkeys(prior_paths + _extract_file_paths(follow_up_message)))
-        file_contents = _pre_read_files(app_name, context_paths)
+        file_contents = _file_manifest(context_paths)
         prior_files = "\n".join(f"- {p}" for p in context_paths) if context_paths else "- (none recorded)"
         logs = _log_stage(
             {**state, "stage_log": logs}, "Implementing", "progress",
-            f"Follow-up context: {len(context_paths)} files loaded"
+            f"Follow-up context: {len(context_paths)} target files identified"
         )
         base_prompt = get_follow_up_implement_prompt(
             follow_up_message,
             plan_text,
-            implementation_memory,
+            _bounded_text(implementation_memory, MAX_UNDERSTANDING_CONTEXT_CHARS),
             prior_files,
             file_contents,
             request_name=state.get("request_name"),
@@ -795,14 +1076,14 @@ def implement_node(state: dict) -> dict:
     else:
         all_text = plan_text + "\n" + understanding_text
         file_paths = _extract_file_paths(all_text)
-        file_contents = _pre_read_files(app_name, file_paths)
+        file_contents = _file_manifest(file_paths)
         logs = _log_stage(
             {**state, "stage_log": logs}, "Implementing", "progress",
-            f"Pre-loaded {len(file_paths)} files: {', '.join(file_paths[:5])}"
+            f"Identified {len(file_paths)} target files: {', '.join(file_paths[:5])}"
         )
         base_prompt = get_implement_prompt(
             plan_text,
-            understanding_text,
+            _bounded_text(understanding_text, MAX_UNDERSTANDING_CONTEXT_CHARS),
             state.get("user_message", ""),
             file_contents,
             request_name=state.get("request_name"),

@@ -18,13 +18,21 @@ var PROVIDER_MODELS = {
         { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4: balanced' },
         { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet: proven' },
         { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku: fast, light' }
+    ],
+    'OpenRouter': [
+        { value: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash: fast, cheap' },
+        { value: 'deepseek/deepseek-chat', label: 'DeepSeek Chat: general' },
+        { value: 'anthropic/claude-sonnet-4', label: 'Claude Sonnet 4: via OpenRouter' },
+        { value: 'openai/gpt-4o-mini', label: 'GPT-4o Mini: via OpenRouter' },
+        { value: 'qwen/qwen-2.5-coder-32b-instruct', label: 'Qwen 2.5 Coder 32B: coding' }
     ]
 };
 
 var DEFAULT_MODELS = {
     'OpenAI': 'gpt-4o-mini',
     'Gemini': 'gemini-2.0-flash',
-    'Claude': 'claude-sonnet-4-20250514'
+    'Claude': 'claude-sonnet-4-20250514',
+    'OpenRouter': 'deepseek/deepseek-v4-flash-0731'
 };
 
 var REQUEST_TYPE_HELP = {
@@ -68,7 +76,7 @@ frappe.ui.form.on('Agent Request', {
         setup_realtime_listeners(frm);
         setup_status_polling(frm);
         setup_live_log_panel(frm);
-        set_model_options_for_provider(frm);
+        set_model_options_for_provider(frm, false);
         update_request_type_help(frm);
         toggle_config_readonly(frm);
         style_form(frm);
@@ -79,8 +87,10 @@ frappe.ui.form.on('Agent Request', {
     },
 
     ai_provider: function (frm) {
+        // The one place a reset is correct: the user changed provider, so a
+        // model belonging to the old one is genuinely no longer valid.
         var provider = frm.doc.ai_provider || 'OpenAI';
-        set_model_options_for_provider(frm);
+        set_model_options_for_provider(frm, true);
         frm.set_value('ai_model', DEFAULT_MODELS[provider] || DEFAULT_MODELS['OpenAI']);
     },
 
@@ -93,7 +103,7 @@ frappe.ui.form.on('Agent Request', {
     onload: function (frm) {
         if (frm.is_new()) {
             load_user_defaults(frm);
-            set_model_options_for_provider(frm);
+            set_model_options_for_provider(frm, false);
         }
         update_request_type_help(frm);
     }
@@ -396,18 +406,24 @@ function style_form(frm) {
 // Model dropdown: filter options by selected provider
 // ---------------------------------------------------------------------------
 
-function set_model_options_for_provider(frm) {
+// `reset` is passed only when the user actually picked a different provider.
+// On load and refresh it is false: a saved request's model is part of the record
+// of how that request was run, and rewriting it on open would edit history.
+function set_model_options_for_provider(frm, reset) {
     var provider = frm.doc.ai_provider || 'OpenAI';
     var entries = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
     var model_ids = entries.map(function (m) { return m.value; });
-    var options_str = model_ids.join('\n');
+    var current = frm.doc.ai_model || '';
 
-    frm.set_df_property('ai_model', 'options', options_str);
+    if (!reset && current && model_ids.indexOf(current) === -1) {
+        model_ids = model_ids.concat([current]);
+    }
+
+    frm.set_df_property('ai_model', 'options', model_ids.join('\n'));
     frm.refresh_field('ai_model');
 
-    var current = frm.doc.ai_model || '';
-    if (model_ids.indexOf(current) === -1) {
-        frm.set_value('ai_model', model_ids[0]);
+    if (reset && model_ids.indexOf(current) === -1) {
+        frm.set_value('ai_model', DEFAULT_MODELS[provider] || model_ids[0]);
     }
 
     var desc = entries.map(function (m) {
@@ -879,17 +895,31 @@ function show_post_checkout_bench_dialog(frm) {
                         freeze: true,
                         freeze_message: __('Running bench commands...'),
                         callback: function (r2) {
-                            if (r2.message && r2.message.status === 'ok') {
-                                frappe.msgprint({
-                                    title: __('Bench Commands Output'),
-                                    message: '<pre style="max-height:400px;overflow:auto;font-size:12px;white-space:pre-wrap;">'
-                                        + frappe.utils.escape_html(r2.message.log || '(no output)')
-                                        + '</pre>',
-                                    indicator: 'green',
-                                    wide: true
-                                });
-                                frm.reload_doc();
-                            }
+                            if (!r2.message) { return; }
+                            // The output is shown whether or not the commands
+                            // worked. This used to render only on status 'ok',
+                            // so a run that failed showed nothing at all — the
+                            // one case where the log is worth reading.
+                            var failed = r2.message.failed || [];
+                            var header = failed.length
+                                ? '<p style="margin-bottom:8px;"><b>'
+                                    + __('{0} command(s) failed:', [failed.length])
+                                    + '</b><br>'
+                                    + frappe.utils.escape_html(failed.join('\n')).replace(/\n/g, '<br>')
+                                    + '</p>'
+                                : '';
+                            frappe.msgprint({
+                                title: failed.length
+                                    ? __('Bench Commands Failed')
+                                    : __('Bench Commands Output'),
+                                message: header
+                                    + '<pre style="max-height:400px;overflow:auto;font-size:12px;white-space:pre-wrap;">'
+                                    + frappe.utils.escape_html(r2.message.log || '(no output)')
+                                    + '</pre>',
+                                indicator: failed.length ? 'red' : 'green',
+                                wide: true
+                            });
+                            frm.reload_doc();
                         }
                     });
                 },
@@ -1075,6 +1105,26 @@ function append_log_entry(frm, data) {
             + ts + '\u2500 ' + frappe.utils.escape_html(data.tool_name || '') + ': '
             + '<span style="color:var(--text-light);">' + frappe.utils.escape_html(preview) + '</span>'
             + '</div>';
+    } else if (data.type === 'token_usage') {
+        var input_tokens = Number(data.input_tokens || 0);
+        var cached_tokens = Number(data.cache_read_tokens || 0);
+        var output_tokens = Number(data.output_tokens || 0);
+        var context_tokens = data.context_chars ? Math.ceil(Number(data.context_chars) / 3.6) : 0;
+        var pieces = [];
+        if (input_tokens) pieces.push('input ' + input_tokens.toLocaleString());
+        if (cached_tokens) pieces.push('cached ' + cached_tokens.toLocaleString());
+        if (output_tokens) pieces.push('output ' + output_tokens.toLocaleString());
+        if (context_tokens) pieces.push('context ~' + context_tokens.toLocaleString());
+        html = '<div style="color:var(--text-muted);margin-bottom:3px;padding-left:14px;">'
+            + ts + '\u25C7 round ' + frappe.utils.escape_html(String(data.round || '?'))
+            + ': ' + frappe.utils.escape_html(pieces.join(' \u00B7 ') || String(data.tokens_this_round || 0) + ' tokens')
+            + ' <b>(total ' + Number(data.tokens_total || 0).toLocaleString() + ')</b>'
+            + '</div>';
+    } else if (data.type === 'duplicate_tool_call') {
+        html = '<div style="color:var(--orange-500);margin-bottom:3px;padding-left:14px;">'
+            + ts + '\u21B7 skipped duplicate ' + frappe.utils.escape_html(data.tool_name || '')
+            + ' (already in round ' + frappe.utils.escape_html(String(data.original_round || '?')) + ')'
+            + '</div>';
     } else if (data.type === 'llm_response') {
         var preview = (data.preview || '').substring(0, 250);
         html = '<div style="color:var(--orange-500);margin-bottom:5px;">'
@@ -1146,7 +1196,7 @@ function load_user_defaults(frm) {
     });
 
     setTimeout(function () {
-        set_model_options_for_provider(frm);
+        set_model_options_for_provider(frm, false);
         var saved_model = stored['ai_agent_ai_model'];
         if (saved_model && !frm.doc.ai_model) {
             frm.set_value('ai_model', saved_model);

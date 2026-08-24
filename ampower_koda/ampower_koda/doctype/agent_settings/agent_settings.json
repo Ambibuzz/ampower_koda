@@ -16,7 +16,16 @@
         "gemini_section",
         "google_api_key",
         "claude_section",
-        "anthropic_api_key"
+        "anthropic_api_key",
+        "openrouter_section",
+        "openrouter_api_key",
+        "tracing_tab",
+        "langsmith_section",
+        "enable_langsmith",
+        "langsmith_api_key",
+        "column_break_langsmith",
+        "langsmith_project",
+        "langsmith_endpoint"
     ],
     "fields": [
         {
@@ -45,7 +54,7 @@
             "fieldname": "default_ai_provider",
             "fieldtype": "Select",
             "label": "AI Provider",
-            "options": "OpenAI\nGemini\nClaude",
+            "options": "OpenAI\nGemini\nClaude\nOpenRouter",
             "default": "OpenAI",
             "reqd": 0
         },
@@ -55,10 +64,10 @@
         },
         {
             "fieldname": "default_ai_model",
-            "fieldtype": "Select",
+            "fieldtype": "Autocomplete",
             "label": "AI Model",
             "default": "gpt-4o-mini",
-            "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022",
+            "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022\ndeepseek/deepseek-v4-flash-0731\ndeepseek/deepseek-chat\nanthropic/claude-sonnet-4\nopenai/gpt-4o-mini\nqwen/qwen-2.5-coder-32b-instruct",
             "description": "Default model for new requests. Changes with provider selection."
         },
         {
@@ -104,11 +113,71 @@
             "label": "Anthropic API Key",
             "description": "API key from Anthropic console",
             "mandatory_depends_on": "eval:doc.default_ai_provider === 'Claude'"
+        },
+        {
+            "fieldname": "openrouter_section",
+            "fieldtype": "Section Break",
+            "label": "OpenRouter",
+            "depends_on": "enable_ai_agent",
+            "collapsible": 1,
+            "collapsible_depends_on": "eval:doc.default_ai_provider !== 'OpenRouter'"
+        },
+        {
+            "fieldname": "openrouter_api_key",
+            "fieldtype": "Password",
+            "label": "OpenRouter API Key",
+            "description": "API key from openrouter.ai. Models are namespaced, e.g. deepseek/deepseek-chat.",
+            "mandatory_depends_on": "eval:doc.default_ai_provider === 'OpenRouter'"
+        },
+        {
+            "fieldname": "tracing_tab",
+            "fieldtype": "Tab Break",
+            "label": "Tracing"
+        },
+        {
+            "fieldname": "langsmith_section",
+            "fieldtype": "Section Break",
+            "label": "LangSmith"
+        },
+        {
+            "fieldname": "enable_langsmith",
+            "fieldtype": "Check",
+            "label": "Enable LangSmith Tracing",
+            "default": "0",
+            "description": "Traces the LangChain calls made by the agent graph."
+        },
+        {
+            "fieldname": "langsmith_api_key",
+            "fieldtype": "Password",
+            "label": "LangSmith API Key",
+            "depends_on": "enable_langsmith",
+            "description": "API key from smith.langchain.com, starting with lsv2_.",
+            "mandatory_depends_on": "enable_langsmith"
+        },
+        {
+            "fieldname": "column_break_langsmith",
+            "fieldtype": "Column Break"
+        },
+        {
+            "fieldname": "langsmith_project",
+            "fieldtype": "Data",
+            "label": "LangSmith Project",
+            "depends_on": "enable_langsmith",
+            "default": "Koda",
+            "description": "Traces are grouped under this project name. Created on first trace if absent."
+        },
+        {
+            "fieldname": "langsmith_endpoint",
+            "fieldtype": "Data",
+            "label": "LangSmith Endpoint",
+            "depends_on": "enable_langsmith",
+            "default": "https://api.smith.langchain.com",
+            "description": "Change only for self-hosted LangSmith."
         }
     ],
     "issingle": 1,
     "links": [],
-    "modified": "2026-03-31 20:30:00.000000",
+    "modified": "2026-08-24 10:00:00.000000",
     "modified_by": "Administrator",
     "module": "Ampower Koda",
     "name": "Agent Settings",
@@ -128,5 +197,6 @@
     "sort_field": "modified",
     "sort_order": "DESC",
     "states": [],
-    "track_changes": 1
+    "track_changes": 1,
+    "row_format": "Dynamic"
 }
