@@ -542,11 +542,13 @@ meets Frappe standards. Keep this review brief and focused.
 6. **Style** — consistent naming, no dead code, no unused imports.
 
 ### Verdict format (REQUIRED)
-- All good: `REVIEW_PASSED=yes`
-- Issues found: `REVIEW_PASSED=no` then list each issue:
-  - File: path — Issue: ... — Fix: ...
+Output ONLY a single JSON object, nothing before or after it:
+{{"review_passed": true, "issues": []}}
 
-After reading the files, output the verdict immediately.
+If issues were found:
+{{"review_passed": false, "issues": ["File: path — Issue: ... — Fix: ...", "..."]}}
+
+After reading the files, output the verdict JSON immediately — no prose before or after it.
 """
     template = get_config_prompt("review_prompt", default, request_name)
     context = {
