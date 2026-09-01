@@ -292,83 +292,41 @@ def get_plan_prompt(understanding_summary: str, user_message: str = "", request_
     default = """{user_section}## CODEBASE ANALYSIS
 {understanding_summary}
 
-## YOUR TASK: Create an Implementation Plan (Todos Only — No Code)
+## YOUR TASK: Create an Implementation Plan
 
-You are writing a **review plan** for a human to approve before any code is written.
-An implementation agent will execute this plan **after approval** — it will read files and write code then.
-Your job now is to describe **what** must be done, not **how** in source code.
+Create the complete review plan that a human approves before implementation.
+Your response is constrained to the plan schema by the provider. Populate every
+field; do not write code, pseudocode, or prose outside the structured response.
 
-**CRITICAL: Do NOT call any tools. Do NOT write code, pseudocode, or JSON/Python/JS snippets in this plan.**
+### Planning principles
+1. **Tasks, not code** — each task needs a complete description and measurable
+   acceptance criteria.
+2. **State assumptions, don't block** — if scope, behaviour, field names or UX
+   are unclear, make the most reasonable evidence-based choice and record it in
+   `assumptions`.
+3. **Ground in the analysis** — use exact paths and line ranges from the
+   codebase analysis.
+4. **Minimal scope** — only what this request needs. No drive-by refactors.
+5. **Exploration is done** — no read/inspect/investigate tasks.
 
-### Planning principles (Cursor / Antigravity style)
-1. **Todos, not code** — each item is a clear task with a detailed description and acceptance criteria.
-2. **State assumptions, don't block** — if scope, behavior, field names, or UX are unclear, make the most reasonable choice grounded in the codebase analysis and record it under **Assumptions**. Do not stop to ask the user.
-3. **Ground in analysis** — reference exact file paths and line ranges from the codebase analysis. Quote short excerpts (1–3 lines) only for context, never full replacements.
-4. **Minimal scope** — only tasks required for this request type. No drive-by refactors.
-5. **Exploration is done** — do not add read/inspect/explore tasks.
+### Task fields
+- Use sequential ids: `TODO 1`, `TODO 2`, and so on.
+- `title` is a short action phrase; `goal` is one sentence of outcome.
+- `description` is the complete implementation brief: what changes, where, why,
+  and which existing pattern to follow. Do not include source code.
+- `action` is `MODIFY` or `CREATE`. Every file in one task must use that action;
+  split a task when existing and new files are both involved.
+- `files` contains app-relative owned paths.
+- `context_refs` contains only the code spans needed to implement the task, at
+  most 6. Use `start: 0` and `end: 0` for a whole-file reference. Always provide
+  `symbol` and `why`; either may be an empty string, but not both.
+- `acceptance_criteria` contains observable, checkable outcomes.
+- `depends_on` contains earlier task ids. Tasks sharing a file must declare an
+  ordering dependency.
 
-### Plan Format (use these exact section headings)
-
----
-
-## Overview
-2–4 sentences: goal, approach, and which areas of the app are affected.
-
-## Scope
-**In scope:** bullet list of what this plan covers
-**Out of scope:** bullet list of what is explicitly NOT included (prevents scope creep)
-
-## Assumptions
-List the assumptions and decisions you are making based on the codebase analysis
-(including any ambiguity you resolved on the user's behalf).
-If you have none, write exactly: `None — all requirements verified from codebase analysis.`
-
-## Implementation Todos
-
-Each todo is one logical unit of work. Use this structure for every todo:
-
-### TODO 1: [Short action title]
-**Goal:** One sentence outcome.
-**Description:** Detailed instructions for the implementer — what to change, where, and why. Reference file paths and line ranges from the analysis. Describe behavior and patterns to follow (e.g. "match the peer report at …"). Do NOT paste code.
-**Files:** `path/one.ext`, `path/two.ext`
-**Action:** MODIFY | CREATE | DELETE
-**Acceptance criteria:**
-- [ ] Measurable check 1
-- [ ] Measurable check 2
-**Dependencies:** TODO N (or None)
-
----
-
-(Repeat for every todo — typically 2–8 todos depending on request size)
-
-## Execution Order
-Numbered list explaining why todos run in this sequence and any dependencies.
-
-## Bench Commands
-- **migrate:** yes/no — reason (schema JSON changed?)
-- **build:** yes/no — reason (JS/CSS/public assets changed?)
-- **clear-cache:** yes/no — reason
-
-## Testing Checklist
-- [ ] Request scope satisfied — no extra files or features
-- [ ] Syntax valid (.py, .js, .json as applicable)
-- [ ] Server–client wiring correct if APIs involved
-- [ ] Bench steps listed match actual changes
-
-## Risks & Mitigations
-Bullet list of potential issues and how to avoid them.
-
----
-
-### FORBIDDEN in this plan
-- **NO** "New code to write" or code blocks with implementation
-- **NO** pseudocode or partial functions
-- **NO** "update as needed" or "add appropriate logic"
-- **NO** exploration/read-only tasks
-- **NO** open questions or requests for clarification — resolve ambiguity yourself and record it under Assumptions
-
-Keep the complete plan under 1,200 words. Prefer fewer, concrete todos over splitting
-one change into many narrative steps.
+Typically use 2–8 tasks and never more than 12. For a new file, reference an
+existing peer file that supplies the pattern. Resolve ambiguity in `assumptions`;
+do not ask questions or add exploration tasks.
 """
     template = get_config_prompt("plan_prompt", default, request_name)
 
