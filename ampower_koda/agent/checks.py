@@ -21,7 +21,7 @@ import subprocess
 import frappe
 
 from ampower_koda.agent.tools import _resolve_path, validate_code
-from ampower_koda.agent.git_ops import diff_file
+from ampower_koda.agent.git_ops import diff_file_working_tree
 
 REQUIRED_DOCTYPE_KEYS = ("doctype", "name", "module")
 REQUIRED_REPORT_KEYS = ("doctype", "report_name", "ref_doctype")
@@ -308,24 +308,20 @@ class ReviewDecision:
 def needs_llm_review(app_name: str, base_branch: str, branch_name: str, edits: list[dict]) -> ReviewDecision:
     """Decide whether mechanical checks passing is enough, or an LLM should
     still look at this change.
-
-    Only ``.py`` edits are considered for size/risk — pure JSON/JS-only
-    changes are already fully covered by the mechanical checks (JSON
-    validity + the wiring check), so they never need this at all.
+    
     """
     py_paths = [e.get("path", "") for e in (edits or []) if (e.get("path") or "").endswith(".py")]
     if not py_paths:
         return ReviewDecision(False, "no Python changes — mechanical checks cover this fully")
 
-    if not branch_name:
-        # No branch to diff against yet (e.g. edits not committed) — cannot
-        # measure size/risk safely, so fail toward the LLM rather than
-        # silently skipping a change we couldn't actually inspect.
-        return ReviewDecision(True, "no branch available to diff — cannot assess size/risk")
+    if not base_branch:
+        # No base to diff against — cannot measure size/risk safely, so
+        # fail toward the LLM rather than silently assuming the change is safe.
+        return ReviewDecision(True, "no base branch available to diff — cannot assess size/risk")
 
     total_changed_lines = 0
     for path in py_paths:
-        ok, diff_text = diff_file(app_name, base_branch, branch_name, path)
+        ok, diff_text = diff_file_working_tree(app_name, base_branch, path)
         if not ok:
             # Can't get a diff for this file — same reasoning as above,
             # don't guess that it's safe.
