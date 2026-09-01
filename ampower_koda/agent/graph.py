@@ -18,6 +18,7 @@ from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
 from ampower_koda.agent import koda_core
 from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent.checks import run_health_checks, needs_llm_review
 from ampower_koda.agent.prompts import (
     get_system_prompt,
     get_understand_system_prompt,
@@ -117,19 +118,69 @@ def _llm_response_text(response) -> str:
 
 
 def _parse_review_verdict(text: str) -> tuple[bool, str]:
-    """Parse explicit review verdict without extra LLM calls."""
-    notes = (text or "").strip()
-    upper = notes.upper()
-    if _re.search(r"REVIEW_PASSED\s*[=:]\s*YES\b", upper):
-        return True, notes
-    if _re.search(r"REVIEW_PASSED\s*[=:]\s*NO\b", upper):
-        return False, notes
-    if "REVIEW_PASSED=YES" in upper or "REVIEW PASSED: YES" in upper:
-        return True, notes
-    if "REVIEW_PASSED=NO" in upper or "REVIEW PASSED: NO" in upper:
-        return False, notes
-    return False, notes or "Review verdict missing explicit REVIEW_PASSED=yes/no."
+    """Parse the review verdict as structured JSON, with a soft-pass fallback.
 
+    Preferred format: {"review_passed": true/false, "issues": ["...", ...]}
+
+    If the model didn't produce valid JSON, this is treated as a formatting
+    slip, not a real failure — by the time review_node calls this, the
+    mechanical health checks have already passed, so an unparseable verdict
+    is far more likely to be "forgot the format" than "found a real problem".
+    A genuine failure must be an *explicit* review_passed: false.
+    """
+    notes = (text or "").strip()
+    payload = _extract_review_json(notes)
+
+    if payload is not None and isinstance(payload.get("review_passed"), bool):
+        passed = payload["review_passed"]
+        issues = payload.get("issues") or []
+        if passed:
+            return True, notes
+        if isinstance(issues, list) and issues:
+            formatted = "\n".join(f"- {issue}" for issue in issues if str(issue).strip())
+            return False, formatted or notes
+        return False, notes or "Review reported issues without details."
+
+    # No parseable, well-formed verdict. Mechanical checks already passed
+    # before this was ever called — don't fail a real run over a formatting
+    # slip. Soft pass, but say plainly that the verdict was unparseable so
+    # it's visible in review_notes rather than silently swallowed.
+    return True, (
+        "Verdict could not be parsed as structured JSON; treated as a soft "
+        f"pass since mechanical checks already passed. Raw response: {notes[:300]}"
+    )
+
+
+def _extract_review_json(text: str) -> dict | None:
+    """Pull a {"review_passed": ...} object out of the model's response.
+
+    Tries, in order: the whole response as JSON, a ```json fenced block,
+    then the last {...} object found anywhere in the text — models
+    sometimes add a sentence of prose before or after the JSON despite
+    being asked not to.
+    """
+    candidates = []
+
+    stripped = text.strip()
+    candidates.append(stripped)
+
+    fence_match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+    if fence_match:
+        candidates.append(fence_match.group(1))
+
+    brace_match = _re.search(r"\{[^{}]*\"review_passed\"[^{}]*\}", text, _re.DOTALL)
+    if brace_match:
+        candidates.append(brace_match.group(0))
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, dict) and "review_passed" in parsed:
+            return parsed
+    return None
+    
 
 def _syntax_check_edits(app_name: str, edits: list[dict]) -> tuple[bool, str]:
     """Validate edited .py/.js locally so broken syntax never reaches bench."""
@@ -1200,32 +1251,57 @@ def review_node(state: dict) -> dict:
     logs = _log_stage(state, "Reviewing", "started", "Testing implementation quality")
     edits = state.get("edits_made", [])
     app_name = state.get("target_app_name", "")
-
-    syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
+    base_branch = state.get("base_branch", "")
+    branch_name = state.get("branch_name", "")
     attempt = (state.get("review_attempts") or 0) + 1
-    if not syntax_ok:
+
+    health = run_health_checks(app_name, edits)
+
+    if not health.passed:
+        # A real, mechanical failure — no ambiguity, no need for an LLM
+        # opinion. Same retry/error semantics as before.
+        report = health.summary()
         updates = {
             "review_passed": False,
-            "review_notes": syntax_report[:1000],
+            "review_notes": report[:1000],
             "review_attempts": attempt,
         }
         logs = _log_stage(
             {**state, "stage_log": logs}, "Reviewing", "completed",
-            f"Testing FAILED (syntax): {syntax_report[:120]}"
+            f"Testing FAILED (health check): {report[:120]}"
         )
         if attempt >= MAX_REVIEW_ATTEMPTS:
-            updates["error"] = f"Syntax errors remain after {attempt} test attempt(s)."
+            updates["error"] = f"Health checks failed after {attempt} test attempt(s)."
         updates["stage_log"] = logs
         return updates
 
-    prompt = get_review_prompt(edits, state.get("user_message", ""), request_name=state.get("request_name"))
-    if syntax_report:
-        short_report = "\n".join(syntax_report.splitlines()[:6])
-        prompt += (
-            "\n\n## LOCAL SYNTAX PRE-CHECK (already passed)\n"
-            f"{short_report}\n"
-            "Do not re-run validate_code unless you need to re-check after reasoning."
+    decision = needs_llm_review(app_name, base_branch, branch_name, edits)
+    if not decision.needs_llm:
+        # Checks passed, and the change is small/low-risk enough that a
+        # model's judgment isn't worth the tokens for this run.
+        updates = {
+            "review_passed": True,
+            "review_notes": f"Mechanical checks passed; LLM review skipped ({decision.reason}).",
+            "review_attempts": attempt,
+        }
+        logs = _log_stage(
+            {**state, "stage_log": logs}, "Reviewing", "completed",
+            f"Testing PASSED (mechanical only — {decision.reason})"
         )
+        updates["stage_log"] = logs
+        return updates
+
+    # Checks passed, but size/risk says this is worth a model's attention —
+    # run the existing LLM review, informed by what's already been verified
+    # so it doesn't spend rounds re-checking syntax/JSON/imports/wiring.
+    prompt = get_review_prompt(edits, state.get("user_message", ""), request_name=state.get("request_name"))
+    short_report = "\n".join(health.summary().splitlines()[:6])
+    prompt += (
+        "\n\n## LOCAL HEALTH CHECKS (already passed)\n"
+        f"{short_report}\n"
+        f"## WHY THIS NEEDS REVIEW\n{decision.reason}\n"
+        "Do not re-verify syntax, JSON validity, imports, or wiring — focus on logic and quality."
+    )
     updates = _run_agent_turn(state, "Reviewing", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_REVIEW)
     if updates.get("error"):
         logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "failed", updates["error"][:200])

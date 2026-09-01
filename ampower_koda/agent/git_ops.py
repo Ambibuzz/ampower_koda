@@ -323,6 +323,21 @@ def diff_file(
     return ok, out
 
 
+def diff_file_working_tree(app_name: str, base_branch: str, file_path: str) -> tuple[bool, str]:
+    """Unified diff for a single file between base_branch and the current
+    working tree (uncommitted changes included).
+    """
+    if not file_path:
+        return False, ""
+    root = get_repo_root(app_name)
+    base = (base_branch or "main").strip()
+    ok, out = run_git_stdout(
+        ["diff", base, "--", file_path],
+        cwd=root,
+    )
+    return ok, out
+
+
 def checkout_base(app_name: str, base_branch: str = "main") -> tuple[bool, str]:
     """
     Discards all uncommitted changes and returns the repository to its 
