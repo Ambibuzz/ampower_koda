@@ -33,6 +33,8 @@ class AgentState(TypedDict, total=False):
 
     # Plan phase
     plan: str
+    plan_object: dict
+
     files_to_modify: list
     files_to_create: list
 
