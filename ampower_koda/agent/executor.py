@@ -309,14 +309,21 @@ def run_planning_phase(request_name: str) -> None:
         _save_logs(request_name, final_state)
 
         understanding = _message_content_to_str(final_state.get("understanding_summary", "")).strip()
+        plan_object = final_state.get("plan_object") or {}
+        tasks = plan_object.get("tasks") or []
+        if not tasks:
+            raise ValueError("Planning completed without a structured task list")
+
         frappe.db.set_value(DOCTYPE_NAME, request_name, {
             "agent_plan": plan[:50000],
             "understanding_snapshot": understanding,
         })
         frappe.db.commit()
 
-        approval_msg = "Plan generated. Review the todos and approve to start implementation."
-
+        approval_msg = (
+            "Plan generated with %d task(s). Review them and approve to start implementation."
+            % len(tasks)
+        )
         _update_status(request_name, user, "Awaiting Approval", approval_msg,
             tokens_used=int(final_state.get("tokens_used") or 0))
 

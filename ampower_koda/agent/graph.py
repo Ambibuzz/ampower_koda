@@ -18,6 +18,13 @@ from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
 from ampower_koda.agent import koda_core
 from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent.plan_contract import (
+    MAX_PLAN_TASKS,
+    PLAN_JSON_SCHEMA,
+    PlanValidationError,
+    plan_to_markdown,
+    validate_plan,
+)
 from ampower_koda.agent.checks import run_health_checks, needs_llm_review
 from ampower_koda.agent.prompts import (
     get_system_prompt,
@@ -57,6 +64,10 @@ MAX_TOOL_RESULT_CHARS = 8000
 MAX_UNDERSTANDING_CONTEXT_CHARS = 8000
 MODEL_ROUND_OUTPUT_TOKENS = 4096
 MODEL_FINAL_OUTPUT_TOKENS = 2048
+# Sized for the largest valid plan plus its overview and scope.
+PLAN_OUTPUT_TOKENS_PER_TASK = 450
+MODEL_PLAN_OUTPUT_TOKENS = 1000 + MAX_PLAN_TASKS * PLAN_OUTPUT_TOKENS_PER_TASK
+
 
 # Provider-native prompt caching for the stable system prefix (safe no-op when unsupported).
 ENABLE_PROMPT_CACHE = True
@@ -611,6 +622,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     seen_calls: dict[str, int] = {}
     seen_results: dict[str, int] = {}
     total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
+    usage_missing_logged = False  # warn once per loop, not once per round
 
     wrote_anything = False
     read_only_streak = 0
@@ -677,7 +689,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             )
 
     def account_tokens(response, round_label, context_chars: int = 0):
-        nonlocal total_tokens
+        nonlocal total_tokens, usage_missing_logged
         usage = getattr(response, "usage_metadata", None)
         if usage:
             total_tokens += int(usage.get("total_tokens") or 0)
@@ -698,6 +710,16 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 context_chars=context_chars,
             )
             _persist_token_usage(request_name, total_tokens)
+        elif not usage_missing_logged:
+            # A provider that omits usage_metadata omits it every round, so this
+            # is a property of the provider, not of this round. Report it once;
+            # every later round would repeat the same fact.
+            usage_missing_logged = True
+            _publish_agent_log(request_name, "token_usage_missing",
+                round=round_label,
+                tokens_total=total_tokens,
+                provider=provider,
+            )
 
     for round_num in range(max_rounds):
         maybe_trim()
@@ -1001,6 +1023,46 @@ def understand_node(state: dict) -> dict:
             "stage_log": logs,
         }
 
+def _structured_plan_model(llm, provider: str):
+    """Bind the plan schema using the provider's structured-output API."""
+    # Native structured-output path per wrapper: OpenAI/OpenRouter enforce json_schema (strict),
+    # Claude only has json_schema on newer models so use tool input, Gemini rejects json_schema.
+    method = {
+        "Claude": "function_calling",
+        "Gemini": "json_mode",
+    }.get(provider, "json_schema")
+    options = {"method": method, "include_raw": True}
+    if provider in ("OpenAI", "OpenRouter"):
+        options["strict"] = True
+    structured = llm.with_structured_output(PLAN_JSON_SCHEMA, **options)
+    if provider == "OpenRouter":
+        structured = structured.bind(extra_body={
+            "usage": {"include": True},
+            "provider": {"require_parameters": True},
+        })
+    return structured
+
+
+def _unpack_structured_plan(result) -> tuple[object, dict]:
+    if not isinstance(result, dict) or "parsed" not in result:
+        raise PlanValidationError(["Provider returned no structured plan result"])
+
+    raw = result.get("raw")
+    metadata = getattr(raw, "response_metadata", None) or {}
+    reason = str(metadata.get("finish_reason") or metadata.get("stop_reason") or "").lower()
+    status = str(metadata.get("status") or "").lower()
+    if reason in {"length", "max_tokens", "max_output_tokens"} or status == "incomplete":
+        raise PlanValidationError(["Planner output reached the model output limit"])
+    if result.get("parsing_error"):
+        raise PlanValidationError([f"Provider rejected the structured plan: {result['parsing_error']}"])
+
+    parsed = result.get("parsed")
+    if hasattr(parsed, "model_dump"):
+        parsed = parsed.model_dump()
+    if not isinstance(parsed, dict):
+        raise PlanValidationError(["Provider returned no structured plan object"])
+    return raw, parsed
+
 
 def plan_node(state: dict) -> dict:
     """Turn the understanding summary into a step-by-step implementation plan."""
@@ -1029,14 +1091,15 @@ def plan_node(state: dict) -> dict:
         _publish_agent_log(request_name, "llm_response",
             preview="Generating todo-based plan from codebase analysis...", round=1)
 
-        response = _invoke_limited(llm, [
+        structured_llm = _structured_plan_model(llm, provider)
+        response = structured_llm.invoke([
             _build_system_message(provider, system_prompt, model),
             HumanMessage(content=plan_prompt),
-        ], MODEL_ROUND_OUTPUT_TOKENS)
-        plan = _llm_response_text(response)
+        ], max_tokens=MODEL_PLAN_OUTPUT_TOKENS)
+        raw_response, plan_object = _unpack_structured_plan(response)
 
         total_tokens = state.get("tokens_used", 0)
-        usage = getattr(response, "usage_metadata", None)
+        usage = getattr(raw_response, "usage_metadata", None)
         if usage:
             total_tokens += int(usage.get("total_tokens") or 0)
             _publish_agent_log(request_name, "token_usage",
@@ -1045,25 +1108,46 @@ def plan_node(state: dict) -> dict:
                 tokens_total=total_tokens,
             )
             _persist_token_usage(request_name, total_tokens)
+        else:
+            logs = _log_stage(
+                {**state, "stage_log": logs}, "Planning", "progress",
+                f"{provider} reported no token usage for the plan call - "
+                f"recorded total stays at {total_tokens} and undercounts this request",
+            )
 
-        if not plan.strip():
-            logs = _log_stage({**state, "stage_log": logs}, "Planning", "failed",
-                "LLM returned empty plan")
-            return {"error": "Plan generation returned empty response", "stage_log": logs}
+        plan_object = validate_plan(
+            plan_object,
+            path_exists=lambda path: _app_file_exists(app_name, path),
+        )
 
-        _publish_agent_log(request_name, "llm_response",
-            preview=plan[:500], round=2)
+        tasks = plan_object["tasks"]
+        _publish_agent_log(
+            request_name,
+            "llm_response",
+            preview=f"Structured plan returned {len(tasks)} validated task(s)",
+            round=2,
+        )
+        logs = _log_stage(
+            {**state, "stage_log": logs},
+            "Planning",
+            "progress",
+            f"{len(tasks)} task(s) validated; paths and dependency graph verified",
+        )
+
+        # Derive the editable plan consumed by the current executor.
+        plan = plan_to_markdown(plan_object)
 
         steps = list(state.get("intermediate_steps") or []) + [
             {"phase": "Planning", "output": plan[:MAX_PHASE_OUTPUT_CHARS]}
         ]
 
         logs = _log_stage({**state, "stage_log": logs}, "Planning", "completed",
-            f"Plan generated ({len(plan)} chars)")
+            f"Plan generated ({len(plan)} chars, {len(tasks)} task(s))")
 
         return {
             "current_stage": "Planning",
             "plan": plan,
+            "plan_object": plan_object,
             "intermediate_steps": steps,
             "stage_log": logs,
             "tokens_used": total_tokens,
