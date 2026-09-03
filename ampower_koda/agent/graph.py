@@ -622,6 +622,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     seen_calls: dict[str, int] = {}
     seen_results: dict[str, int] = {}
     total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
+    usage_missing_logged = False  # warn once per loop, not once per round
 
     wrote_anything = False
     read_only_streak = 0
@@ -688,7 +689,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             )
 
     def account_tokens(response, round_label, context_chars: int = 0):
-        nonlocal total_tokens
+        nonlocal total_tokens, usage_missing_logged
         usage = getattr(response, "usage_metadata", None)
         if usage:
             total_tokens += int(usage.get("total_tokens") or 0)
@@ -709,6 +710,16 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 context_chars=context_chars,
             )
             _persist_token_usage(request_name, total_tokens)
+        elif not usage_missing_logged:
+            # A provider that omits usage_metadata omits it every round, so this
+            # is a property of the provider, not of this round. Report it once;
+            # every later round would repeat the same fact.
+            usage_missing_logged = True
+            _publish_agent_log(request_name, "token_usage_missing",
+                round=round_label,
+                tokens_total=total_tokens,
+                provider=provider,
+            )
 
     for round_num in range(max_rounds):
         maybe_trim()
@@ -1014,6 +1025,8 @@ def understand_node(state: dict) -> dict:
 
 def _structured_plan_model(llm, provider: str):
     """Bind the plan schema using the provider's structured-output API."""
+    # Native structured-output path per wrapper: OpenAI/OpenRouter enforce json_schema (strict),
+    # Claude only has json_schema on newer models so use tool input, Gemini rejects json_schema.
     method = {
         "Claude": "function_calling",
         "Gemini": "json_mode",
@@ -1095,6 +1108,12 @@ def plan_node(state: dict) -> dict:
                 tokens_total=total_tokens,
             )
             _persist_token_usage(request_name, total_tokens)
+        else:
+            logs = _log_stage(
+                {**state, "stage_log": logs}, "Planning", "progress",
+                f"{provider} reported no token usage for the plan call - "
+                f"recorded total stays at {total_tokens} and undercounts this request",
+            )
 
         plan_object = validate_plan(
             plan_object,
