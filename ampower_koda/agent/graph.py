@@ -42,11 +42,15 @@ from ampower_koda.agent.prompts import (
 
 
 MAX_TOOL_ROUNDS_EXECUTION = 18
+MAX_TOOL_ROUNDS_REPAIR = 8        # a retry continues from current source with a remaining-work list
 MAX_TOOL_ROUNDS_REVIEW = 6
 MAX_TOOL_ROUNDS_REVIEW_RECOVERY = 4  # continues the first pass's history, so these are new reads only
 MAX_REVIEW_ATTEMPTS = 2           # per task and for final integration
 BASE_EXECUTION_CALL_BUDGET = 18
-PER_TASK_CALL_BUDGET = 10
+# A task must be able to afford one full implementation turn and one repair
+# turn, each with its forced final call. The old value of 10 left a one-task
+# plan 11 rounds for the first attempt and none for the retry.
+PER_TASK_CALL_BUDGET = (MAX_TOOL_ROUNDS_EXECUTION + 1) + (MAX_TOOL_ROUNDS_REPAIR + 1)
 FINAL_REVIEW_RESERVE = 16  # review (7), evidence recovery (5), repair/re-review minimum (4)
 REPAIR_REVIEW_RESERVE = 3
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
@@ -836,6 +840,15 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
 
     maybe_trim()
     final_messages = build_messages()
+    # Tools are unbound for this call. Without saying so, a model that still
+    # wants to work writes its next tool calls as prose, and the turn ends with
+    # garbage instead of a report the retry can act on.
+    final_messages.append(HumanMessage(content=(
+        "STOP: the call limit for this turn is reached and tools are no longer available. "
+        "Do not write any further tool calls. Return the required final report now. "
+        'If work remains, use status "blocked" and list exactly what is unfinished and '
+        "which edits were already applied, so the next attempt can continue from current source."
+    )))
     final_context_chars = sum(message_chars(m) for m in final_messages)
     if progress is not None:
         progress["calls"] = max_rounds + 1
@@ -1323,7 +1336,7 @@ def implement_node(state: dict) -> dict:
     updates = _run_agent_turn(
         {**state, "allowed_write_paths": allowed}, "Implementing", prompt,
         read_only_tools=False,
-        max_rounds=8 if state.get("review_attempts") else MAX_TOOL_ROUNDS_EXECUTION,
+        max_rounds=MAX_TOOL_ROUNDS_REPAIR if state.get("review_attempts") else MAX_TOOL_ROUNDS_EXECUTION,
     )
     before = updates.pop("_write_baseline", {})
     updates.pop("_tool_edited_paths", None)
@@ -1378,6 +1391,12 @@ def review_node(state: dict) -> dict:
         passed, notes = False, health.summary()
     elif state.get("turn_exhausted"):
         passed, notes = False, "Implementation reached its call limit without finishing. Inspect current changes and complete the active task."
+        # A blocked report from the forced final call says what is left; hand
+        # it to the retry instead of making it rediscover the state.
+        remaining = [completion.get("summary", "")] + list(completion.get("unverified") or [])
+        remaining = [item for item in remaining if isinstance(item, str) and item.strip()]
+        if completion.get("status") == "blocked" and remaining:
+            notes += " Reported remaining work: " + " | ".join(remaining)[:1500]
     elif (not integration or state.get("review_attempts", 0) > 0) and completion.get("status") != "complete":
         passed, notes = False, "Implementation did not return a valid complete JSON report. Finish the task and report its behavior and verification."
         if completion.get("status") == "blocked":
