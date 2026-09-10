@@ -13,6 +13,8 @@ dependencies = [
     "langchain-core>=0.3.0",
     "langchain-google-genai>=2.0.0",
     "langchain-anthropic>=0.3.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-language-pack>=0.7.0",
 ]
 
 [build-system]
