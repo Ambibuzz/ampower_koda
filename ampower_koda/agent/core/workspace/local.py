@@ -66,6 +66,11 @@ class LocalWorkspace:
         temporary = directory / f"{key}.{os.getpid()}.tmp"
         try:
             directory.mkdir(parents=True, exist_ok=True)
+            # The cache lives inside the app checkout. Without this marker it
+            # is untracked there, and the patch/push path sweeps it into the PR.
+            marker = self.root_path / Path(self.cache_directory).parts[0] / ".gitignore"
+            if not marker.exists():
+                marker.write_text("*\n", encoding="utf-8")
             temporary.write_bytes(payload)
             os.replace(temporary, target)
         except OSError:
