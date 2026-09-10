@@ -43,7 +43,9 @@ it is slower.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,10 +66,13 @@ from ampower_koda.agent.core import (
     TurnUsage,
     open_session,
     run_turn,
+    search,
 )
 from ampower_koda.agent.core.constants import DEFAULT_ARCHITECT_MODEL
+from ampower_koda.agent.git_ops import get_repo_root, run_git, worktree_signature
 from ampower_koda.agent.core.contracts.escalation import SideUsage
 from ampower_koda.agent.core.contracts.model import Completion
+from ampower_koda.agent.core.retrieval.tokenize import split_words
 from ampower_koda.agent.core.tools.catalogue import CATALOGUE
 
 #: Frappe doctype the graph's request rows live in.
@@ -583,6 +588,154 @@ def forget_session(request_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Model-free retrieval for a task the user is writing by hand
+# ---------------------------------------------------------------------------
+
+#: One read-only session per app root, reused while the checkout is unchanged.
+#: Keyed separately from ``_SESSIONS`` because those carry a request's transcript.
+_APP_SESSIONS: dict[str, tuple[str, Session]] = {}
+
+
+def _tree_key(app_name: str) -> str:
+    """HEAD plus a content hash of every uncommitted change, tracked or not.
+
+    ``git status`` would not do: a file that is already modified keeps the same
+    status line as it changes again, and the session would go stale.
+    """
+    repo_root = get_repo_root(app_name)
+    ok, head = run_git(["rev-parse", "HEAD"], cwd=repo_root)
+    return f"{head.strip() if ok else ''}:{worktree_signature(repo_root)}"
+
+
+def remember_app_session(app_name: str, session: Session) -> None:
+    """Hold a session for model-free searches while the checkout is unchanged."""
+    try:
+        entry = (_tree_key(app_name), session)
+    except Exception:
+        return  # not a git checkout, or git unavailable: fall back to cold start
+    with _SESSIONS_LOCK:
+        _APP_SESSIONS[_app_root(app_name)] = entry
+
+
+def _app_session(app_name: str) -> Session:
+    root = _app_root(app_name)
+    key = _tree_key(app_name)
+    with _SESSIONS_LOCK:
+        held = _APP_SESSIONS.get(root)
+    if held is not None and held[0] == key:
+        return held[1]
+    session = open_session(LocalWorkspace(root_path=Path(root)))
+    with _SESSIONS_LOCK:
+        _APP_SESSIONS[root] = (key, session)
+    return session
+
+
+def suggest_context(app_name: str, query: str, *, limit: int = 12) -> list[dict]:
+    """Rank code spans for a task description with the retriever planning used.
+
+    No model call. Cold start on a large app takes tens of seconds, which is why
+    the API runs this in a job and streams the result back over realtime.
+    """
+    return suggestions_for(_app_session(app_name), query, limit=limit)
+
+
+def suggestions_for(session: Session, query: str, *, limit: int = 12) -> list[dict]:
+    """Translate search hits into the shape a ``context_refs`` entry needs.
+
+    This is the working set's retrieved tier — the same ``search`` call and the
+    same location dedup ``working_set_for`` does before the model's first round —
+    kept as structured hits rather than its rendered ``path:start-end`` lines.
+    """
+    index = session.retriever.index
+    seen: set[tuple[str, int, int]] = set()
+    out: list[dict] = []
+    for hit in search(session.retriever, query, limit=limit).hits:
+        chunk = hit.chunk
+        definition = _enclosing_definition(index, chunk.path, chunk.span.start, chunk.span.end, chunk.identity)
+        start, end = (definition.extent.start, definition.extent.end) if definition else (chunk.span.start, chunk.span.end)
+        if (chunk.path, start, end) in seen:
+            continue
+        seen.add((chunk.path, start, end))
+        score = hit.score * (NAME_MATCH_BOOST if _names_file(query, chunk.path) else 1.0)
+        out.append({
+            "path": chunk.path, "start": start, "end": end,
+            "symbol": definition.qualified_name if definition else (chunk.identity or ""),
+            "snippet": _headline(chunk.body), "score": round(score, 3), "note": hit.note,
+        })
+    out.sort(key=lambda ref: -ref["score"])
+    return out
+
+
+NAME_MATCH_BOOST = 1.5
+MIN_NAME_PHRASE_CHARS = 6
+
+
+def _names_file(query: str, path: str) -> bool:
+    """Whether the query spells out the file's name, as words or as a token.
+
+    "the Document Traceability client script" names ``document_traceability.js``
+    but the lexical scorer cannot tell: ``document`` and ``traceability`` are in
+    nearly every chunk of that app, so their weight is close to zero, and the
+    ranking is decided by whichever look-alike file has the shorter chunk.
+    Short stems (``api``, ``utils``) are ignored; they name nothing.
+    """
+    phrase = " ".join(split_words(Path(path).stem))
+    if len(phrase) < MIN_NAME_PHRASE_CHARS:
+        return False
+    return phrase in " ".join(split_words(query))
+
+
+_DEFINITION_LINE = re.compile(
+    r"^\s*(?:async\s+def|def|class|function|frappe\.ui\.form\.on|frappe\.pages)\b"
+    r"|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:function|\()"
+)
+_NOISE_LINE = re.compile(r'^\s*(?:#|//|/\*|\*|"""|\'\'\'|\)|\]|\}|$)')
+
+
+def _headline(body: str, limit: int = 120) -> str:
+    """The line a person would recognise the chunk by.
+
+    A window rarely starts on anything meaningful — a closing bracket, a
+    licence comment — so prefer the first definition inside it, then the first
+    line that is neither blank nor punctuation nor a comment.
+    """
+    lines = body.splitlines()
+    chosen = next((line for line in lines if _DEFINITION_LINE.match(line)), None)
+    if chosen is None:
+        chosen = next((line for line in lines if not _NOISE_LINE.match(line)), "")
+    return chosen.strip()[:limit]
+
+
+def _enclosing_definition(index, path: str, start: int, end: int, identity: str = ""):
+    """The definition a chunk belongs to, so the ref names the function.
+
+    A symbol chunk knows its own name; use it, because the chunk often starts a
+    few lines above the definition (its comment) and so is not *inside* it —
+    containment alone would climb to the enclosing class and cite 900 lines.
+    Plain line windows fall back to the smallest definition containing them.
+    """
+    analysis = index.files.get(path)
+    if analysis is None:
+        return None
+    if identity:
+        named = next((d for d in analysis.definitions if d.qualified_name == identity), None)
+        if named is not None:
+            return named
+    best = None
+    for definition in analysis.definitions:
+        extent = definition.extent
+        if extent.start <= start and end <= extent.end:
+            if best is None or (extent.end - extent.start) < (best.extent.end - best.extent.start):
+                best = definition
+    if best is not None and best.extent.end - best.extent.start > MAX_WIDEN_LINES:
+        return None  # A window inside a 900-line class is better cited as the window.
+    return best
+
+
+MAX_WIDEN_LINES = 200
+
+
+# ---------------------------------------------------------------------------
 # The one function the graph calls
 # ---------------------------------------------------------------------------
 
@@ -681,6 +834,9 @@ def understand(
         )
 
     _remember(request_name, result.session)
+    # The index this turn just built is exactly what a task-suggestion search
+    # needs; keeping it under the app key saves the next click a cold start.
+    remember_app_session(app_name, result.session)
     notes = tuple(result.notes)
     if host.refused:
         notes = (*notes, f"declined: {', '.join(sorted(set(host.refused)))}")

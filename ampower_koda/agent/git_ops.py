@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
 # Git and GitHub operations for the agent — all functions accept explicit parameters
 
+import hashlib
 import os
 import re
 import subprocess
@@ -9,6 +10,37 @@ import requests as http_requests
 import frappe
 
 from ampower_koda.agent.errors import log_agent_error
+
+
+def worktree_signature(repo_root: str) -> str:
+    """Hash the full working-tree content vs HEAD to detect net file changes.
+
+    Uses content diffs (not just file names) so a follow-up that patches a file
+    already in the changed set is still detected. Includes untracked file
+    contents so newly created files count too.
+    """
+    parts = []
+    # Full content diff of tracked files (staged + unstaged) against HEAD.
+    ok, out = run_git(["diff", "HEAD"], cwd=repo_root)
+    if ok and out:
+        parts.append(out)
+
+    # Untracked files: include their contents, not just their names.
+    ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
+    if ok and untracked:
+        for rel in sorted(untracked.splitlines()):
+            rel = rel.strip()
+            if not rel:
+                continue
+            parts.append(f"\n### UNTRACKED {rel}\n")
+            try:
+                with open(os.path.join(repo_root, rel), "r", encoding="utf-8", errors="replace") as fh:
+                    parts.append(fh.read())
+            except OSError:
+                parts.append(f"(unreadable: {rel})")
+
+    payload = "\n".join(parts)
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
 def get_repo_root(app_name: str) -> str:
