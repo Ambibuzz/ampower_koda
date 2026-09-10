@@ -67,6 +67,9 @@ function set_model_options_for_provider(frm, reset) {
     }
 
     frm.set_df_property('default_ai_model', 'options', model_ids.join('\n'));
+    // Autocomplete clears any value not in its list on blur; the list is only a
+    // suggestion, so a pasted provider model id must survive.
+    frm.set_df_property('default_ai_model', 'ignore_validation', 1);
     frm.refresh_field('default_ai_model');
 
     if (reset && model_ids.indexOf(current) === -1) {
