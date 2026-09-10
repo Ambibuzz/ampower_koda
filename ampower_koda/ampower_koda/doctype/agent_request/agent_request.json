@@ -35,6 +35,9 @@
   "change_summary",
   "plan_section",
   "agent_plan",
+  "plan_json",
+  "approved_plan_json",
+  "execution_results",
   "diff_section",
   "patch_diff",
   "logs_section",
@@ -241,7 +244,9 @@
   {
    "fieldname": "agent_plan",
    "fieldtype": "Markdown Editor",
-   "label": "Agent Plan"
+   "label": "Agent Plan",
+   "read_only": 1,
+   "description": "Display of the structured plan. Edit Structured Plan JSON to adjust tasks."
   },
   {
    "collapsible": 1,
@@ -384,10 +389,31 @@
    "fieldtype": "Table",
    "label": "Prompts",
    "options": "Agent Prompt Configuration"
+  },
+  {
+   "fieldname": "plan_json",
+   "fieldtype": "Code",
+   "options": "JSON",
+   "label": "Structured Plan JSON",
+   "description": "Canonical task contract. Changes are validated before approval."
+  },
+  {
+   "fieldname": "approved_plan_json",
+   "fieldtype": "Long Text",
+   "label": "Approved Plan JSON",
+   "hidden": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "execution_results",
+   "fieldtype": "Code",
+   "options": "JSON",
+   "label": "Task Execution Results",
+   "read_only": 1
   }
  ],
  "links": [],
- "modified": "2026-08-24 10:00:00.000000",
+ "modified": "2026-09-08 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Ampower Koda",
  "name": "Agent Request",
