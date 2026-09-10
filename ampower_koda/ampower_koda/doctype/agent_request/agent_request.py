@@ -6,6 +6,8 @@ from frappe import _
 from frappe.model.document import Document
 
 from ampower_koda.agent.errors import log_agent_error
+from ampower_koda.agent.execution_contract import load_plan
+from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdown
 
 
 class AgentRequest(Document):
@@ -37,6 +39,12 @@ class AgentRequest(Document):
 
     def validate(self):
         self._normalize_json_fields()
+        if self.get("plan_json"):
+            try:
+                plan = load_plan(self.plan_json)
+            except PlanValidationError as exc:
+                frappe.throw(str(exc))
+            self.agent_plan = plan_to_markdown(plan)
 
         if not (self.target_app_name or "").strip():
             frappe.throw(_("Target App Name is required"))

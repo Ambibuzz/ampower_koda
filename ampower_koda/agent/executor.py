@@ -3,14 +3,15 @@
 # bench + commit, and deploy (push + PR). Enqueued as background jobs from api.py.
 
 import datetime
-import hashlib
 import json
 import os
 import re
 import subprocess
 
 import frappe
+from ampower_koda.agent import koda_core
 from ampower_koda.agent.errors import log_agent_error
+from ampower_koda.agent.execution_contract import load_plan
 from ampower_koda.agent.graph import (
     _get_bench_env,
     _message_content_to_str,
@@ -27,6 +28,7 @@ from ampower_koda.agent.git_ops import (
     commit_changes,
     push_branch,
     create_pull_request,
+    worktree_signature,
 )
 
 DOCTYPE_NAME = "Agent Request"
@@ -315,7 +317,10 @@ def run_planning_phase(request_name: str) -> None:
             raise ValueError("Planning completed without a structured task list")
 
         frappe.db.set_value(DOCTYPE_NAME, request_name, {
-            "agent_plan": plan[:50000],
+            "agent_plan": plan,
+            "plan_json": json.dumps(plan_object, ensure_ascii=True),
+            "approved_plan_json": "",
+            "execution_results": "",
             "understanding_snapshot": understanding,
         })
         frappe.db.commit()
@@ -361,6 +366,10 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         app_name = config["target_app_name"]
         keep_same_branch = bool(int(preserve_branch or 0))
         is_follow_up_mode = bool(int(is_follow_up or 0)) or keep_same_branch
+
+        # Validate the persisted approval before any checkout/reset or file mutation.
+        approved = doc.get("approved_plan_json")
+        plan_object = load_plan(approved)
 
         if keep_same_branch:
             branch_name = (doc.branch_name or "").strip()
@@ -409,7 +418,6 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
                 f"Created branch '{branch_name}'. Starting implementation...",
                 branch_name=branch_name)
 
-        plan = doc.agent_plan or ""
         prior_changed_paths = _prior_changed_paths(doc) if is_follow_up_mode else []
         implementation_memory = (
             (doc.implementation_snapshot or doc.change_summary or "").strip()
@@ -421,14 +429,14 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         prev_stage_log = _parse_stage_log(doc.stage_log or "")
 
         repo_root = get_repo_root(app_name)
-        worktree_before = _worktree_signature(repo_root) if is_follow_up_mode else ""
+        worktree_before = worktree_signature(repo_root) if is_follow_up_mode else ""
 
         graph = build_execution_graph()
         initial = {
             "user_message": doc.user_message or "",
             "request_type": doc.request_type or "Improvement",
             "request_name": request_name,
-            "plan": plan,
+            "plan_object": plan_object,
             "understanding_summary": _extract_understanding(doc),
             "target_app_name": config["target_app_name"],
             "ai_provider": config["ai_provider"],
@@ -449,11 +457,12 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
             "implementation_memory": implementation_memory,
         }
 
-        final_state = graph.invoke(initial)
+        final_state = graph.invoke(initial, config={"recursion_limit": 100})
 
         _save_logs(request_name, final_state)
 
-        if final_state.get("error"):
+        if final_state.get("error") or not final_state.get("review_passed"):
+            final_state.setdefault("error", "Execution ended without a passing final review.")
             _update_status(request_name, user, "Failed",
                 final_state["error"],
                 error_log=final_state.get("error_log") or final_state["error"])
@@ -461,41 +470,36 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
 
         repo_root = get_repo_root(app_name)
 
-        # Drop throwaway notes/marker files the model may have created so they
-        # never reach the diff or PR.
-        stripped = _strip_agent_scratch_files(repo_root)
+        # Notes the model leaves behind (IMPLEMENTATION_DONE.md, notes.txt) never
+        # belong in a patch. Only untracked .md/.txt files go, and never one the
+        # approved plan names, so a reviewed patches.txt or README survives.
+        planned = {path for task in plan_object["tasks"] for path in task["files"]}
+        stripped = _strip_stray_notes(repo_root, keep=planned)
         if stripped:
             _update_status(request_name, user, "Implementing",
-                f"Removed {len(stripped)} stray file(s): {', '.join(stripped[:5])}")
+                f"Removed {len(stripped)} stray note file(s): {', '.join(stripped[:5])}")
 
-        worktree_after = _worktree_signature(repo_root) if is_follow_up_mode else ""
+        worktree_after = worktree_signature(repo_root) if is_follow_up_mode else ""
         run_made_changes = (not is_follow_up_mode) or (worktree_before != worktree_after)
 
         ok_diff, diff_out = run_git(["diff", "--stat"], cwd=repo_root)
         ok_ut, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
+        if not ok_diff or not ok_ut:
+            raise RuntimeError("Could not verify the working tree after review: " + (diff_out if not ok_diff else untracked))
         has_changes = bool((diff_out or "").strip()) or bool((untracked or "").strip())
 
-        if is_follow_up_mode and not run_made_changes:
-            _update_status(request_name, user, "Failed",
-                "Follow-up made no changes. The patch did not modify any files on disk.",
-                error_log="Follow-up produced no net file changes.")
-            return
-
-        if not has_changes:
-            _update_status(request_name, user, "Failed",
-                "No code changes were produced. The implement phase did not modify any files on disk.",
-                error_log="No file changes detected after implementation.")
+        if not has_changes or (is_follow_up_mode and not run_made_changes):
+            _update_status(
+                request_name, user, "Completed",
+                "Review passed with no net changes. See Task Execution Results for evidence.",
+                change_summary=final_state.get("change_summary", ""),
+                tokens_used=int(final_state.get("tokens_used") or 0),
+            )
             return
 
         patch_diff = _generate_patch_diff(app_name)
-
-        # Keep the recorded change set in sync with what actually remains on disk.
-        stripped_set = set(stripped)
-        edits = [
-            e for e in (final_state.get("edits_made") or [])
-            if e.get("path") not in stripped_set
-            and not (e.get("path") and _is_scratch_file(e["path"]))
-        ]
+        edits = [e for e in (final_state.get("edits_made") or [])
+                 if not (e.get("path") and _same_file(e["path"], stripped))]
         if is_follow_up_mode:
             edits = _merge_file_edits(as_json_list(doc.files_changed), edits)
         bench_cmds = _compute_bench_commands(app_name, edits)
@@ -527,37 +531,6 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
 # ---------------------------------------------------------------------------
 # Helpers: bench command computation
 # ---------------------------------------------------------------------------
-
-def _worktree_signature(repo_root: str) -> str:
-    """Hash the full working-tree content vs HEAD to detect net file changes.
-
-    Uses content diffs (not just file names) so a follow-up that patches a file
-    already in the changed set is still detected. Includes untracked file
-    contents so newly created files count too.
-    """
-    parts = []
-    # Full content diff of tracked files (staged + unstaged) against HEAD.
-    ok, out = run_git(["diff", "HEAD"], cwd=repo_root)
-    if ok and out:
-        parts.append(out)
-
-    # Untracked files: include their contents, not just their names.
-    ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
-    if ok and untracked:
-        for rel in sorted(untracked.splitlines()):
-            rel = rel.strip()
-            if not rel:
-                continue
-            parts.append(f"\n### UNTRACKED {rel}\n")
-            try:
-                with open(os.path.join(repo_root, rel), "r", encoding="utf-8", errors="replace") as fh:
-                    parts.append(fh.read())
-            except OSError:
-                parts.append(f"(unreadable: {rel})")
-
-    payload = "\n".join(parts)
-    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
-
 
 def _prior_changed_paths(doc) -> list:
     """Canonical paths from the previous run's files_changed list."""
@@ -610,51 +583,52 @@ def _save_implementation_snapshot(request_name: str, doc, final_state: dict, is_
     })
 
 
-# Names/patterns that indicate throwaway "scratch" files the model sometimes
-# creates (progress notes, status markers, metadata dumps). These are never part
-# of a real code change and must not land in the PR.
-_SCRATCH_NAME_KEYWORDS = (
-    "note", "notes", "metadata", "summary", "readme", "changelog",
-    "finalize", "implementation_done", "done", "todo", "scratch",
-)
+def run_context_suggestion(request_name: str, query: str, token: str, user: str) -> None:
+    """Rank code spans for a task the user is adding to the plan. No model call.
+
+    Runs as a job because indexing a large app takes longer than a web request
+    should; the form matches the reply to its dialog by ``token``.
+    """
+    frappe.set_user("Administrator")
+    payload = {"request_name": request_name, "token": token}
+    try:
+        doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+        payload["suggestions"] = koda_core.suggest_context(doc.target_app_name, query)
+    except Exception as e:
+        log_agent_error("Agent Task Suggestion Error", frappe.get_traceback())
+        payload["error"] = str(e)
+    frappe.publish_realtime("agent_task_suggestions", payload, user=user)
 
 
-def _is_scratch_file(rel_path: str) -> bool:
-    """True for agent-created doc/marker files that don't belong in the change set."""
-    name = os.path.basename(rel_path).lower()
-    _, ext = os.path.splitext(name)
-    # Loose .txt files are never a legitimate Frappe code artifact.
-    if ext == ".txt":
-        return True
-    # Markdown only when it looks like an agent note/marker (keep real code .md rare).
-    if ext == ".md" and any(k in name for k in _SCRATCH_NAME_KEYWORDS):
-        return True
-    if re.match(r"(?i)(implementation_done|finalize_|ai_feature|ai_progress)", name):
-        return True
-    return False
+_NOTE_EXTENSIONS = (".md", ".txt")
 
 
-def _strip_agent_scratch_files(repo_root: str) -> list[str]:
-    """Delete newly-created scratch/marker files from the working tree.
+def _strip_stray_notes(repo_root: str, keep: set[str]) -> list[str]:
+    """Delete untracked .md/.txt files the run left behind, except planned ones.
 
-    Returns the list of removed repo-relative paths. Only untracked files are
-    considered, so tracked source code is never touched.
+    Returns the repo-relative paths removed. Only untracked files are listed,
+    so tracked source and docs are never touched.
     """
     ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
-    if not ok or not (untracked or "").strip():
+    if not ok:
         return []
     removed = []
-    for rel in untracked.splitlines():
+    for rel in (untracked or "").splitlines():
         rel = rel.strip()
-        if not rel or not _is_scratch_file(rel):
+        if not rel.lower().endswith(_NOTE_EXTENSIONS) or _same_file(rel, keep):
             continue
         try:
             os.remove(os.path.join(repo_root, rel))
             removed.append(rel)
         except OSError:
-            log_agent_error("Agent Execution: strip scratch file",
+            log_agent_error("Agent Execution: strip stray note",
                 f"could not remove {rel}\n{frappe.get_traceback()}")
     return removed
+
+
+def _same_file(path: str, others) -> bool:
+    """Plan and edit paths are app-relative, git paths are repo-relative; match by suffix."""
+    return any(path == other or path.endswith("/" + other) or other.endswith("/" + path) for other in others)
 
 
 def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
@@ -674,7 +648,8 @@ def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
     )
 
     cmds = []
-    if has_doctype_changes or has_report_changes:
+    has_patch_registration = any(os.path.basename(p) == "patches.txt" for p in edited_paths)
+    if has_doctype_changes or has_report_changes or has_patch_registration:
         cmds.append(f"bench --site {site_name} migrate")
     if has_js_css_changes:
         cmds.append(f"bench build --app {app_name}")
