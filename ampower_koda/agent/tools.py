@@ -23,9 +23,11 @@ def _app_root(app_name: str) -> str:
 
 def _resolve_path(app_name: str, relative_path: str) -> str:
     """Resolve path relative to app root. Prevent directory traversal."""
-    root = _app_root(app_name)
-    path = os.path.normpath(os.path.join(root, relative_path.lstrip("/")))
-    if not path.startswith(root):
+    root = os.path.realpath(_app_root(app_name))
+    if os.path.isabs(relative_path) or os.path.splitdrive(relative_path)[0]:
+        raise ValueError(f"Path must be relative to app: {relative_path}")
+    path = os.path.realpath(os.path.join(root, relative_path))
+    if os.path.commonpath([root, path]) != root:
         raise ValueError(f"Path outside app: {relative_path}")
     return path
 
@@ -224,12 +226,12 @@ def edit_file(app_name: str, path: str, old_string: str, new_string: str) -> str
             return f"EDIT_FAILED: Not a file: {path}"
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-        if old_string not in content:
+        if not old_string or content.count(old_string) != 1:
             preview = content[:3000]
             if len(content) > 3000:
                 preview += f"\n... ({len(content)} chars total, showing first 3000)"
             return (
-                f"EDIT_FAILED: old_string not found in {path} ({len(content)} chars, {content.count(chr(10))+1} lines). "
+                f"EDIT_FAILED: old_string must match exactly once in {path} ({len(content)} chars, {content.count(chr(10))+1} lines). "
                 f"Use read_file to inspect the file and copy the exact string to match, "
                 f"including whitespace and indentation."
             )
