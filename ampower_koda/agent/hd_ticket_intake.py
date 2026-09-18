@@ -38,28 +38,60 @@ INDEXING_POLL_INTERVAL_SECONDS = 20
 INDEXING_MAX_POLL_SECONDS = 60 * 60
 
 
-def _extract_relevant_kb_sections(comment_for_developer: str) -> str:
-    """Trim KB's comment_for_developer down to the problem, affected files,
-    and resolution steps (sections 1-3). Drops the testing plan (section 4)
-    and any trailing notes -- Koda has its own Verify phase for that.
+def _extract_relevant_kb_sections_html(comment_for_developer: str) -> str:
+    """Condense KB's comment_for_developer into HTML: just the problem (one
+    line), the affected files (a list), and the steps (titles only, not
+    KB's per-step reasoning paragraphs). Drops the testing plan, root-cause
+    narrative, and trailing notes -- Koda's own Explore phase reads the
+    actual files itself and doesn't need KB's reasoning repeated.
 
-    Pattern-matches KB's numbered-section prose format; falls back to
-    returning the text unchanged if the shape doesn't match.
+    Returns HTML, not markdown -- Agent Request.user_message is a "Text
+    Editor" fieldtype, which renders raw HTML, not markdown syntax or plain
+    newlines. Every extracted fragment is escaped before insertion.
+
+    Pattern-matches KB's prose format (backtick file paths, "- Step X:"
+    lines, "1) Root Cause Analysis" section headers). Falls back to the
+    unmodified text (escaped, newlines as <br>) if the shape doesn't match.
     """
     if not comment_for_developer:
         return comment_for_developer
 
-    parts = re.split(r'\n(?=\d\)\s)', comment_for_developer.strip())
-    if len(parts) < 3:
-        return comment_for_developer
+    text = comment_for_developer.strip()
 
-    kept = []
-    for part in parts:
-        match = re.match(r'^(\d)\)', part)
-        if match and int(match.group(1)) <= 3:
-            kept.append(part.strip())
+    def esc(s: str) -> str:
+        return frappe.utils.escape_html(s.strip())
 
-    return "\n\n".join(kept) if kept else comment_for_developer
+    problem = ""
+    section1 = re.search(r'1\)[^\n]*\n(.*?)(?=\n\d\)|\Z)', text, re.DOTALL)
+    if section1:
+        for line in section1.group(1).splitlines():
+            line = line.strip("- ").strip()
+            if line and not line.lower().startswith(("classification", "repository:")):
+                problem = line
+                break
+
+    files = list(dict.fromkeys(
+        re.findall(r'`([\w./-]+\.(?:py|js|json|html|md))`', text)
+    ))
+
+    steps = re.findall(r'-\s*Step\s+\w+:\s*([^\n]+)', text)
+
+    if not files and not steps:
+        return f"<p>{esc(text).replace(chr(10), '<br>')}</p>"
+
+    html = []
+    if problem:
+        html.append(f"<p><strong>Problem:</strong> {esc(problem)}</p>")
+    if files:
+        html.append("<p><strong>Files:</strong></p><ul>")
+        html.extend(f"<li><code>{esc(f)}</code></li>" for f in files)
+        html.append("</ul>")
+    if steps:
+        html.append("<p><strong>Steps:</strong></p><ol>")
+        html.extend(f"<li>{esc(s)}</li>" for s in steps)
+        html.append("</ol>")
+
+    return "".join(html)
 
 
 def _get_cached_repo(repository_name: str):
@@ -113,13 +145,11 @@ def _finalize_agent_request(subject: str, description: str, request_type: str,
                              github_repo_url: str, base_branch: str) -> dict:
     github_username, github_email, github_token = _get_git_credential()
 
-    user_message = description
+    description_html = frappe.utils.escape_html(description).replace("\n", "<br>")
+    user_message = f"<h4>Original Ticket</h4><p>{description_html}</p>"
     if comment_for_developer:
-        relevant_notes = _extract_relevant_kb_sections(comment_for_developer)
-        user_message = (
-            f"## Original Ticket\n\n{description}\n\n"
-            f"## Knowledge Base Technical Notes\n\n{relevant_notes}"
-        )
+        relevant_notes_html = _extract_relevant_kb_sections_html(comment_for_developer)
+        user_message += f"<h4>Knowledge Base Technical Notes</h4>{relevant_notes_html}"
 
     settings = frappe.get_single("Agent Settings")
 
@@ -342,3 +372,4 @@ def _notify_user(user: str, kind: str, message: str, redirect_url):
             title="HD Ticket Intake: Notification Log insert failed",
             message=frappe.get_traceback(),
         )
+        
