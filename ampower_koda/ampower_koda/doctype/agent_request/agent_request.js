@@ -89,9 +89,8 @@ frappe.ui.form.on('Agent Request', {
     ai_provider: function (frm) {
         // The one place a reset is correct: the user changed provider, so a
         // model belonging to the old one is genuinely no longer valid.
-        var provider = frm.doc.ai_provider || 'OpenAI';
         set_model_options_for_provider(frm, true);
-        frm.set_value('ai_model', DEFAULT_MODELS[provider] || DEFAULT_MODELS['OpenAI']);
+        frm.set_value('ai_model', default_model_for(frm, frm.doc.ai_provider));
     },
 
     before_save: function (frm) {
@@ -101,13 +100,25 @@ frappe.ui.form.on('Agent Request', {
     },
 
     onload: function (frm) {
-        if (frm.is_new()) {
-            load_user_defaults(frm);
+        // Settings' default model is not in the static catalogue below; fetch it
+        // so it is offered here and becomes the default for a new request.
+        frappe.call({ method: 'ampower_koda.agent.api.get_model_defaults', callback: function (r) {
+            frm._settings_defaults = r.message || {};
+            if (frm.is_new()) {
+                load_user_defaults(frm);
+            }
             set_model_options_for_provider(frm, false);
-        }
+        } });
         update_request_type_help(frm);
     }
 });
+
+function default_model_for(frm, provider) {
+    provider = provider || 'OpenAI';
+    var settings = frm._settings_defaults || {};
+    if (settings.model && settings.provider === provider) return settings.model;
+    return DEFAULT_MODELS[provider] || DEFAULT_MODELS['OpenAI'];
+}
 
 // ---------------------------------------------------------------------------
 // Status Dashboard: visual progress indicator
@@ -414,16 +425,20 @@ function set_model_options_for_provider(frm, reset) {
     var entries = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
     var model_ids = entries.map(function (m) { return m.value; });
     var current = frm.doc.ai_model || '';
+    var settings_model = default_model_for(frm, provider);
 
-    if (!reset && current && model_ids.indexOf(current) === -1) {
-        model_ids = model_ids.concat([current]);
-    }
+    [settings_model, reset ? '' : current].forEach(function (extra) {
+        if (extra && model_ids.indexOf(extra) === -1) model_ids.push(extra);
+    });
 
     frm.set_df_property('ai_model', 'options', model_ids.join('\n'));
+    // Autocomplete clears any value not in its list on blur; the list is only a
+    // suggestion, so a pasted provider model id must survive.
+    frm.set_df_property('ai_model', 'ignore_validation', 1);
     frm.refresh_field('ai_model');
 
     if (reset && model_ids.indexOf(current) === -1) {
-        frm.set_value('ai_model', DEFAULT_MODELS[provider] || model_ids[0]);
+        frm.set_value('ai_model', settings_model);
     }
 
     var desc = entries.map(function (m) {
@@ -497,6 +512,12 @@ function setup_action_buttons(frm) {
 
         frm.add_custom_button(__('Reject Plan'), function () {
             reject_plan(frm);
+        }, __('Actions'));
+    }
+
+    if (PLAN_EDITABLE_STATUSES.includes(status) && (frm.doc.plan_json || '').trim()) {
+        frm.add_custom_button(__('Add / Edit Task'), function () {
+            open_task_dialog(frm);
         }, __('Actions'));
     }
 
@@ -663,14 +684,14 @@ function execute_existing_plan(frm) {
 
 function approve_plan(frm) {
     frappe.confirm(
-        __('Approve this plan and start implementation?<br><br>The agent will execute each todo, run bench commands, and prepare changes for push.'),
+        __('Approve this plan and start implementation?<br><br>The agent will implement and review each task, then request approval for bench commands.'),
         function () {
-            var edited_plan = frm.doc.agent_plan || '';
+            var plan_json = frm.doc.plan_json || '';
             frappe.call({
                 method: 'ampower_koda.agent.api.approve_plan',
                 args: {
                     request_name: frm.doc.name,
-                    edited_plan: edited_plan
+                    plan_json: plan_json
                 },
                 freeze: true,
                 freeze_message: __('Starting execution...'),
@@ -959,7 +980,255 @@ function setup_realtime_listeners(frm) {
         frm.reload_doc();
     });
 
+    frappe.realtime.on('agent_task_suggestions', function (data) {
+        if (!data || data.request_name !== frm.doc.name) return;
+        const dialog = frm._task_dialog;
+        // Only the dialog that asked gets the answer; a stale reply is dropped.
+        if (!dialog || dialog.token !== data.token) return;
+        render_task_suggestions(dialog, data);
+    });
+
     setup_status_polling(frm);
+}
+
+// ---------------------------------------------------------------------------
+// Plan task editor: add or edit one structured task without hand-writing JSON
+// ---------------------------------------------------------------------------
+
+// Top-level `var`, not `const`: Frappe compiles the doctype script together with
+// any Client Scripts as one function body and may do so more than once, and a
+// redeclared `const` is a SyntaxError before anything runs.
+var PLAN_EDITABLE_STATUSES = ['Awaiting Approval', 'Failed', 'Cancelled', 'Completed', 'Awaiting Push Approval'];
+var split_lines = (text) => (text || '').split('\n').map((s) => s.trim()).filter(Boolean);
+
+function open_task_dialog(frm) {
+    const tasks = JSON.parse(frm.doc.plan_json).tasks;
+    const ids = tasks.map((t) => t.id);
+    const dialog = new frappe.ui.Dialog({
+        title: __('Add / Edit Task'),
+        size: 'large',
+        fields: [
+            { fieldname: 'task_id', fieldtype: 'Select', label: __('Task'), options: ['New task', ...ids], default: 'New task',
+              change: () => fill_task(dialog, tasks.find((t) => t.id === dialog.get_value('task_id'))) },
+            { fieldname: 'title', fieldtype: 'Data', label: __('Title'), reqd: 1 },
+            { fieldname: 'goal', fieldtype: 'Data', label: __('Goal (one sentence)'), reqd: 1 },
+            { fieldname: 'description', fieldtype: 'Small Text', label: __('Description'), reqd: 1,
+              description: __('What changes, where, why, and which existing pattern to follow. No code.') },
+            { fieldtype: 'Column Break' },
+            { fieldname: 'action', fieldtype: 'Select', label: __('Action'), options: ['MODIFY', 'CREATE'], default: 'MODIFY', reqd: 1 },
+            { fieldname: 'depends_on', fieldtype: 'MultiSelectPills', label: __('Depends on'),
+              get_data: () => ids.map((id) => ({ value: id, description: '' })) },
+            { fieldname: 'acceptance_criteria', fieldtype: 'Small Text', label: __('Acceptance criteria (one per line)'), reqd: 1 },
+            { fieldname: 'files', fieldtype: 'Small Text', label: __('Files to edit or create (one per line)'), reqd: 1 },
+            { fieldtype: 'Section Break', label: __('Relevant code'),
+              description: __('Optional. We search the codebase for what this task describes and pre-select the best files for the implementer to read first.') },
+            { fieldname: 'find', fieldtype: 'Button', label: __('Find relevant code'), click: () => find_task_context(frm, dialog) },
+            { fieldname: 'results', fieldtype: 'HTML' },
+        ],
+        primary_action_label: __('Save Task'),
+        primary_action: (values) => save_task(frm, dialog, values),
+        secondary_action_label: __('Remove Task'),
+        secondary_action: () => remove_task(frm, dialog, tasks),
+    });
+    dialog.suggestions = [];
+    dialog.existing_refs = [];
+    frm._task_dialog = dialog;
+    dialog.show();
+    // Only an existing task can be removed; the button follows the selector.
+    dialog.get_secondary_btn().addClass('btn-danger').hide();
+}
+
+function remove_task(frm, dialog, tasks) {
+    const task_id = dialog.get_value('task_id');
+    const task = tasks.find((t) => t.id === task_id);
+    if (!task) return;
+    if (tasks.length === 1) {
+        return frappe.msgprint(__('A plan needs at least one task. Edit this task or reject the plan instead.'));
+    }
+    const dependents = tasks.filter((t) => (t.depends_on || []).includes(task_id)).map((t) => t.id);
+    const esc = frappe.utils.escape_html;
+    let message = __('Remove {0} ({1}) from the plan? Later tasks are renumbered.', [esc(task_id), esc(task.title)]);
+    if (dependents.length) {
+        message += '<br><br>' + __('{0} depend on it; that dependency is dropped.', [esc(dependents.join(', '))]);
+    }
+    frappe.confirm(message, () => {
+        frappe.call({
+            method: 'ampower_koda.agent.api.remove_plan_task',
+            args: { request_name: frm.doc.name, task_id },
+            freeze: true,
+            callback: (r) => {
+                frappe.show_alert({ message: __('Removed {0}', [r.message.removed]), indicator: 'green' });
+                dialog.hide();
+                frm._task_dialog = null;
+                frm.reload_doc();
+            },
+        });
+    });
+}
+
+function fill_task(dialog, task) {
+    dialog.existing_refs = task ? task.context_refs : [];
+    dialog.get_secondary_btn().toggle(Boolean(task));
+    if (!task) return;
+    dialog.set_values({
+        title: task.title, goal: task.goal, description: task.description, action: task.action,
+        acceptance_criteria: task.acceptance_criteria.join('\n'), files: task.files.join('\n'),
+    });
+    dialog.set_value('depends_on', task.depends_on);
+}
+
+function find_task_context(frm, dialog) {
+    const query = ['title', 'goal', 'description'].map((f) => dialog.get_value(f)).filter(Boolean).join('\n');
+    if (!query) return frappe.msgprint(__('Fill in the title or description first.'));
+    dialog.fields_dict.results.$wrapper.html(`<div class="koda-suggest"><div class="koda-loading">
+        <span class="spinner-border spinner-border-sm"></span>
+        ${__('Searching the codebase... the first search on a large app can take up to a minute.')}</div></div>`);
+    frappe.call({
+        method: 'ampower_koda.agent.api.suggest_task_context',
+        args: { request_name: frm.doc.name, query },
+        callback: (r) => { dialog.token = r.message.token; },
+    });
+}
+
+var MAX_CONTEXT_REFS = 6;
+
+var KODA_SUGGEST_CSS = `<style>
+.koda-suggest .koda-loading{display:flex;gap:8px;align-items:center;color:var(--text-muted);padding:8px 0}
+.koda-suggest .koda-summary{display:flex;justify-content:space-between;color:var(--text-muted);font-size:var(--text-sm);margin:4px 0 10px}
+.koda-suggest .koda-file{border:1px solid var(--border-color);border-radius:var(--border-radius-md,8px);padding:10px 12px;margin-bottom:8px;background:var(--fg-color,#fff)}
+.koda-suggest .koda-file.is-active{border-color:var(--primary)}
+.koda-suggest .koda-file-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.koda-suggest .koda-file-dir{color:var(--text-muted);font-size:var(--text-sm);margin-left:6px;word-break:break-all}
+.koda-suggest .koda-strength{color:var(--primary);letter-spacing:2px;font-size:10px;white-space:nowrap}
+.koda-suggest .koda-file-actions{display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap}
+.koda-suggest .koda-file-count{color:var(--text-muted);font-size:var(--text-sm);margin-left:auto}
+.koda-suggest .koda-spans{margin:8px 0 0;padding-left:2px}
+.koda-suggest .koda-span{display:flex;gap:8px;align-items:center;font-size:var(--text-sm);margin:3px 0;cursor:pointer;font-weight:normal}
+.koda-suggest .koda-span input{margin:0}
+.koda-suggest .koda-span-name{font-family:var(--font-stack-mono,monospace);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.koda-suggest .koda-span-lines{color:var(--text-muted);margin-left:auto;white-space:nowrap}
+</style>`;
+
+function render_task_suggestions(dialog, data) {
+    const $results = dialog.fields_dict.results.$wrapper;
+    const esc = frappe.utils.escape_html;
+    dialog.suggestions = data.suggestions || [];
+    if (data.error) return $results.html(`<p class="text-danger">${esc(data.error)}</p>`);
+    if (!dialog.suggestions.length) {
+        return $results.html(`<p class="text-muted">${__('Nothing matched. Try different words, or enter file paths by hand.')}</p>`);
+    }
+    // Group the ranked sections by file; the first file seen is the best match.
+    const files = [];
+    dialog.suggestions.forEach((s, index) => {
+        let file = files.find((f) => f.path === s.path);
+        if (!file) files.push(file = { path: s.path, score: s.score, spans: [] });
+        file.spans.push({ ...s, index });
+    });
+    // Pre-select: the top three files, up to two sections each, within the cap.
+    let budget = MAX_CONTEXT_REFS;
+    dialog.selection = {};
+    files.forEach((file, rank) => {
+        const spans = rank < 3 ? file.spans.slice(0, Math.min(2, budget)).map((s) => s.index) : [];
+        budget -= spans.length;
+        dialog.selection[file.path] = { read: spans.length > 0, edit: false, spans: new Set(spans) };
+    });
+    dialog.suggestion_files = files;
+    paint_task_suggestions(dialog);
+
+    $results.off('click.koda').on('click.koda', '.koda-toggle', function () {
+        const state = dialog.selection[this.dataset.path];
+        state[this.dataset.kind] = !state[this.dataset.kind];
+        if (this.dataset.kind === 'read' && state.read && !state.spans.size) {
+            // Reading a file with nothing ticked means its best section.
+            const first = files.find((f) => f.path === this.dataset.path).spans[0].index;
+            if (selected_ref_count(dialog) < MAX_CONTEXT_REFS) state.spans.add(first);
+        }
+        paint_task_suggestions(dialog);
+    }).off('change.koda').on('change.koda', '.koda-span input', function () {
+        const state = dialog.selection[this.dataset.path];
+        const index = Number(this.dataset.index);
+        if (this.checked && selected_ref_count(dialog) >= MAX_CONTEXT_REFS) {
+            this.checked = false;
+            return frappe.show_alert({ message: __('At most {0} reference sections per task.', [MAX_CONTEXT_REFS]), indicator: 'orange' });
+        }
+        if (this.checked) state.spans.add(index); else state.spans.delete(index);
+        paint_task_suggestions(dialog);
+    });
+}
+
+function selected_ref_count(dialog) {
+    return Object.values(dialog.selection).reduce((n, s) => n + (s.read ? s.spans.size : 0), 0);
+}
+
+function paint_task_suggestions(dialog) {
+    const esc = frappe.utils.escape_html;
+    const files = dialog.suggestion_files;
+    const top = files[0].score || 1;
+    const refs = selected_ref_count(dialog);
+    const edits = Object.values(dialog.selection).filter((s) => s.edit).length;
+    const strength = (score) => {
+        const ratio = score / top;
+        return ratio >= 0.75 ? '●●●' : ratio >= 0.4 ? '●●○' : '●○○';
+    };
+    const cards = files.map((file) => {
+        const state = dialog.selection[file.path];
+        const slash = file.path.lastIndexOf('/');
+        const name = file.path.slice(slash + 1);
+        const dir = slash > 0 ? file.path.slice(0, slash) : '';
+        const spans = !state.read ? '' : `<div class="koda-spans">${file.spans.map((s) => `
+            <label class="koda-span">
+                <input type="checkbox" data-path="${esc(file.path)}" data-index="${s.index}" ${state.spans.has(s.index) ? 'checked' : ''}>
+                <span class="koda-span-name" title="${esc(s.snippet)}">${esc(s.symbol || s.snippet || __('section'))}</span>
+                <span class="koda-span-lines">${__('lines {0}–{1}', [s.start, s.end])}</span>
+            </label>`).join('')}</div>`;
+        const toggle = (kind, label) => `<button type="button" class="btn btn-xs koda-toggle ${state[kind] ? 'btn-primary' : 'btn-default'}"
+            data-path="${esc(file.path)}" data-kind="${kind}">${label}</button>`;
+        return `<div class="koda-file ${state.read || state.edit ? 'is-active' : ''}">
+            <div class="koda-file-head">
+                <div class="koda-file-name"><b>${esc(name)}</b><span class="koda-file-dir">${esc(dir)}</span></div>
+                <span class="koda-strength" title="${__('How strongly this file matches the task')}">${strength(file.score)}</span>
+            </div>
+            <div class="koda-file-actions">
+                ${toggle('read', __('Read for context'))}${toggle('edit', __('Change this file'))}
+                <span class="koda-file-count">${__('{0} matching section(s)', [file.spans.length])}</span>
+            </div>${spans}</div>`;
+    });
+    dialog.fields_dict.results.$wrapper.html(`${KODA_SUGGEST_CSS}<div class="koda-suggest">
+        <div class="koda-summary">
+            <span>${__('{0} file(s) found', [files.length])}</span>
+            <span>${__('{0} of {1} reference sections · {2} to change', [refs, MAX_CONTEXT_REFS, edits])}</span>
+        </div>${cards.join('')}</div>`);
+}
+
+function save_task(frm, dialog, values) {
+    const selection = Object.entries(dialog.selection || {});
+    const refs = selection.flatMap(([, state]) => state.read ? [...state.spans] : []).map((index) => {
+        const s = dialog.suggestions[index];
+        return { path: s.path, start: s.start, end: s.end, symbol: s.symbol, why: s.snippet ? `Pattern: ${s.snippet}` : 'Related code' };
+    });
+    const edited = selection.filter(([, state]) => state.edit).map(([path]) => path);
+    const files = [...new Set([...split_lines(values.files), ...edited])];
+    if (!files.length) return frappe.msgprint(__('Name at least one file to change, or mark a suggested file as "Change this file".'));
+    const task = {
+        id: values.task_id === 'New task' ? '' : values.task_id,
+        title: values.title, goal: values.goal, description: values.description, action: values.action,
+        files,
+        // Server falls back to whole-file refs when this is empty.
+        context_refs: refs.length ? refs : dialog.existing_refs,
+        acceptance_criteria: split_lines(values.acceptance_criteria),
+        depends_on: values.depends_on || [],
+    };
+    frappe.call({
+        method: 'ampower_koda.agent.api.save_plan_task',
+        args: { request_name: frm.doc.name, task: JSON.stringify(task) },
+        freeze: true,
+        callback: (r) => {
+            frappe.show_alert({ message: __('Saved {0}', [r.message.task_id]), indicator: 'green' });
+            dialog.hide();
+            frm._task_dialog = null;
+            frm.reload_doc();
+        },
+    });
 }
 
 function setup_status_polling(frm) {
@@ -1197,8 +1466,10 @@ function load_user_defaults(frm) {
 
     setTimeout(function () {
         set_model_options_for_provider(frm, false);
+        // Setting the provider above already reset the model to its default, so
+        // the user's last-used model must win unconditionally here.
         var saved_model = stored['ai_agent_ai_model'];
-        if (saved_model && !frm.doc.ai_model) {
+        if (saved_model) {
             frm.set_value('ai_model', saved_model);
         }
     }, 100);

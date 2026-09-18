@@ -126,16 +126,25 @@ def load_grammars(specs: Sequence[LanguageSpec] = LANGUAGES) -> GrammarLoad:
 
 
 def _load_one(spec: LanguageSpec) -> Grammar:
-    """Load one grammar from its dedicated module, or from the language pack."""
-    from tree_sitter import Language
+    """Load one grammar from its dedicated module, or from the language pack.
 
+    The dedicated module wins when both are installed, but its absence is not
+    an error: a bench with only ``tree-sitter-language-pack`` still gets every
+    language the pack ships, which is all of the table.
+    """
     if spec.module:
-        module = import_module(spec.module)
-        capsule = getattr(module, spec.symbol)()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            language = Language(capsule)
-        return Grammar(name=spec.name, language=language, version=_distribution_version(spec))
+        try:
+            module = import_module(spec.module)
+        except ModuleNotFoundError:
+            module = None
+        if module is not None:
+            from tree_sitter import Language
+
+            capsule = getattr(module, spec.symbol)()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                language = Language(capsule)
+            return Grammar(name=spec.name, language=language, version=_distribution_version(spec))
 
     pack = import_module(_LANGUAGE_PACK)
     return Grammar(

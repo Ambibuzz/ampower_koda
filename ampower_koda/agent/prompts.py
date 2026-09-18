@@ -320,7 +320,13 @@ field; do not write code, pseudocode, or prose outside the structured response.
 - `context_refs` contains only the code spans needed to implement the task, at
   most 6. Use `start: 0` and `end: 0` for a whole-file reference. Always provide
   `symbol` and `why`; either may be an empty string, but not both.
-- `acceptance_criteria` contains observable, checkable outcomes.
+- `acceptance_criteria` contains observable outcomes the reviewer can check by
+  reading the resulting source or by a mechanical check available in the sandbox
+  (syntax validation, import, migration). The reviewer has no browser, server or
+  test runner. Never require a live UI session, manual clicks, screenshots or
+  production data; phrase UI or runtime behavior as the code path that produces it
+  (for example "stale responses are ignored because the callback compares the
+  captured request token to the current one").
 - `depends_on` contains earlier task ids. Tasks sharing a file must declare an
   ordering dependency.
 
@@ -340,67 +346,35 @@ do not ask questions or add exploration tasks.
 
 
 def get_implement_prompt(plan: str, understanding_summary: str, user_message: str, file_contents: str, request_name: str = None) -> str:
-    default = """## ORIGINAL USER REQUEST
+    default = """## USER REQUEST
 {user_message}
 
-## APPROVED PLAN (Todos — implement each one)
+## ACTIVE STRUCTURED TASK
 {plan}
 
-The plan contains **todo descriptions only** — no pre-written code. You must read the codebase, follow each TODO's description and acceptance criteria, and write production-ready code yourself.
-
-## CONCISE CODEBASE FINDINGS
+## CODEBASE FINDINGS
 {understanding_summary}
 
-## TARGET FILE MANIFEST
+## APPROVED WRITE PATHS
 {file_contents}
 
-File bodies are intentionally not duplicated in this prompt. Read each required
-span once with the tools, then keep using the result already present in context.
+Implement this task's goal and acceptance criteria. Read the referenced current
+source before editing; context line numbers are hints and may have shifted.
+Retrieve missing definitions or related schemas narrowly when needed.
+Use edit_file with a unique exact anchor for existing code. For line-based edits,
+read fresh line numbers first. Use write_file for new files. After EDIT_FAILED,
+read the current file and correct the anchor; do not repeat a failed edit blindly.
 
-## IMPLEMENTATION INSTRUCTIONS
+Preserve existing behavior outside the requested change. Follow the app's Frappe
+patterns and verify field names, whitelisted methods, hooks and client/server
+contracts from source. Do not guess. Only write approved task files; report a
+plan blocker if additional files or a different approach are required.
 
-Work through every **TODO** in the approved plan, in the stated execution order.
-
-For each TODO:
-1. **Read once** — batch independent files and use the smallest line ranges that cover the change
-2. **Verify** anchors match the codebase — re-read if line numbers shifted
-3. **Implement** the described change with replace_lines (preferred) or write_file for new files
-4. **Validate** with validate_code on every .py and .js edit
-5. **Confirm** the todo's acceptance criteria before moving to the next
-
-### Read order by task type
-- **Bug fix**: failing file first → trace related .py/.js/hooks.py
-- **DocType**: .json → .py → .js (if all exist)
-- **Report**: .json → .py → .js (copy peer report pattern from codebase)
-- **Page**: .json → .py → .js → .html
-- **Hook/API only**: hooks.py and/or target .py
-
-### CRITICAL RULES
-- **Read → Anchor → Edit → Validate → Verify** for every change
-- Never repeat an unchanged read or search. Re-read only after an edit or an explicit incomplete-result marker.
-- **Implement ALL todos** — don't skip; don't add unplanned files
-- **Match existing app patterns** — copy structure from peer artifacts when creating new ones
-- **NEVER insert code inside JS template literals**
-- **NEVER guess** field names or API paths — read files first
-- Only edit/create the **code files required by the plan**
-
-### FORBIDDEN — do NOT create these files
-Do NOT create README, CHANGELOG, notes, summary, status, "done", "finalize", or
-metadata files (e.g. `*.md`, `*.txt`, `*_NOTE.txt`, `IMPLEMENTATION_DONE.txt`,
-`FINALIZE_*.txt`, `*_METADATA.txt`, `*_SUMMARY*`). Do NOT write your summary or
-progress notes into a file. The ONLY files you may touch are the actual source
-code files needed to satisfy the plan's todos. Put any explanation in your final
-message text — never in a new file.
-
-### If problems
-- EDIT_FAILED → re-read file, use fresh line numbers
-- Line numbers shifted → search_code or re-read before retry
-- Todo description conflicts with file contents → follow the file, note in output
-
-### FINAL STEP — write a summary (in your message, not a file)
-After all edits are applied and validated, end with a concise plain-English
-summary titled `SUMMARY OF CHANGES:` — 3–8 sentences describing, per file, what
-you changed and why. Do not include code in the summary.
+Check modified code with validate_code. Report what checks actually ran and any
+runtime behavior still unverified. If the task is already satisfied, explain the
+source evidence without forcing an edit. Finish with the JSON completion report
+specified in the execution contract, including blockers and unverified behavior.
+Never write progress notes into the app.
 """
     template = get_config_prompt("implement_prompt", default, request_name)
 
@@ -456,7 +430,8 @@ those tool results already present in context.
 7. If the bug is in a file not listed, locate it narrowly and read it before editing — do not guess.
 
 ### FINAL STEP
-End with `SUMMARY OF CHANGES:` — 2–5 sentences on what you fixed for this follow-up only.
+End with the JSON completion report specified in the execution contract.
+Describe only what you fixed for this follow-up, including unresolved behavior.
 """
     template = get_config_prompt("follow_up_prompt", default, request_name)
     context = {
@@ -477,40 +452,25 @@ def get_review_prompt(edits_made: list[dict], user_message: str, request_name: s
     default = """## USER REQUEST
 {user_message_short}
 
-## FILES MODIFIED
+## FILES TO REVIEW
 {paths_list}
 
-You are in the TEST STAGE. Validate that the implementation is correct, clean, and
-meets Frappe standards. Keep this review brief and focused.
+Review the supplied task contract against the actual changes and current source.
+Inspect related definitions, schemas, callers and dependencies when needed to
+verify behavior. Use focused reads and searches. Check business logic, permissions,
+client/server contracts and Frappe conventions. Prioritize concrete defects and
+missing acceptance criteria; avoid stylistic preferences unrelated to the task.
 
-### Scope & efficiency rules (keep tokens low)
-- ONLY inspect the files listed above.
-- Prefer `read_file(path, start_line, end_line)` with targeted line ranges.
-- Syntax validation already runs locally before this stage. Call `validate_code` only
-  if a finding requires a fresh check after additional reasoning or edits.
-- Do NOT explore unrelated files or modules.
-- Limit your output to at most 5 issues.
-
-### Clean code & Frappe standards checklist
-1. **No hallucinations** — fieldnames, methods, DocTypes, and routes match real files.
-2. **Server/client wiring** — frappe.call ↔ @frappe.whitelist() paths match.
-3. **Frappe patterns** — use frappe.db/orm methods; avoid raw SQL unless necessary.
-4. **No debug artifacts** — no print/console.log, no leftover TODOs, no scratch files.
-5. **DocType consistency** — JSON/py/js changes agree on fieldnames & behavior.
-6. **Style** — consistent naming, no dead code, no unused imports.
-
-### Verdict format (REQUIRED)
-Output ONLY a single JSON object, nothing before or after it:
-{{"review_passed": true, "issues": []}}
-
-If issues were found:
-{{"review_passed": false, "issues": ["File: path — Issue: ... — Fix: ...", "..."]}}
-
-After reading the files, output the verdict JSON immediately — no prose before or after it.
+Mechanical checks are provided separately. They do not prove behavioral correctness.
+Do not claim tests were executed unless a test result is supplied. You cannot run a
+browser, server or test suite here: judge runtime and UI criteria from the source
+path that produces the behavior, and state in the evidence that the runtime was not
+exercised, rather than withholding a verdict. The execution contract below specifies
+the required verdict and per-criterion evidence format.
 """
     template = get_config_prompt("review_prompt", default, request_name)
     context = {
-        "user_message_short": user_message[:800] if user_message else "",
+        "user_message_short": user_message or "",
         "paths_list": paths_list,
     }
     return render_prompt_safe(template, context, default)

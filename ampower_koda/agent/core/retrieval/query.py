@@ -181,11 +181,24 @@ def _fenced_blocks(query: str) -> list[str]:
     return parts[1::2] if len(parts) >= 3 else []
 
 
+_SOURCE_EXTENSIONS: frozenset[str] = frozenset(
+    ("py", "pyi", "js", "jsx", "mjs", "cjs", "ts", "tsx", "vue", "json", "html", "htm", "css",
+     "scss", "md", "rst", "txt", "yaml", "yml", "toml", "ini", "cfg", "sql", "sh", "csv", "xml")
+)
+
+
 def _first_known_path(query: str) -> str:
-    """The first path-shaped token in the query. Empty when there is none."""
+    """The first path-shaped token in the query. Empty when there is none.
+
+    A bare ``word.word`` only counts when the suffix is a file extension:
+    ``frappe.call`` or ``self.name`` is an attribute access, and treating it as
+    a path gave a view of two common words the highest weight in the plan.
+    """
     for match in _PATH_LIKE.finditer(query):
         candidate = match.group(0)
-        if "/" in candidate or candidate.count(".") == 1:
+        if "/" in candidate:
+            return candidate
+        if candidate.count(".") == 1 and candidate.rsplit(".", 1)[1].lower() in _SOURCE_EXTENSIONS:
             return candidate
     return ""
 

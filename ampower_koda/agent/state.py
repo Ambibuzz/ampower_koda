@@ -42,6 +42,18 @@ class AgentState(TypedDict, total=False):
     implemented_files: list
     edits_made: list  # [{path, summary}, ...]
     change_summary: str  # plain-English summary of what the implement phase changed
+    execution_tasks: list[dict]
+    task_index: int
+    task_results: list[dict]
+    task_baseline: dict
+    execution_baseline: dict
+    task_completion: dict
+    task_summary: str
+    integration_mode: bool
+    tool_rounds_used: int
+    tool_rounds_limit: int
+    turn_exhausted: bool
+    allowed_write_paths: list[str] | None
 
     # Follow-up patch mode
     is_follow_up: bool
