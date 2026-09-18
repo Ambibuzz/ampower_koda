@@ -25,7 +25,12 @@
         "langsmith_api_key",
         "column_break_langsmith",
         "langsmith_project",
-        "langsmith_endpoint"
+        "langsmith_endpoint",
+        "kb_tab",
+        "kb_connection_section",
+        "kb_base_url",
+        "kb_api_key",
+        "kb_api_secret"
     ],
     "fields": [
         {
@@ -173,6 +178,32 @@
             "depends_on": "enable_langsmith",
             "default": "https://api.smith.langchain.com",
             "description": "Change only for self-hosted LangSmith."
+        },
+        {
+            "fieldname": "kb_tab",
+            "fieldtype": "Tab Break",
+            "label": "Knowledge Base"
+        },
+        {
+            "fieldname": "kb_connection_section",
+            "fieldtype": "Section Break",
+            "label": "Connection"
+        },
+        {
+            "fieldname": "kb_base_url",
+            "fieldtype": "Data",
+            "label": "KB Base URL",
+            "description": "e.g. https://kb.ambibuzz.com — no trailing slash."
+        },
+        {
+            "fieldname": "kb_api_key",
+            "fieldtype": "Data",
+            "label": "KB API Key"
+        },
+        {
+            "fieldname": "kb_api_secret",
+            "fieldtype": "Password",
+            "label": "KB API Secret"
         }
     ],
     "issingle": 1,

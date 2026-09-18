@@ -1,0 +1,63 @@
+{
+    "actions": [],
+    "autoname": "field:repository_name",
+    "creation": "2026-09-17 12:00:00.000000",
+    "doctype": "DocType",
+    "engine": "InnoDB",
+    "field_order": [
+        "repository_name",
+        "github_repo_url",
+        "base_branch"
+    ],
+    "fields": [
+        {
+            "fieldname": "repository_name",
+            "fieldtype": "Data",
+            "label": "Repository Name",
+            "reqd": 1,
+            "unique": 1,
+            "in_list_view": 1,
+            "description": "Must match KB's repository name exactly."
+        },
+        {
+            "fieldname": "github_repo_url",
+            "fieldtype": "Data",
+            "label": "GitHub Repo URL",
+            "reqd": 1
+        },
+        {
+            "fieldname": "base_branch",
+            "fieldtype": "Data",
+            "label": "Base Branch",
+            "default": "main"
+        }
+    ],
+    "links": [],
+    "modified": "2026-09-17 12:00:00.000000",
+    "modified_by": "Administrator",
+    "module": "Ampower Koda",
+    "name": "Agent Repository",
+    "naming_rule": "By fieldname",
+    "owner": "Administrator",
+    "permissions": [
+        {
+            "create": 1,
+            "delete": 1,
+            "email": 1,
+            "print": 1,
+            "read": 1,
+            "report": 1,
+            "role": "System Manager",
+            "share": 1,
+            "write": 1
+        },
+        {
+            "read": 1,
+            "role": "All"
+        }
+    ],
+    "sort_field": "modified",
+    "sort_order": "DESC",
+    "states": [],
+    "track_changes": 1
+}

@@ -10,3 +10,7 @@ doctype_js = {
     "Agent Request": "ampower_koda/doctype/agent_request/agent_request.js",
     "Agent Settings": "ampower_koda/doctype/agent_settings/agent_settings.js",
 }
+
+app_include_js = [
+    "/assets/ampower_koda/js/hd_ticket_intake_listener.js",
+]
