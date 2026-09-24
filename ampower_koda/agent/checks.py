@@ -20,6 +20,7 @@ import sys
 import frappe
 
 from ampower_koda.agent.tools import _resolve_path, validate_code
+from ampower_koda.agent.frappe_rpc import call_options as _call_options
 from ampower_koda.agent.run_control import check_active
 
 REQUIRED_DOCTYPE_KEYS = ("doctype", "name", "module")
@@ -313,14 +314,7 @@ def _module_recovery(app_name: str, dotted_module: str) -> tuple[list[tuple[str,
 # must resolve to a real, @frappe.whitelist()-decorated Python function.
 # ---------------------------------------------------------------------------
 
-_CALL_METHOD_RE = None  # compiled lazily to keep the import list minimal
-
-
 def _wiring_checks(app_name: str, paths: list[str]) -> list[CheckResult]:
-    global _CALL_METHOD_RE
-    if _CALL_METHOD_RE is None:
-        _CALL_METHOD_RE = re.compile(r"""frappe\.call\(\s*\{[^}]*?method\s*:\s*["']([\w.]+)["']""")
-
     results = []
     for path in paths:
         if not path.endswith(".js"):
@@ -336,11 +330,16 @@ def _wiring_checks(app_name: str, paths: list[str]) -> list[CheckResult]:
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
-        methods = _CALL_METHOD_RE.findall(content)
-        if not methods:
-            continue
-
-        for method in methods:
+        for options in _call_options(content):
+            method = options.get("method")
+            if "doc" in options or ("module" in options and "page" in options):
+                results.append(CheckResult(f"wiring:{path} -> {method or 'dynamic method'}", True,
+                    "Document controller/page dispatch requires source tracing during semantic review.", verified=False))
+                continue
+            if not method or "." not in method:
+                results.append(CheckResult(f"wiring:{path} -> {method or 'dynamic method'}", True,
+                    "Dynamic or shorthand dispatch is not statically verified; trace it during review.", verified=False))
+                continue
             ok, reason = _whitelisted(method)
             results.append(CheckResult(f"wiring:{path} -> {method}", ok, reason))
     return results
@@ -355,27 +354,55 @@ def _whitelisted(dotted_method: str) -> tuple[bool, str]:
         parts = module_name.split(".")
         if not all(p.isidentifier() for p in [*parts, func_name]):
             return False, "invalid Python method path"
+        app_name = parts[0]
         relative = "/".join(parts[1:])
-        full = _resolve_path(parts[0], relative + ".py") if relative else ""
-        if not full or not os.path.isfile(full):
-            full = _resolve_path(parts[0], (relative + "/" if relative else "") + "__init__.py")
-        with open(full, encoding="utf-8") as source:
-            tree = ast.parse(source.read())
-        frappe_aliases, whitelist_aliases = set(), set()
-        for node in tree.body:
-            if isinstance(node, ast.Import):
-                frappe_aliases.update(a.asname or a.name for a in node.names if a.name == "frappe")
-            elif isinstance(node, ast.ImportFrom) and node.module == "frappe":
-                whitelist_aliases.update(a.asname or a.name for a in node.names if a.name == "whitelist")
-        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name]
-        if not functions:
-            return False, "method not found"
-        for decorator in functions[-1].decorator_list:
-            target = decorator.func if isinstance(decorator, ast.Call) else decorator
-            if isinstance(target, ast.Name) and target.id in whitelist_aliases:
-                return True, "whitelist decorator found in current source"
-            if isinstance(target, ast.Attribute) and target.attr == "whitelist" and isinstance(target.value, ast.Name) and target.value.id in frappe_aliases:
-                return True, "whitelist decorator found in current source"
-        return False, "could not verify a frappe.whitelist decorator in current source"
+        module_file = _resolve_path(app_name, relative + ".py") if relative else ""
+        init_file = _resolve_path(app_name, (relative + "/" if relative else "") + "__init__.py")
+        full = module_file if module_file and os.path.isfile(module_file) else init_file
+        if not os.path.isfile(full):
+            matches, _ = _module_recovery(app_name, module_name)
+            verified = []
+            for candidate_path, canonical_module in matches:
+                try:
+                    ok, _ = _source_has_whitelisted(_resolve_path(app_name, candidate_path), func_name)
+                except (OSError, SyntaxError, UnicodeError, ValueError):
+                    continue  # one unreadable candidate must not end the search
+                if ok:
+                    verified.append((candidate_path, canonical_module))
+            if len(verified) == 1:
+                candidate_path, canonical_module = verified[0]
+                return False, (
+                    f"method module '{module_name}' does not exist; matching @frappe.whitelist source is "
+                    f"{candidate_path}:{func_name}; use '{canonical_module}.{func_name}'"
+                )
+            if verified:
+                choices = ", ".join(f"'{module}.{func_name}' at {path}" for path, module in verified[:4])
+                return False, f"method module '{module_name}' does not exist; multiple whitelisted matches: {choices}"
+            return False, f"method module '{module_name}' does not exist and no matching whitelisted source was found"
+        return _source_has_whitelisted(full, func_name)
+    except PermissionError:
+        raise  # Environment ownership: do not tell implementation to rewrite correct source.
     except Exception as e:  # a bad import here is itself a wiring failure, not a crash
         return False, f"could not resolve: {e}"
+
+
+def _source_has_whitelisted(full: str, func_name: str) -> tuple[bool, str]:
+    """Check one already-resolved source file for a whitelisted function."""
+    with open(full, encoding="utf-8") as source:
+        tree = ast.parse(source.read())
+    frappe_aliases, whitelist_aliases = set(), set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            frappe_aliases.update(a.asname or a.name for a in node.names if a.name == "frappe")
+        elif isinstance(node, ast.ImportFrom) and node.module == "frappe":
+            whitelist_aliases.update(a.asname or a.name for a in node.names if a.name == "whitelist")
+    functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name]
+    if not functions:
+        return False, "method not found"
+    for decorator in functions[-1].decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Name) and target.id in whitelist_aliases:
+            return True, "whitelist decorator found in current source"
+        if isinstance(target, ast.Attribute) and target.attr == "whitelist" and isinstance(target.value, ast.Name) and target.value.id in frappe_aliases:
+            return True, "whitelist decorator found in current source"
+    return False, "could not verify a frappe.whitelist decorator in current source"
