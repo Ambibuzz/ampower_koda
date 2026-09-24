@@ -1,7 +1,7 @@
 """Real, mechanical Frappe health checks — run before any LLM review.
 
-Task checks cover syntax and JSON. Final integration also checks imports and
-wiring, once all dependent tasks have been implemented. Mechanical checks do
+Task checks cover syntax and JSON. Final integration also checks Query Builder
+fields, imports and wiring, once all dependent tasks have been implemented. Mechanical checks do
 not replace review against the approved acceptance criteria.
 
 Each checker runs per file in isolation, so a bad file or a crashing checker
@@ -11,6 +11,7 @@ becomes a failure line instead of aborting the whole check pass.
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import frappe
 from ampower_koda.agent.tools import _resolve_path, validate_code
 from ampower_koda.agent.frappe_rpc import call_options as _call_options
 from ampower_koda.agent.run_control import check_active
+from ampower_koda.agent.query_schema import query_fields
 
 REQUIRED_DOCTYPE_KEYS = ("doctype", "name", "module")
 REQUIRED_REPORT_KEYS = ("doctype", "report_name", "ref_doctype")
@@ -85,7 +87,7 @@ def run_health_checks(app_name: str, edits: list[dict]) -> HealthReport:
     """Run every mechanical check against this run's edited files."""
     paths = [e.get("path", "") for e in (edits or []) if e.get("path")]
     results: list[CheckResult] = []
-    for checker in (_syntax_checks, _json_checks, _import_checks, _wiring_checks):
+    for checker in (_syntax_checks, _json_checks, _query_schema_checks, _import_checks, _wiring_checks):
         results.extend(_isolated_checks(checker, app_name, paths))
     return HealthReport(results)
 
@@ -93,6 +95,80 @@ def run_health_checks(app_name: str, edits: list[dict]) -> HealthReport:
 def run_task_checks(app_name: str, paths: list[str]) -> HealthReport:
     """Check an intermediate task without requiring later tasks' wiring."""
     return HealthReport(_syntax_checks(app_name, paths) + _json_checks(app_name, paths))
+
+
+def run_query_schema_checks(app_name: str, paths: list[str]) -> HealthReport:
+    return HealthReport(_isolated_checks(_query_schema_checks, app_name, paths))
+
+
+def _declared_fields(app_name: str, doctype: str) -> set[str]:
+    """Column fields the app's own DocType JSON declares; they may await a test-site migration."""
+    filename = re.sub(r"\W+", "_", doctype).lower() + ".json"
+    ignored = {"node_modules", ".git", ".koda", "__pycache__", "dist", "build"}
+    no_columns = {"Section Break", "Column Break", "Tab Break", "HTML", "Button", "Heading", "Fold",
+                  "Table", "Table MultiSelect"}
+    root = frappe.get_app_path(app_name)
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in ignored]
+        if filename not in files:
+            continue
+        relative = os.path.relpath(os.path.join(directory, filename), root)
+        try:
+            with open(_resolve_path(app_name, relative), encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if isinstance(data, dict) and data.get("doctype") == "DocType" and data.get("name") == doctype:
+            return {field["fieldname"] for field in (data.get("fields") or [])
+                    if isinstance(field, dict) and field.get("fieldname")
+                    and isinstance(field.get("fieldtype"), str)
+                    and field["fieldtype"] not in no_columns and not field.get("is_virtual")}
+    return set()
+
+
+def _query_schema_checks(app_name: str, paths: list[str]) -> list[CheckResult]:
+    """Literal Query Builder fields (``qb.DocType("X").field``) against the site's installed columns."""
+    columns_for = getattr(frappe.db, "get_table_columns", None)
+    if not callable(columns_for):
+        return []
+    exists = getattr(frappe.db, "table_exists", None)
+    results, columns, declared = [], {}, {}
+    for path in paths:
+        if not path.endswith(".py"):
+            continue
+        full = _resolve_path(app_name, path)
+        if not os.path.isfile(full):
+            continue  # deleted in this run: nothing to query
+        with open(full, encoding="utf-8", errors="replace") as source:
+            references = query_fields(source.read())
+        checked, findings = 0, set()
+        for doctype, field, line in references:
+            if doctype not in columns:
+                # A DocType declared in this run may not be migrated yet: skip it.
+                installed = not callable(exists) or exists(doctype)
+                columns[doctype] = set(columns_for(doctype)) if installed else None
+            if columns[doctype] is None:
+                continue
+            checked += 1
+            if field in columns[doctype] or (doctype, field) in findings:
+                continue
+            findings.add((doctype, field))
+            if doctype not in declared:
+                declared[doctype] = _declared_fields(app_name, doctype)
+            pending = field in declared[doctype]
+            if pending:
+                advice = "The field is declared in app JSON; verify after test-site migration."
+            else:
+                close = difflib.get_close_matches(field, columns[doctype], n=5, cutoff=0.6)
+                advice = (f'Inspect read_doctype_schema("{doctype}") and correct the query. '
+                          + (f"Closest installed columns: {', '.join(close)}. " if close else "")
+                          + f"{doctype} has {len(columns[doctype])} installed columns.")
+            detail = f"{path}:{line} queries {doctype}.{field}, which is absent from the installed database. {advice}"
+            results.append(CheckResult(f"schema:{path}:{doctype}.{field}", pending, detail, verified=not pending))
+        if checked and not findings:
+            results.append(CheckResult(f"schema:{path}", True,
+                                       f"Checked {checked} literal query-field references against installed columns."))
+    return results
 
 
 def _isolated_checks(checker, app_name: str, paths: list[str]) -> list[CheckResult]:
