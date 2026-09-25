@@ -226,9 +226,30 @@ function render_status_dashboard(frm) {
 
     var error_html = '';
     if (status === 'Failed' && frm.doc.error_log) {
-        var err_preview = (frm.doc.error_log || '').substring(0, 300);
+        var full_error = String(frm.doc.error_log || '');
+        var err_preview = full_error.substring(0, 300) + (full_error.length > 300 ? '…' : '');
         error_html = '<div class="agent-error-preview">'
             + '<strong>Error:</strong> ' + frappe.utils.escape_html(err_preview)
+            + (full_error.length > 300
+                ? ' <a class="agent-error-full">' + __('See the full error below') + '</a>'
+                : '')
+            + '</div>';
+    }
+
+    var cache_html = '';
+    var cache_input = Number(frm.doc.cache_input_tokens || 0);
+    if (cache_input > 0) {
+        var cache_read = Number(frm.doc.cache_read_tokens || 0);
+        var cache_hit = 100 * cache_read / cache_input;
+        cache_html = '<div class="agent-push-info" style="display:flex;gap:18px;flex-wrap:wrap;">'
+            + '<span><strong>Whole-run cache hit:</strong> ' + cache_hit.toFixed(1) + '%</span>'
+            + '<span><strong>New input:</strong> '
+            + Math.max(0, cache_input - cache_read).toLocaleString() + '</span>'
+            + '<span><strong>Cache writes:</strong> '
+            + Number(frm.doc.cache_write_tokens || 0).toLocaleString() + '</span>'
+            + (Number(frm.doc.cost_estimate || 0) > 0
+                ? '<span><strong>Provider cost:</strong> $' + Number(frm.doc.cost_estimate).toFixed(6) + '</span>'
+                : '')
             + '</div>';
     }
 
@@ -242,10 +263,15 @@ function render_status_dashboard(frm) {
         + bench_info_html
         + plan_info_html
         + push_info_html
+        + cache_html
         + error_html
         + '</div>';
 
     $(wrapper.wrapper).html(html);
+    // scroll_to_field also opens the collapsed Logs section.
+    $(wrapper.wrapper).find('.agent-error-full').on('click', function () {
+        frm.scroll_to_field('error_log');
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +383,12 @@ function style_form(frm) {
         border-radius: 6px;
         font-size: 12px;
         color: var(--red-700, #b91c1c);
-        max-height: 80px;
-        overflow: hidden;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+    }
+    .agent-error-full {
+        cursor: pointer;
+        font-weight: 600;
     }
 
     .agent-push-info {
@@ -1377,17 +1407,32 @@ function append_log_entry(frm, data) {
     } else if (data.type === 'token_usage') {
         var input_tokens = Number(data.input_tokens || 0);
         var cached_tokens = Number(data.cache_read_tokens || 0);
+        var cache_write_tokens = Number(data.cache_write_tokens || 0);
+        var cache_new_input_tokens = Number(data.cache_new_input_tokens || 0);
         var output_tokens = Number(data.output_tokens || 0);
         var context_tokens = data.context_chars ? Math.ceil(Number(data.context_chars) / 3.6) : 0;
+        var full_input = Number(data.context_input_tokens || 0);
+        var estimated_input = Number(data.context_estimated_tokens || context_tokens);
         var pieces = [];
-        if (input_tokens) pieces.push('input ' + input_tokens.toLocaleString());
+        if (full_input) pieces.push('context ' + full_input.toLocaleString());
+        else if (estimated_input) pieces.push('context ~' + estimated_input.toLocaleString());
+        if (input_tokens) pieces.push('uncached input ' + input_tokens.toLocaleString());
         if (cached_tokens) pieces.push('cached ' + cached_tokens.toLocaleString());
+        if (cache_write_tokens) pieces.push('cache write ' + cache_write_tokens.toLocaleString());
+        if (cache_new_input_tokens) pieces.push('new input ' + cache_new_input_tokens.toLocaleString());
+        if (data.cache_read_ratio !== undefined && data.cache_read_ratio !== null) {
+            pieces.push('whole-call hit ' + (Number(data.cache_read_ratio) * 100).toFixed(1) + '%');
+        }
+        if (Number(data.provider_cost || 0) > 0) {
+            pieces.push('cost $' + Number(data.provider_cost).toFixed(6));
+        }
         if (output_tokens) pieces.push('output ' + output_tokens.toLocaleString());
-        if (context_tokens) pieces.push('context ~' + context_tokens.toLocaleString());
+        if (data.input_budget_tokens) pieces.push('budget ' + Number(data.input_budget_tokens).toLocaleString());
+        if (data.upstream_provider) pieces.push('via ' + String(data.upstream_provider));
         html = '<div style="color:var(--text-muted);margin-bottom:3px;padding-left:14px;">'
             + ts + '\u25C7 round ' + frappe.utils.escape_html(String(data.round || '?'))
             + ': ' + frappe.utils.escape_html(pieces.join(' \u00B7 ') || String(data.tokens_this_round || 0) + ' tokens')
-            + ' <b>(total ' + Number(data.tokens_total || 0).toLocaleString() + ')</b>'
+            + ' <b>(cumulative ' + Number(data.tokens_total || 0).toLocaleString() + ')</b>'
             + '</div>';
     } else if (data.type === 'duplicate_tool_call') {
         html = '<div style="color:var(--orange-500);margin-bottom:3px;padding-left:14px;">'
