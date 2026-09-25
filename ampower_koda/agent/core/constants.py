@@ -154,7 +154,6 @@ CALIBRATOR_CLAMP: Final[tuple[float, float]] = (0.4, 3.0)
 CALIBRATOR_ALPHA: Final[float] = 0.3
 
 
-MAX_PREFIX_BREAKPOINTS: Final[int] = 3
 MAX_TOTAL_BREAKPOINTS: Final[int] = 4
 
 MIN_CACHEABLE_BY_FAMILY: Final[dict[str, int]] = {

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from ..constants import MAP_MAX_TOKENS, MIRROR_RANK_FACTOR
 from ..contracts.repo_map import FileRanks, MirrorSet, RepoMap
@@ -72,30 +72,3 @@ def build_map(
     )
 
 
-def repersonalize_once(
-    build: MapBuild,
-    index: RepositoryIndex,
-    *,
-    query: str = "",
-    established: Sequence[str] = (),
-    max_tokens: int = MAP_MAX_TOKENS,
-) -> MapBuild:
-    """Re-rank the map once, now that the session knows what it is about."""
-    if build.rewritten or build.personalized or not (query or established):
-        return build
-
-    return replace(
-        build_map(
-            index,
-            query=query,
-            established=established,
-            max_tokens=max_tokens,
-            graph=build.graph,
-        ),
-        rewritten=True,
-    )
-
-
-def with_map(build: MapBuild, rendered: RepoMap) -> MapBuild:
-    """Replace only the rendered map, keeping the ranking machinery."""
-    return replace(build, map=rendered)

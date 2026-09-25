@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any
-
+from dataclasses import dataclass, field, fields
 from ..constants import (
     COCHANGE_HALF_LIFE_DAYS,
     COCHANGE_MAX_COMMITS,
@@ -156,20 +154,3 @@ class CoreConfig:
 def config_defaults() -> CoreConfig:
     """Return a fresh, fully defaulted config."""
     return CoreConfig()
-
-
-def as_mapping(config: Any) -> dict[str, Any]:
-    """Render a config (or group) as nested plain dicts."""
-    if not is_dataclass(config):
-        raise ConfigError("<root>", f"not a config dataclass: {type(config).__name__}")
-
-    result: dict[str, Any] = {}
-    for spec in fields(config):
-        value = getattr(config, spec.name)
-        if is_dataclass(value):
-            result[spec.name] = as_mapping(value)
-        elif isinstance(value, tuple):
-            result[spec.name] = list(value)
-        else:
-            result[spec.name] = value
-    return result

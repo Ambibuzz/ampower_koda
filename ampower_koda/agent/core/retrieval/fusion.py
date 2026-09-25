@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from ..constants import FUSION_RANK_DECAY, RRF_K, SOURCE_LIMIT, UNION_LIMIT
+from ..constants import FUSION_RANK_DECAY, SOURCE_LIMIT, UNION_LIMIT
 from ..contracts.retrieval import LEG_TRUST, UNKNOWN_LEG_TRUST, Hit, LegResult
 
 
@@ -45,26 +45,6 @@ def fuse(legs: Sequence[LegResult], *, limit: int = UNION_LIMIT) -> tuple[FusedH
         FusedHit(hit=hit.with_score(priors[hit.chunk.digest]), prior=priors[hit.chunk.digest])
         for hit in ordered[:limit]
     )
-
-
-def reciprocal_rank_fusion(
-    legs: Sequence[LegResult],
-    *,
-    limit: int,
-    k: int = RRF_K,
-) -> tuple[Hit, ...]:
-    """Classic RRF. Kept for seed selection, and only for that."""
-    scores: dict[str, float] = {}
-    hits: dict[str, Hit] = {}
-
-    for result in legs:
-        for rank, hit in enumerate(result.hits):
-            digest = hit.chunk.digest
-            scores[digest] = scores.get(digest, 0.0) + 1.0 / (k + rank + 1)
-            hits.setdefault(digest, hit)
-
-    ordered = sorted(hits.values(), key=lambda hit: (-scores[hit.chunk.digest], hit.chunk.location))
-    return tuple(ordered[:limit])
 
 
 def normalise(priors: Mapping[str, float]) -> dict[str, float]:

@@ -4,21 +4,9 @@ from __future__ import annotations
 
 from ..contracts.agent import ToolOutcome
 
-PARSE_ERROR_KEY = "__parse_error"
-
-
-def ok(text: str) -> ToolOutcome:
-    return ToolOutcome(text=text)
-
-
 def error(detail: str) -> ToolOutcome:
     """``[error: …]`` — a value the model can read and act on."""
     return ToolOutcome(text=f"[error: {detail}]", ok=False)
-
-
-def parse_error(raw: str) -> ToolOutcome:
-    """The provider sent tool-call JSON that does not parse."""
-    return ToolOutcome(text=f"[error: malformed tool call — {PARSE_ERROR_KEY}: {raw}]", ok=False)
 
 
 def cap_rows(rows: list[str], limit: int, *, unit: str = "rows") -> ToolOutcome:

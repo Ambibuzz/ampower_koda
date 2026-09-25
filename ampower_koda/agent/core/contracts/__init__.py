@@ -44,7 +44,7 @@ from .repository import (
     iter_definitions,
     with_file,
 )
-from .retrieval import LEG_TRUST, UNKNOWN_LEG_TRUST, Hit, LegName, LegResult, SearchResult
+from .retrieval import LEG_TRUST, UNKNOWN_LEG_TRUST, Hit, LegResult, SearchResult
 from .session import CoChangeMemory, RepoMemory, SessionContext
 from .source import FileStat, Overlay, SourceFile, Span
 from .symbols import (
@@ -84,7 +84,6 @@ __all__ = [
     "LedgerEntry",
     "LedgerKind",
     "LedgerSource",
-    "LegName",
     "LegResult",
     "Message",
     "MirrorSet",

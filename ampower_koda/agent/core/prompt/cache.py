@@ -127,18 +127,3 @@ def _keep_alive(
     return previous
 
 
-def system_plan_mismatch(system_prompt: str, plan: CachePlan) -> str | None:
-    """Detect a driver about to send two role prompts, or the wrong one."""
-    wanted = system_prompt.strip()
-    if not wanted:
-        return None
-
-    carried = plan.system_text
-    if not carried:
-        return "cache plan carries no system text while a system prompt was supplied"
-    if wanted in carried:
-        return None
-    return (
-        "system prompt is not the one in the cache plan — "
-        "sending both would run the wrong role"
-    )

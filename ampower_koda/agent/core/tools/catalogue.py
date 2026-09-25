@@ -117,6 +117,3 @@ CATALOGUE: tuple[ToolSpec, ...] = (
 TOOL_NAMES: tuple[str, ...] = tuple(spec.name for spec in CATALOGUE)
 
 
-def by_name(name: str) -> ToolSpec | None:
-    """One tool's contract, or ``None`` when nothing is spelled that way."""
-    return next((spec for spec in CATALOGUE if spec.name == name), None)

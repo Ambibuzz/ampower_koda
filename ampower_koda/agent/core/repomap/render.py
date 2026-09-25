@@ -9,7 +9,6 @@ from ..constants import MAP_MAX_TOKENS
 from ..contracts.analysis import FileAnalysis
 from ..contracts.repo_map import FileRanks, RepoMap
 from ..contracts.repository import RepositoryIndex
-from ..contracts.symbols import Definition
 from ..tokens import estimate_tokens, truncate_to_tokens
 
 MAPPED_ROLES: frozenset[str] = frozenset({"function", "method", "class", "enum", "type"})
@@ -179,8 +178,3 @@ def _degraded(index: RepositoryIndex, max_tokens: int) -> RepoMap:
     )
 
 
-def definitions_in_map(analysis: FileAnalysis) -> tuple[Definition, ...]:
-    """The definitions this file would contribute. Exposed for tests and tooling."""
-    return tuple(
-        definition for definition in analysis.definitions if definition.role in MAPPED_ROLES
-    )

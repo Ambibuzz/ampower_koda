@@ -11,7 +11,6 @@ from .schema import (
     ModelsConfig,
     RetrievalConfig,
     SecurityConfig,
-    as_mapping,
     config_defaults,
 )
 
@@ -23,7 +22,6 @@ __all__ = [
     "ModelsConfig",
     "RetrievalConfig",
     "SecurityConfig",
-    "as_mapping",
     "config_defaults",
     "merge_config",
     "parse_toml",

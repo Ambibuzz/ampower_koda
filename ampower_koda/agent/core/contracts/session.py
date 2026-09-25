@@ -54,9 +54,7 @@ class SessionContext:
     repo_map: RepoMap = field(default_factory=RepoMap)
     """Frozen for the session, and first in the cached prefix. Held here rather
     than rebuilt per turn because rewriting it invalidates every byte
-    downstream of it — see
-    :func:`~ampower_koda.agent.core.repomap.build.repersonalize_once` for the
-    single rewrite that is permitted."""
+    downstream of it."""
 
     overlaid: tuple[str, ...] = ()
     """Paths whose analysis came from an overlay rather than from disk. Kept so

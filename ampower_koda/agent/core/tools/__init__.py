@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 from ..contracts.agent import ToolOutcome
-from .catalogue import CATALOGUE, TOOL_NAMES, ToolSpec, by_name
-from .results import cap_chars, cap_rows, error, ok, parse_error
+from .catalogue import CATALOGUE, TOOL_NAMES, ToolSpec
+from .results import cap_chars, cap_rows, error
 
 __all__ = [
     "CATALOGUE",
     "TOOL_NAMES",
     "ToolOutcome",
     "ToolSpec",
-    "by_name",
     "cap_chars",
     "cap_rows",
     "error",
-    "ok",
-    "parse_error",
 ]
