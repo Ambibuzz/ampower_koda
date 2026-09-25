@@ -41,8 +41,6 @@ from .tools.run import BUILT_IN, NullHost, run_tool
 from .workingset.build import working_set_for
 from .workspace.ports import Workspace
 
-COVERAGE_CENTRAL_FILES = 5
-
 ROLE_PROMPT = """You are a software engineer working inside one repository.
 
 Answer from what you have actually read. When you have not read something, say
@@ -225,12 +223,6 @@ def _rounds(state, *, working, model, model_id, host, role_prompt,
 
         calls = turn.calls or leaked
         if not calls:
-            nudge = _coverage(state)
-            if nudge is not None:
-                state.transcript = _append(state.transcript, "user", nudge.text)
-                state.notes = (*state.notes, "coverage nudge")
-                state.meters = _advance(state.meters)
-                continue
             state.answer = text or _salvage(state, "", "the model returned no text")
             return state
 
@@ -318,28 +310,6 @@ def _salvage(state, body: str, reason: str) -> str:  # noqa: ANN001
 def _advance(meters: gates.TurnMeters) -> gates.TurnMeters:
     """Count a round that ran no tool."""
     return replace(meters, round_index=meters.round_index + 1)
-
-
-def _coverage(state):  # noqa: ANN001
-    """The one gate that asks for more work rather than less."""
-    if state.meters.coverage_fired:
-        return None
-
-    state.meters = replace(state.meters, coverage_fired=True)
-
-    opened = {
-        ref.path
-        for entry in state.ledger.entries
-        if entry.kind == "span"
-        for ref in entry.refs
-    }
-    decision = gates.coverage_gate(
-        replace(state.meters, coverage_fired=False),
-        central=state.session.ranks.ordered()[:COVERAGE_CENTRAL_FILES],
-        opened=opened,
-        discovery_calls=len(state.calls),
-    )
-    return decision.nudge
 
 
 def _record(state, call: ToolCall, outcome, text: str):  # noqa: ANN001

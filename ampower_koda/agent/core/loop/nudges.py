@@ -27,12 +27,6 @@ CONTINUE = (
     "the question, and do not start over — continue the sentence."
 )
 
-COVERAGE = (
-    "You are about to answer without having opened {files}, which rank among the most "
-    "central files for this question. Open what is relevant, or say explicitly why it "
-    "is not."
-)
-
 CUT_OFF = (
     "[the model's output was cut off at the output limit and could not be continued]"
 )
@@ -46,11 +40,6 @@ class Nudge:
 
     kind: str
     text: str
-
-    @property
-    def forces_terminal(self) -> bool:
-        """Whether this nudge comes with ``tool_choice: none``."""
-        return self.kind != "coverage"
 
 
 def budget() -> Nudge:
@@ -67,7 +56,3 @@ def dry() -> Nudge:
 
 def continuation() -> Nudge:
     return Nudge(kind="continue", text=CONTINUE)
-
-
-def coverage(files: tuple[str, ...]) -> Nudge:
-    return Nudge(kind="coverage", text=COVERAGE.format(files=", ".join(files)))

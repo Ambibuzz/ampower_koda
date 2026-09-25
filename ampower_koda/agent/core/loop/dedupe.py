@@ -21,13 +21,8 @@ REPLAYABLE: frozenset[str] = frozenset(
     }
 )
 
-NOT_REPLAYABLE: frozenset[str] = frozenset(
-    {"recall", "trace_discover", "read_doctype_schema"}
-)
 
 RESULT_FINGERPRINT_MIN_CHARS = 400
-
-PREFETCH_CONCURRENCY = 4
 
 
 def canonical(tool: str, arguments: Mapping[str, object]) -> str:
@@ -111,13 +106,3 @@ class Memo:
         """Both nets, entirely. Called after any non-replayable call."""
         self.calls.clear()
         self.results.clear()
-
-
-def leading_replayable(tools: list[str]) -> int:
-    """How many calls at the head of a batch may be dispatched together."""
-    count = 0
-    for tool in tools:
-        if tool not in REPLAYABLE:
-            break
-        count += 1
-    return min(count, PREFETCH_CONCURRENCY)
