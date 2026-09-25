@@ -425,6 +425,12 @@ class PatchResult:
     rejected: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True, slots=True)
+class ScopeCompletion:
+    plan: dict
+    repairs: tuple[str, ...] = ()
+
+
 def _canonicalize_task_paths(tasks: list[dict], path_exists: Callable[[str], bool], *,
                              prefix: str, start: int = 0,
                              task_id: str = "") -> list[tuple[str, dict[str, str]]]:
@@ -508,6 +514,81 @@ def ground_plan_references(plan: dict, path_exists: Callable[[str], bool], *, ap
         raise PlanValidationError(issues)
     # Root corrections may reveal duplicate paths/dependency conflicts.
     return validate_plan(result)
+
+
+def complete_rename_file_scope(
+    plan: dict, path_exists: Callable[[str], bool], *, app_name: str = "", start: int = 0, task_id: str = "",
+) -> ScopeCompletion:
+    """Complete the file inventory for an explicit rename already in the plan.
+
+    Recognize only a direct `Rename/Move <known source> to <destination>`
+    instruction in approved task text. Blocker reports are never authority for
+    new paths. Ambiguous prose, existing destinations, and conflicting exclusions
+    stay with ordinary plan repair. This function changes no files or criteria.
+    """
+    result = copy.deepcopy(plan)
+    notices = []
+    prefix = app_name.rstrip("/") + "/" if app_name else ""
+    if prefix:
+        for changed_task, replacements in _canonicalize_task_paths(
+            result.get("tasks", []), path_exists, prefix=prefix, start=start, task_id=task_id,
+        ):
+            notices.append(
+                f"{changed_task}: removed redundant app prefix from "
+                + ", ".join(f"{source} -> {target}" for source, target in replacements.items())
+            )
+    target = r'''(?:`([^`\r\n]+)`|"([^"\r\n]+)"|'([^'\r\n]+)'|((?:[\w.@+-]+/)*[\w@+()-][\w.@+()-]*\.[A-Za-z0-9]{1,10}))(?=$|[\s,;.])'''
+    for index, task in enumerate(result.get("tasks", [])):
+        if index < start or (task_id and task["id"] != task_id):
+            continue
+        known = dict.fromkeys([*task["files"], *[ref["path"] for ref in task["context_refs"]]])
+        texts = [task["description"], task["goal"], *task["acceptance_criteria"]]
+        pairs = set()
+        for source in known:
+            if not path_exists(source):
+                continue
+            # Prose often includes the app name, while `files` is app-relative.
+            # Strip it only when the known source proves that prefix redundant.
+            aliases = [(source, "")]
+            if prefix and not path_exists(prefix + source):
+                aliases.append((prefix + source, prefix))
+            for displayed_source, redundant_prefix in aliases:
+                instruction = re.compile(
+                    r"^\s*(?:[-*]\s+)?(?i:rename|move)\s+(?:(?i:the|existing|file|script|from)\s+)*"
+                    + r"[`\"']?" + re.escape(displayed_source) + r"[`\"']?\s+(?i:to|as)\s+" + target,
+                )
+                for text in texts:
+                    for line in text.splitlines():
+                        line = re.sub(r"\\([_*`])", r"\1", line)
+                        match = instruction.match(line)
+                        if not match or re.search(r"\b(?:not|never|instead)\b", line, re.IGNORECASE):
+                            continue
+                        destination = next(part for part in match.groups() if part is not None)
+                        if redundant_prefix:
+                            if not destination.startswith(redundant_prefix):
+                                continue
+                            destination = destination[len(redundant_prefix):]
+                        issues = []
+                        canonical = _path(destination, "rename destination", issues)
+                        if issues or destination.endswith(("/", "\\")) or not canonical or canonical == source:
+                            continue
+                        if path_exists(canonical):
+                            continue
+                        excluded = plan.get("scope", {}).get("out", [])
+                        if any(source in item or canonical in item or re.search(r"\brenam\w*\b", item, re.IGNORECASE)
+                               for item in excluded):
+                            continue
+                        pairs.add((source, canonical))
+        if len(pairs) != 1:
+            continue
+        source, destination = next(iter(pairs))
+        missing = [path for path in (source, destination) if path not in task["files"]]
+        if not missing and task["action"] == "CREATE":
+            continue
+        task["files"].extend(missing)
+        task["action"] = "CREATE"
+        notices.append(f"{task['id']}: completed declared rename scope {source} -> {destination}")
+    return ScopeCompletion(plan=result, repairs=tuple(notices))
 
 
 def apply_plan_patch(plan: dict, patch: dict) -> PatchResult:
