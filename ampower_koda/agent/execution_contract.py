@@ -45,7 +45,7 @@ def change_evidence(before: dict, read_current, *, limit: int = 20000) -> tuple[
             continue
         change = {
             "path": path, "before": revision(original), "after": revision(current),
-            "summary": "Created" if original is None else "Modified",
+            "summary": "Deleted" if current is None else ("Created" if original is None else "Modified"),
         }
         changes.append(change)
         header = f"\n### {path} ({change['summary']})\nSHA256 {change['before']} -> {change['after']}\n"
@@ -63,23 +63,64 @@ def change_evidence(before: dict, read_current, *, limit: int = 20000) -> tuple[
     return changes, "".join(blocks) or "No net file changes."
 
 
-def completion_report(text: str) -> dict:
-    """An explicit completion report is a claim, not independent verification."""
+def renamed_sources(file_moves: list[dict], read_current) -> set[str]:
+    """Missing sources are intentional only when a recorded move still has a destination.
+
+    Follow chains because a file may be renamed more than once before final
+    integration. Cycles with no surviving file never excuse missing paths.
+    """
+    destinations = {move["source"]: move["destination"] for move in file_moves
+                    if move.get("source") and move.get("destination")}
+    allowed = set()
+    for source in destinations:
+        if read_current(source) is not None:
+            continue
+        path, visited = source, {source}
+        while path in destinations:
+            path = destinations[path]
+            if read_current(path) is not None:
+                allowed.add(source)
+                break
+            if path in visited:
+                break
+            visited.add(path)
+    return allowed
+
+
+def _parse_completion_report(text: str) -> tuple[dict, str]:
+    """Return the canonical report and why parsing failed, if it did."""
     try:
-        payload = json.loads(text)
+        payload = json.loads(text or "")
     except (ValueError, TypeError):
-        return {}
-    if not isinstance(payload, dict) or payload.get("status") not in ("complete", "blocked"):
-        return {}
+        return {}, ("The reply is not a JSON object. Reply with only the JSON report: "
+                    '{"status": "complete"|"blocked", "summary": "...", "behavior": [...], '
+                    '"verification": [...], "unverified": [...]}.')
+    if not isinstance(payload, dict):
+        return {}, "The reply must be a single JSON object, not a list or scalar."
+    if payload.get("status") not in ("complete", "blocked"):
+        return {}, 'The "status" field must be exactly "complete" or "blocked".'
     if not isinstance(payload.get("summary"), str) or not payload["summary"].strip():
-        return {}
+        return {}, 'The "summary" field must be a non-empty string.'
     for key in ("behavior", "verification", "unverified"):
         values = payload.get(key)
         if not isinstance(values, list) or any(not isinstance(v, str) or not v.strip() for v in values):
-            return {}
+            return {}, f'The "{key}" field must be a list of non-empty strings (use [] when there are none).'
     if payload["status"] == "complete" and not payload["behavior"]:
-        return {}
-    return {key: payload[key] for key in ("status", "summary", "behavior", "verification", "unverified")}
+        return {}, 'A "complete" report must list at least one entry under "behavior".'
+    return {
+        key: payload[key]
+        for key in ("status", "summary", "behavior", "verification", "unverified")
+    }, ""
+
+
+def completion_report_problem(text: str) -> str:
+    """Why ``text`` is not a usable completion report, or "" when it is."""
+    return _parse_completion_report(text)[1]
+
+
+def completion_report(text: str) -> dict:
+    """An explicit completion report is a claim, not independent verification."""
+    return _parse_completion_report(text)[0]
 
 
 def review_decision(payload, criteria: list[str]) -> tuple[str, str]:
