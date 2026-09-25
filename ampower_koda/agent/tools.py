@@ -17,6 +17,12 @@ from ampower_koda.agent.core.constants import CACHE_DIRECTORY
 from ampower_koda.agent.core.globs import compile_globs
 from ampower_koda.agent.javascript_validation import globals_configs, validate_javascript_names
 
+READ_WHOLE_FILE_LINES = 2000
+# Longer code files are first shown as a summary: every read rides along in later requests.
+SUMMARY_MIN_LINES = 200
+# Runs between signatures up to this long are shown verbatim.
+SUMMARY_KEEP_RUN = 6
+MAX_READ_RANGES = 20
 
 
 def command_environment() -> dict:
@@ -196,14 +202,68 @@ def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
         return _tool_error("find_files", ex, f"Error: {ex}")
 
 
-def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0) -> str:
+def _parse_ranges(spec: str, total: int) -> list[tuple[int, int]]:
+    """``"40-80,120"`` -> merged, clamped 1-indexed inclusive spans."""
+    spans = []
+    for part in str(spec).replace(" ", "").split(","):
+        if not part:
+            continue
+        first, _, last = part.partition("-")
+        if not first.isdigit() or (last and not last.isdigit()):
+            raise ValueError(f"Invalid range {part!r}: use start-end, e.g. 40-80,120-160")
+        a, b = int(first), int(last or first)
+        if a < 1 or b < a:
+            raise ValueError(f"Invalid range {part!r}: lines are 1-indexed and start <= end")
+        if a <= total:
+            spans.append((a, min(b, total)))
+    if len(spans) > MAX_READ_RANGES:
+        raise ValueError(f"At most {MAX_READ_RANGES} ranges per read")
+    merged = []
+    for a, b in sorted(spans):
+        if merged and a <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _summary(path: str, all_lines: list[str]) -> str:
+    """Signatures and short runs verbatim, long bodies elided; "" when that saves too little."""
+    declared = {index for index, _ in _declarations(path, all_lines)}
+    if not declared:
+        return ""
+    total, rows, shown, index = len(all_lines), [], 0, 0
+    while index < total:
+        if index in declared:
+            rows.append(f"{index + 1:5d} | {all_lines[index].rstrip()}")
+            shown, index = shown + 1, index + 1
+            continue
+        run_end = index
+        while run_end < total and run_end not in declared:
+            run_end += 1
+        if run_end - index <= SUMMARY_KEEP_RUN:
+            rows.extend(f"{i + 1:5d} | {all_lines[i].rstrip()}" for i in range(index, run_end))
+            shown += run_end - index
+        else:
+            rows.append(f"      … lines {index + 1}-{run_end} elided")
+        index = run_end
+    if shown > total * 0.6:
+        return ""
+    return (f"[{path}] summary of {total} lines: signatures kept, long bodies elided\n" + "\n".join(rows)
+            + f"\n[Read what you need in one call, e.g. ranges=\"40-80,120-160\"; ranges=\"1-{total}\" "
+            "reads the whole file. Edit only lines you have read.]")
+
+
+def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0, ranges: str = "") -> str:
     """Read a file (path relative to app root) with line numbers.
 
+    - ``ranges`` ("40-80,120-160") reads several spans in one call.
     - If start_line and end_line are both > 0, reads only that range (1-indexed, inclusive).
-    - Otherwise reads the full file.
+    - Otherwise reads the full file, except that a long code file is summarized
+      (signatures kept, long bodies elided) so the model reads only the ranges it needs.
 
     Returns numbered lines (format: '    1 | content') so that line numbers can be used
-    directly with replace_lines / insert_lines.
+    when citing source.
     """
     try:
         full = _resolve_path(app_name, path)
@@ -213,17 +273,32 @@ def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0) 
             all_lines = f.readlines()
 
         total = len(all_lines)
-        if start_line > 0 and end_line > 0:
-            s = max(0, start_line - 1)
-            e = min(total, end_line)
-            lines = all_lines[s:e]
-            numbered = [f"{s + i + 1:5d} | {line.rstrip()}" for i, line in enumerate(lines)]
-            header = f"[{path}] lines {s+1}-{e} of {total}"
-            return header + "\n" + "\n".join(numbered)
+        if not ranges and start_line > 0 and end_line > 0:
+            ranges = f"{start_line}-{end_line}"
+        if ranges:
+            spans = _parse_ranges(ranges, total)
+            if not spans:
+                return f"[{path}] has {total} lines; no requested line exists."
+            blocks = ["\n".join(f"{i + 1:5d} | {all_lines[i].rstrip()}" for i in range(a - 1, b))
+                      for a, b in spans]
+            label = ",".join(f"{a}-{b}" for a, b in spans)
+            return f"[{path}] lines {label} of {total}\n" + "\n      …\n".join(blocks)
 
-        if total > 500:
-            numbered = [f"{i+1:5d} | {line.rstrip()}" for i, line in enumerate(all_lines)]
-            return f"[{path}] {total} lines total\n" + "\n".join(numbered)
+        if total >= SUMMARY_MIN_LINES:
+            summary = _summary(path, all_lines)
+            if summary:
+                return summary
+
+        # Read whole, not in slices: each slice resends the conversation, and
+        # edits made from partial views miss their own dependencies.
+        if total > READ_WHOLE_FILE_LINES:
+            preview = all_lines[:READ_WHOLE_FILE_LINES]
+            numbered = [f"{i+1:5d} | {line.rstrip()}" for i, line in enumerate(preview)]
+            return (
+                f"[{path}] lines 1-{len(preview)} of {total}\n"
+                + "\n".join(numbered)
+                + f"\n[Read start_line={len(preview) + 1} end_line={total} for the rest.]"
+            )
 
         numbered = [f"{i+1:5d} | {line.rstrip()}" for i, line in enumerate(all_lines)]
         return f"[{path}] {total} lines\n" + "\n".join(numbered)
@@ -545,6 +620,50 @@ def _edit_excerpt(content: str, offset: int, new_string: str, occurrences: int) 
     return "\n".join(numbered) + note
 
 
+def _declarations(path: str, lines: list[str]) -> list[tuple[int, str]]:
+    """(0-based line index, rendered text) of each class/function-level declaration."""
+    outline = []
+    if path.endswith(".py"):
+        for i, line in enumerate(lines):
+            stripped = line.rstrip()
+            lstrip = line.lstrip()
+            if (lstrip.startswith("class ") or lstrip.startswith("def ")
+                    or lstrip.startswith("async def ")
+                    or lstrip.startswith("@frappe.whitelist")
+                    or lstrip.startswith("@property")
+                    or (lstrip.startswith("import ") and i < 30)
+                    or (lstrip.startswith("from ") and i < 30)):
+                indent = len(line) - len(lstrip)
+                outline.append((i, f"{'  ' * (indent // 4)}{stripped.strip()}"))
+    elif path.endswith(".js") or path.endswith(".ts"):
+        in_class = False
+        for i, line in enumerate(lines):
+            stripped = line.rstrip()
+            lstrip = line.lstrip()
+            indent = len(line) - len(lstrip)
+
+            if re.match(r'^(export\s+)?class\s', lstrip):
+                in_class = True
+                outline.append((i, stripped.strip()))
+            elif re.match(r'^(export\s+)?(function|const|let|var)\s', lstrip):
+                outline.append((i, stripped.strip()))
+            elif re.match(r'^frappe\.(ui\.form\.on|listview_settings|call|pages)', lstrip):
+                outline.append((i, stripped.strip()))
+            elif re.match(r'^[a-zA-Z_$]+\s*[:=]\s*function', lstrip):
+                outline.append((i, stripped.strip()))
+            elif re.match(r'^[a-zA-Z_$]+\s*\(', lstrip) and indent == 0:
+                outline.append((i, stripped.strip()))
+            elif in_class and indent <= 4 and re.match(r'^(async\s+)?[a-zA-Z_$]+\s*\(', lstrip):
+                outline.append((i, f"  {stripped.strip()}"))
+            elif re.match(r'^\$\(|^jQuery\(', lstrip) and '.on(' in lstrip:
+                outline.append((i, stripped.strip()[:100]))
+    return outline
+
+
+#: A declaration row longer than this is cut: a whole minified statement is not a signature.
+OUTLINE_ROW_CHARS = 160
+
+
 def get_file_outline(app_name: str, path: str) -> str:
     """Extract class and function definitions from a file (.py, .js, .ts)."""
     try:
@@ -554,47 +673,11 @@ def get_file_outline(app_name: str, path: str) -> str:
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
 
-        outline = []
         total = len(lines)
-        is_py = path.endswith(".py")
-        is_js = path.endswith(".js") or path.endswith(".ts")
-
-        if is_py:
-            for i, line in enumerate(lines):
-                stripped = line.rstrip()
-                lstrip = line.lstrip()
-                if (lstrip.startswith("class ") or lstrip.startswith("def ")
-                        or lstrip.startswith("async def ")
-                        or lstrip.startswith("@frappe.whitelist")
-                        or lstrip.startswith("@property")
-                        or (lstrip.startswith("import ") and i < 30)
-                        or (lstrip.startswith("from ") and i < 30)):
-                    indent = len(line) - len(lstrip)
-                    outline.append(f"{i+1:5d} | {'  ' * (indent // 4)}{stripped.strip()}")
-        elif is_js:
-            in_class = False
-            for i, line in enumerate(lines):
-                stripped = line.rstrip()
-                lstrip = line.lstrip()
-                indent = len(line) - len(lstrip)
-
-                if re.match(r'^(export\s+)?class\s', lstrip):
-                    in_class = True
-                    outline.append(f"{i+1:5d} | {stripped.strip()}")
-                elif re.match(r'^(export\s+)?(function|const|let|var)\s', lstrip):
-                    outline.append(f"{i+1:5d} | {stripped.strip()}")
-                elif re.match(r'^frappe\.(ui\.form\.on|listview_settings|call|pages)', lstrip):
-                    outline.append(f"{i+1:5d} | {stripped.strip()}")
-                elif re.match(r'^[a-zA-Z_$]+\s*[:=]\s*function', lstrip):
-                    outline.append(f"{i+1:5d} | {stripped.strip()}")
-                elif re.match(r'^[a-zA-Z_$]+\s*\(', lstrip) and indent == 0:
-                    outline.append(f"{i+1:5d} | {stripped.strip()}")
-                elif in_class and indent <= 4 and re.match(r'^(async\s+)?[a-zA-Z_$]+\s*\(', lstrip):
-                    outline.append(f"{i+1:5d} |   {stripped.strip()}")
-                elif re.match(r'^\$\(|^jQuery\(', lstrip) and '.on(' in lstrip:
-                    outline.append(f"{i+1:5d} | {stripped.strip()[:100]}")
-        else:
+        if not (path.endswith(".py") or path.endswith(".js") or path.endswith(".ts")):
             return f"Outline not supported for this file type. Use read_file instead. ({total} lines)"
+        outline = [f"{i+1:5d} | {text if len(text) <= OUTLINE_ROW_CHARS else text[:OUTLINE_ROW_CHARS] + '…'}"
+                   for i, text in _declarations(path, lines)]
 
         if not outline:
             return f"[{path}] {total} lines — no class/function signatures found. Use read_file to inspect."
