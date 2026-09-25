@@ -592,6 +592,17 @@ function setup_action_buttons(frm) {
     }
 
     var non_running = running.indexOf(status) === -1 && !frm.is_new();
+    if (['Failed', 'Cancelled'].indexOf(status) !== -1 && frm.doc.execution_checkpoint) {
+        frm.add_custom_button(__('Resume Execution'), function () {
+            frappe.call({
+                method: 'ampower_koda.agent.api.resume_execution',
+                args: { request_name: frm.doc.name },
+                freeze: true,
+                freeze_message: __('Resuming saved execution...'),
+                callback: function () { frm.reload_doc(); }
+            });
+        });
+    }
     if (non_running) {
         frm.add_custom_button(__('Checkout Base Branch'), function () {
             checkout_base_branch(frm);
@@ -604,7 +615,8 @@ function setup_action_buttons(frm) {
         }, __('Actions'));
     }
 
-    var followup_allowed = ['Queued', 'Completed', 'Failed', 'Cancelled', 'Awaiting Approval', 'Awaiting Push Approval'].indexOf(status) !== -1;
+    var followup_allowed = ['Queued', 'Completed', 'Failed', 'Cancelled', 'Awaiting Approval', 'Awaiting Bench Approval',
+        'Awaiting Push Approval'].indexOf(status) !== -1;
     if (followup_allowed && !frm.is_new()) {
         frm.add_custom_button(__('Submit Follow-up Fix'), function () {
             open_follow_up_dialog(frm);
@@ -1102,7 +1114,7 @@ function open_task_dialog(frm) {
             { fieldname: 'description', fieldtype: 'Small Text', label: __('Description'), reqd: 1,
               description: __('What changes, where, why, and which existing pattern to follow. No code.') },
             { fieldtype: 'Column Break' },
-            { fieldname: 'action', fieldtype: 'Select', label: __('Action'), options: ['MODIFY', 'CREATE'], default: 'MODIFY', reqd: 1 },
+            { fieldname: 'action', fieldtype: 'Select', label: __('Action'), options: ['MODIFY', 'CREATE', 'DELETE'], default: 'MODIFY', reqd: 1 },
             { fieldname: 'depends_on', fieldtype: 'MultiSelectPills', label: __('Depends on'),
               get_data: () => ids.map((id) => ({ value: id, description: '' })) },
             { fieldname: 'acceptance_criteria', fieldtype: 'Small Text', label: __('Acceptance criteria (one per line)'), reqd: 1 },
