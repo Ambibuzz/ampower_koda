@@ -119,12 +119,12 @@ class Transcript:
         return replace(self, blocks=tuple(blocks))
 
     def to_messages(self) -> tuple[Message, ...]:
-        """The cache planner's view. Tool blocks are structured, prose is plain."""
+        """Text and tool results expose a cacheable text block; tool calls do not."""
         return tuple(
             Message(
                 role=block.role,
                 text=block.text,
-                plain=block.is_prose,
+                plain=block.kind in ("prose", "context", "tool_result"),
                 tokens=block.tokens,
             )
             for block in self.blocks

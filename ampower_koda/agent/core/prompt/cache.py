@@ -31,8 +31,10 @@ def build_prefix(
     limits = cache_limits(model)
 
     blocks = [
-        PromptBlock(role="map+memory", text=_map_and_memory(repo_map, memory, budget), ttl="5m"),
-        PromptBlock(role="system+tools", text=role_prompt.strip(), ttl="5m"),
+        # Anthropic requires longer TTLs before shorter ones. The rolling
+        # transcript uses 1h, so its preceding system boundaries must too.
+        PromptBlock(role="map+memory", text=_map_and_memory(repo_map, memory, budget), ttl="1h"),
+        PromptBlock(role="system+tools", text=role_prompt.strip(), ttl="1h"),
     ]
 
     allowed = max(0, MAX_TOTAL_BREAKPOINTS - budget.reserved_breakpoints)
@@ -84,7 +86,7 @@ def place_marker(
     last_plain: int | None = None
     for index, message in enumerate(transcript):
         width += message.tokens
-        if message.plain and width >= limits.min_cacheable:
+        if message.plain and message.text and width >= limits.min_cacheable:
             last_plain = index
 
     return TranscriptMarker(index=last_plain) if last_plain is not None else None

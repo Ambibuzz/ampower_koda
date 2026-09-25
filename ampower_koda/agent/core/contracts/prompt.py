@@ -10,10 +10,8 @@ from ..errors import CoreError
 CacheTtl = Literal["none", "5m", "1h"]
 """How long a breakpoint's prefix should be kept.
 
-``5m`` for the system blocks: they are written once and read for the rest of the
-session, and "5 minutes loses nothing at 30 seconds and everything at 400".
-``1h`` for the rolling transcript marker, which is the one boundary that moves —
-and the one whose expiry costs a whole conversation rewrite."""
+System and rolling transcript boundaries use ``1h``. Earlier boundaries must
+not have a shorter TTL than later ones on Anthropic."""
 
 BlockRole = Literal["map+memory", "system+tools"]
 
@@ -98,7 +96,7 @@ class PromptBudget:
     map_tokens: int = 2000
     memory_tokens: int = 800
 
-    reserved_breakpoints: int = 1
+    reserved_breakpoints: int = 2
     """Boundaries held back from the prefix for the rolling marker. Providers cap
     the total, and spending the last one on a system block would leave the
     transcript uncacheable — which is the expensive half."""
@@ -112,9 +110,8 @@ class Message:
     text: str = ""
 
     plain: bool = True
-    """False for a message carrying structured content — a tool call, a tool
-    result, an image. The rolling marker may only be pinned on a plain message,
-    because a boundary inside a structured block is not addressable."""
+    """Whether the adapter can address its text block (including tool results).
+    False for tool calls and other content without a cacheable text block."""
 
     tokens: int = 0
     """Estimated size, filled by the caller. Carried rather than recomputed so
