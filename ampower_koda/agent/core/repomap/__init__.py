@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .build import MapBuild, build_map
-from .personalize import demote_mirrors, personalization, query_tokens
+from .personalize import demote_mirrors
 from .render import MAPPED_ROLES, render_repo_map
 
 __all__ = [
@@ -11,7 +11,5 @@ __all__ = [
     "MapBuild",
     "build_map",
     "demote_mirrors",
-    "personalization",
-    "query_tokens",
     "render_repo_map",
 ]

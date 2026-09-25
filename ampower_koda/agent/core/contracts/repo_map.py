@@ -12,14 +12,9 @@ class FileRanks:
     """PageRank over the reference graph, one score per file."""
 
     scores: Mapping[str, float] = field(default_factory=dict)
-    personalized: bool = False
-    iterations: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scores", MappingProxyType(dict(self.scores)))
-
-    def of(self, path: str) -> float:
-        return self.scores.get(path, 0.0)
 
     def ordered(self) -> tuple[str, ...]:
         """Paths by descending rank, ties broken by path."""

@@ -87,11 +87,6 @@ PAGERANK_ALPHA: Final[float] = 0.85
 
 PAGERANK_ITERATIONS: Final[int] = 40
 
-MAP_BOOST_ESTABLISHED: Final[float] = 4.0
-MAP_BOOST_BASENAME: Final[float] = 3.0
-MAP_BOOST_PARTIAL: Final[float] = 2.0
-MAP_BOOST_DIRECTORY: Final[float] = 1.5
-
 MIRROR_RANK_FACTOR: Final[float] = 0.1
 
 MIRROR_MIN_SHARED_FILES: Final[int] = 5
