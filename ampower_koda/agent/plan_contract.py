@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Callable
 
 
 MAX_PLAN_TASKS = 12
 MAX_TASK_CONTEXT_REFS = 6
-VALID_ACTIONS = {"MODIFY", "CREATE"}
+VALID_ACTIONS = {"MODIFY", "CREATE", "DELETE"}
 _TASK_ID = re.compile(r"TODO [1-9][0-9]*")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
@@ -42,7 +41,7 @@ PLAN_JSON_SCHEMA = {
                     "title": {"type": "string"},
                     "goal": {"type": "string"},
                     "description": {"type": "string"},
-                    "action": {"type": "string", "enum": ["MODIFY", "CREATE"]},
+                    "action": {"type": "string", "enum": ["MODIFY", "CREATE", "DELETE"]},
                     "files": {"type": "array", "items": {"type": "string"}},
                     "context_refs": {
                         "type": "array",
@@ -158,7 +157,7 @@ def _task(raw, index: int, issues: list[str]) -> dict:
         issues.append(f"{label}.id must use the format TODO N")
     action = _text(raw.get("action"), f"{label}.action", issues)
     if action and action not in VALID_ACTIONS:
-        issues.append(f"{label}.action must be MODIFY or CREATE")
+        issues.append(f"{label}.action must be MODIFY, CREATE or DELETE")
 
     files = _string_list(raw.get("files"), f"{label}.files", issues, required=True)
     files = [_path(path, f"{label}.files[{i}]", issues) for i, path in enumerate(files)]
@@ -214,8 +213,12 @@ def _task(raw, index: int, issues: list[str]) -> dict:
     }
 
 
-def validate_plan(raw, *, path_exists: Callable[[str], bool] | None = None) -> dict:
-    """Validate and dependency-order a complete plan."""
+def validate_plan(raw) -> dict:
+    """Validate and dependency-order a complete plan.
+
+    Structure only: a task's ``files`` are a starting point, not a write
+    permission, so paths are never checked against the disk here.
+    """
     issues: list[str] = []
     root_keys = {"overview", "scope", "assumptions", "risks", "tasks"}
     if not isinstance(raw, dict):
@@ -252,7 +255,6 @@ def validate_plan(raw, *, path_exists: Callable[[str], bool] | None = None) -> d
         "risks": _string_list(raw.get("risks"), "plan.risks", issues),
         "tasks": tasks,
     }
-
     id_to_index: dict[str, int] = {}
     for index, task in enumerate(tasks):
         key = task["id"].casefold()
@@ -312,39 +314,6 @@ def validate_plan(raw, *, path_exists: Callable[[str], bool] | None = None) -> d
             ordered.append(index)
             placed.add(index)
             pending.remove(index)
-
-    # Track planned file creation so later dependent tasks see the correct state.
-    if path_exists is not None and len(ordered) == len(tasks):
-        planned_state: dict[str, bool] = {}
-
-        def exists_at_step(path: str) -> bool:
-            if path not in planned_state:
-                planned_state[path] = bool(path_exists(path))
-            return planned_state[path]
-
-        for index in ordered:
-            task = tasks[index]
-            existing_refs = 0
-            for ref in task["context_refs"]:
-                if ref["path"] and exists_at_step(ref["path"]):
-                    existing_refs += 1
-                elif ref["path"] and not (
-                    task["action"] == "CREATE" and ref["path"] in task["files"]
-                ):
-                    issues.append(
-                        f"{task['id']}: context path does not exist at task start: {ref['path']}"
-                    )
-            if task["context_refs"] and not existing_refs:
-                issues.append(f"{task['id']}: no context_ref points to a file available at task start")
-
-            for path in task["files"]:
-                exists = exists_at_step(path)
-                if task["action"] == "MODIFY" and not exists:
-                    issues.append(f"{task['id']}: MODIFY path does not exist at task start: {path}")
-                if task["action"] == "CREATE" and exists:
-                    issues.append(f"{task['id']}: CREATE path already exists at task start: {path}")
-                if task["action"] == "CREATE":
-                    planned_state[path] = True
 
     if issues:
         raise PlanValidationError(issues)

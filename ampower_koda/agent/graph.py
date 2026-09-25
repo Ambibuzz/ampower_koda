@@ -1151,10 +1151,7 @@ def plan_node(state: dict) -> dict:
                 f"recorded total stays at {total_tokens} and undercounts this request",
             )
 
-        plan_object = validate_plan(
-            plan_object,
-            path_exists=lambda path: _app_file_exists(app_name, path),
-        )
+        plan_object = validate_plan(plan_object)
 
         tasks = plan_object["tasks"]
         _publish_agent_log(
@@ -1219,7 +1216,7 @@ def prepare_execution_node(state: dict) -> dict:
                 "depends_on": [],
             }]
         else:
-            plan = load_plan(state.get("plan_object"), path_exists=lambda p: _app_file_exists(state["target_app_name"], p))
+            plan = load_plan(state.get("plan_object"))
             tasks = plan["tasks"]
         return {
             "plan_object": plan, "execution_tasks": tasks, "task_index": 0,

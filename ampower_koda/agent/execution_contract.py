@@ -8,7 +8,7 @@ from pathlib import Path
 from ampower_koda.agent.plan_contract import PlanValidationError, validate_plan
 
 
-def load_plan(value, *, path_exists=None) -> dict:
+def load_plan(value) -> dict:
     if not value:
         raise PlanValidationError([
             "This request has no structured plan. Generate a new plan before execution."
@@ -18,7 +18,7 @@ def load_plan(value, *, path_exists=None) -> dict:
             value = json.loads(value)
         except (ValueError, TypeError) as exc:
             raise PlanValidationError(["Structured plan must contain valid JSON."]) from exc
-    return validate_plan(value, path_exists=path_exists)
+    return validate_plan(value)
 
 
 def read_snapshot(path: str) -> str | None:

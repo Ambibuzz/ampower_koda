@@ -471,10 +471,7 @@ def save_plan_task(request_name: str, task: str):
         tasks[position] = incoming
 
     try:
-        plan = load_plan(
-            {**plan, "tasks": tasks},
-            path_exists=lambda path: _app_file_exists(doc.target_app_name, path),
-        )
+        plan = load_plan({**plan, "tasks": tasks})
     except PlanValidationError as exc:
         frappe.throw(str(exc))
 
@@ -525,10 +522,7 @@ def remove_plan_task(request_name: str, task_id: str):
         task["id"] = renamed[task["id"].casefold()]
 
     try:
-        plan = load_plan(
-            {**plan, "tasks": tasks},
-            path_exists=lambda path: _app_file_exists(doc.target_app_name, path),
-        )
+        plan = load_plan({**plan, "tasks": tasks})
     except PlanValidationError as exc:
         frappe.throw(str(exc))
 
