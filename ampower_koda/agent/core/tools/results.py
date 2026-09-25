@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ..contracts.agent import ToolOutcome
 
+
 def error(detail: str) -> ToolOutcome:
     """``[error: …]`` — a value the model can read and act on."""
     return ToolOutcome(text=f"[error: {detail}]", ok=False)

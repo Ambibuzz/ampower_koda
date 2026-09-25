@@ -343,11 +343,8 @@ def _arguments(block) -> dict:
 def _tool_schemas() -> list[dict]:
     """The frozen catalogue as provider tool schemas.
 
-    Built from ``CATALOGUE`` and nowhere else. Every parameter is a string here
-    because the core's specs describe parameters positionally — ``"glob?"``,
-    ``"target = anchor|symbol|span"`` — and inventing a JSON-Schema type per
-    parameter would be this module asserting something the catalogue never said.
-    The description carries the real contract, including the caps.
+    Built from ``CATALOGUE`` and nowhere else. Parameters are strings except the
+    ``NUMERIC_PARAMETERS``; the description carries the real contract, including the caps.
     """
     schemas = []
     for spec in CATALOGUE:
@@ -372,7 +369,7 @@ def _tool_schemas() -> list[dict]:
 #: Parameters a provider should send as numbers. Everything else is a string —
 #: the tools coerce, and a schema that guessed richer types than the catalogue
 #: states would be this module asserting something the catalogue never said.
-NUMERIC_PARAMETERS = frozenset({"start", "end"})
+NUMERIC_PARAMETERS = frozenset({"start", "end", "offset"})
 
 
 def _parameter_type(name: str) -> str:

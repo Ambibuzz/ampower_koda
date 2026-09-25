@@ -37,7 +37,7 @@ from .ledger.write import record_read
 from .loop import dedupe, gates, leaks
 from .prompt.cache import assemble, build_prefix
 from .tools.catalogue import TOOL_NAMES
-from .tools.run import BUILT_IN, NullHost, run_tool
+from .tools.run import NullHost, run_tool
 from .workingset.build import working_set_for
 from .workspace.ports import Workspace
 
@@ -448,7 +448,6 @@ def _append(transcript: Transcript, role: str, text: str, **fields: object) -> T
 
 
 __all__ = [
-    "BUILT_IN",
     "ROLE_PROMPT",
     "NullHost",
     "Session",
