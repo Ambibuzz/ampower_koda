@@ -239,7 +239,7 @@ WORKING_SET_MAX_SPANS: Final[int] = 12
 
 WORKING_SET_MAX_EDITED: Final[int] = 8
 
-WORKING_SET_EXCERPT_CHARS: Final[int] = 120
+WORKING_SET_EXCERPT_CHARS: Final[int] = 600
 
 WORKING_SET_WEAK_COVERAGE: Final[float] = 0.75
 
@@ -248,6 +248,20 @@ HOTCOLD_LOW_WATER: float = 0.5
 AMORTISATION_RATIO: Final[int] = CACHE_WRITE_TO_READ
 
 HOTCOLD_HARD_PRESSURE: Final[int] = 2
+
+WORKING_SET_RELATIVE_FLOOR: Final[float] = 0.5
+"""Hits below this share of the top score are dropped."""
+
+WORKING_SET_FULL_SPANS: Final[int] = 3
+"""The best hits are rendered whole, with line numbers, so they can be cited
+and edited without a re-read."""
+
+WORKING_SET_FULL_SPAN_CHARS: Final[int] = 6_000
+
+WORKING_SET_OUTLINE_FILES: Final[int] = 2
+
+WORKING_SET_OUTLINE_CHARS: Final[int] = 2_400
+"""A names-only outline, ``symbol@line``, of the top files."""
 
 TYPO_MIN_LENGTH: Final[int] = 6
 """Only longer prose words are corrected; short words are too often real."""

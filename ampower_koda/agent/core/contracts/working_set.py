@@ -21,9 +21,14 @@ class WorkingSpan:
     whether the quoted line still says what it said."""
 
     origin: str = "retrieved"
-    """``retrieved`` · ``established`` · ``edited``. Rendered, because the three
-    mean different things to a reader: one is a guess about this message, one is
-    something the session already confirmed, and one is something it changed."""
+    """``retrieved`` · ``established`` · ``edited`` · ``related``. Rendered,
+    because they mean different things to a reader: one is a guess about this
+    message, one is something the session already confirmed, one is something it
+    changed, and one is a caller or client of a retrieved span."""
+
+    body: str = ""
+    """The complete span, numbered like a ``read`` result. Present only on the
+    top hits: a fragment cannot be cited or edited, so it was always re-read."""
 
     def line(self) -> str:
         if self.origin == "established":
@@ -31,8 +36,11 @@ class WorkingSpan:
         anchor = f"@{self.anchor}" if self.anchor else ""
         score = f" [{self.score:.3f}]" if self.score else ""
         symbol = f" {self.symbol}" if self.symbol else ""
+        if self.body:
+            return f"{self.location}{anchor}{score}{symbol}\n{self.body}"
+        related = " (calls or serves the span above)" if self.origin == "related" else ""
         excerpt = f" — {self.excerpt}" if self.excerpt else ""
-        return f"{self.location}{anchor}{score}{symbol}{excerpt}"
+        return f"{self.location}{anchor}{score}{symbol}{related}{excerpt}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +55,11 @@ class WorkingSet:
     weak floor the block warns about itself, in the block, where a reader will
     see it — a confidence number that only appears in a log is a confidence
     number nobody acts on."""
+
+    reranked: bool = False
+    """The spans passed a dedicated reranker's configured relevance floor."""
+
+    notes: tuple[str, ...] = ()
 
     truncated: bool = False
     """The tail did not fit. *Truncated*, not evicted: spending line by line and
