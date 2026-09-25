@@ -3,6 +3,7 @@
 # Completion checks gate dependency progress; final integration reviews the full plan
 # before bench and deploy run in executor.py.
 
+import html
 import json
 import os
 import re as _re
@@ -37,6 +38,7 @@ from ampower_koda.agent.plan_contract import (
     MAX_PLAN_TASKS,
     PLAN_JSON_SCHEMA,
     PlanValidationError,
+    nearest_paths,
     plan_to_markdown,
     validate_plan,
 )
@@ -441,6 +443,16 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
                       timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES,
                       **direct_options)
 
+
+SUBMIT_PLAN_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "plan": PLAN_JSON_SCHEMA,
+        "findings": {"type": "string", "description": "Verified path:line evidence for the user and reviewer."},
+    },
+    "required": ["plan", "findings"],
+}
 
 #: Open-keyed object parameters travel as JSON text, since strict tool schemas cannot express them.
 #: An object sent anyway is serialized before the tool runs; null becomes empty text.
@@ -2092,6 +2104,11 @@ def _structured_plan_model(llm, provider: str):
     return structured
 
 
+PLAN_PATCH_ROUNDS = 2
+"""Repair rounds that ask for edits to a rejected plan amendment. Each costs a
+cached-prefix read plus a few hundred new tokens."""
+
+
 def _plan_run_config(run_name: str, *, round_number: int, mode: str) -> dict:
     """Trace name, tags and round metadata for one planner call."""
     return {
@@ -2099,6 +2116,26 @@ def _plan_run_config(run_name: str, *, round_number: int, mode: str) -> dict:
         "tags": ["plan", f"plan:{mode}"],
         "metadata": {"plan_round": round_number, "plan_mode": mode},
     }
+
+
+def _plan_path_candidates(app_name: str):
+    """``path -> nearest existing files``, over one lazy walk of the app."""
+    files: list[str] = []
+    walked = False
+
+    def candidates_for(path: str) -> list[str]:
+        nonlocal walked
+        if not walked:
+            walked = True
+            try:
+                from ampower_koda.agent.core import LocalWorkspace
+                from pathlib import Path
+                files.extend(LocalWorkspace(Path(agent_tools._app_root(app_name))).list_files())
+            except Exception:
+                log_agent_error("Agent Graph: plan path candidates", frappe.get_traceback())
+        return nearest_paths(path, files)
+
+    return candidates_for
 
 
 def _charge_plan_call(raw_response, request_name: str, total_tokens: int, *, round_label: int) -> int:
@@ -2127,6 +2164,90 @@ def _charge_plan_call(raw_response, request_name: str, total_tokens: int, *, rou
     _persist_token_usage(request_name, total_tokens, input_tokens=input_tokens,
                          cache_read_tokens=cache_read, cache_write_tokens=cache_write, cost_delta=cost)
     return total_tokens
+
+
+PLAN_COVERAGE_SCHEMA = {
+    "title": "PlanCoverage",
+    "description": "Each clause of the user's request, and whether the plan does what it says.",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "clauses": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "quote": {"type": "string"},
+                    "status": {"type": "string", "enum": ["covered", "narrowed", "missing", "contradicted", "added"]},
+                    "task": {"type": "string"},
+                    "problem": {"type": "string"},
+                },
+                "required": ["quote", "status", "task", "problem"],
+            },
+        },
+    },
+    "required": ["clauses"],
+}
+
+PLAN_COVERAGE_PROMPT = """You check an implementation plan against the user's request before a human approves it.
+You have not seen the codebase analysis the plan came from, on purpose: judge only whether the plan does
+what the request's words say. Split the request into its clauses, one per distinct thing asked, including
+what it asks to keep the same (for example "an identical copy of X" keeps X's behavior). For each clause,
+quote the request's own words exactly, then give its status: covered; narrowed (the plan does less than
+the words, or something different); missing; or contradicted. Name the task id that covers it, or "",
+and in one sentence say what is wrong. Do not add requirements the words do not state. An ambiguous
+clause the plan reads reasonably, and records in its assumptions, is covered, unless the assumptions
+name another reading that keeps more of what already exists: the plan should build that one, so the
+clause is narrowed. Then add one entry per task that changes existing code or behavior no clause asks
+to change, with status "added" and the task's title as the quote; work a requested change needs (its
+own wiring, registration or tests) is not added."""
+
+
+def _plan_text(text: str) -> str:
+    """The request as plain lowercase words, for matching quoted clauses."""
+    text = _re.sub(r"<[^>]+>", " ", html.unescape(str(text or "")))
+    return " ".join(text.lower().split())
+
+
+def _plan_coverage_gaps(plan: dict, user_message: str, *, llm, provider: str, budget: dict,
+                        request_name: str, total_tokens: int) -> tuple[list[str], int]:
+    """Clauses of the request the plan drops or reinterprets, from a model that never saw the investigation.
+
+    A quote not in the request's own words is discarded, so the checker cannot add requirements.
+    """
+    request = _plan_text(user_message)
+    if not request:
+        return [], total_tokens
+    messages = [SystemMessage(content=PLAN_COVERAGE_PROMPT),
+                HumanMessage(content=f"## USER REQUEST\n{request}\n\n## PLAN\n{plan_to_markdown(plan)}")]
+    try:
+        response, total_tokens = _invoke_structured(
+            llm, provider, PLAN_COVERAGE_SCHEMA, messages,
+            _plan_run_config("plan:coverage", round_number=0, mode="coverage"),
+            budget=budget, request_name=request_name, total_tokens=total_tokens, round_label=1)
+        _, parsed = _unpack_structured_plan(response)
+        clauses = [c for c in (parsed or {}).get("clauses") or [] if isinstance(c, dict)]
+    except Exception:  # noqa: BLE001 - a second opinion must never block planning
+        log_agent_error("Agent Graph: plan coverage check", frappe.get_traceback())
+        return [], budget.get("total_tokens", total_tokens)
+    titles = {_plan_text(task.get("title")): task.get("id", "") for task in plan.get("tasks") or []}
+    gaps = []
+    for clause in clauses:
+        words, problem, task = (str(clause.get(key) or "").strip() for key in ("quote", "problem", "task"))
+        quote = _plan_text(words)
+        if clause.get("status") == "added":
+            if quote in titles:
+                gaps.append(f"{titles[quote]} \"{words}\" changes what the request does not ask to change: "
+                            f"{problem} Drop the task and report the defect in risks, or state in assumptions "
+                            "why the request needs it.")
+            continue
+        if clause.get("status") == "covered" or len(quote) < 8 or quote not in request:
+            continue
+        gaps.append(f"The plan {clause.get('status')} the request's words \"{words}\""
+                    f"{' (' + task + ')' if task else ''}: {problem} "
+                    "Edit the plan so it does what these words ask, or state in assumptions why this reading is right.")
+    return gaps, total_tokens
 
 
 def _plan_output_tokens(provider: str) -> int:
@@ -2363,6 +2484,29 @@ def _check_plan_input(state: dict, messages: list, schema: dict, budget: dict) -
 
 
 # Graph nodes — Execution phase
+
+def _persist_execution_plan(request_name: str, plan: dict) -> None:
+    if request_name:
+        values = {
+            "plan_json": json.dumps(plan, ensure_ascii=True),
+            "approved_plan_json": json.dumps(plan, ensure_ascii=True),
+            "agent_plan": plan_to_markdown(plan),
+        }
+        active = checkpoint.journal()
+        if active:
+            active.state.update(plan_object=plan, execution_tasks=plan["tasks"])
+            if active.node == "review":
+                active.node = "implement"
+                active.state.update(review_attempts=0, task_completion={},
+                    review_fingerprint="", review_fingerprints_seen=[],
+                    review_failure_fingerprints_seen=[],
+                    plan_amendments=int(active.state.get("plan_amendments") or 0) + 1,
+                    review_notes="Continue the blocked task using the amended file scope.")
+            active.refresh()
+            values["execution_checkpoint"] = json.dumps(active.payload(), ensure_ascii=True)
+        set_request_value(request_name, values)
+        frappe.db.commit()
+
 
 def prepare_execution_node(state: dict) -> dict:
     """Freeze the validated contract once, before any task writes."""
