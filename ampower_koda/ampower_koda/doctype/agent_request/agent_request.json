@@ -56,6 +56,9 @@
   "follow_up_count",
   "files_changed",
   "tokens_used",
+  "cache_input_tokens",
+  "cache_read_tokens",
+  "cache_write_tokens",
   "cost_estimate",
   "prompts_tab",
   "use_default_prompts",
@@ -375,9 +378,28 @@
    "read_only": 1
   },
   {
+   "fieldname": "cache_input_tokens",
+   "fieldtype": "Int",
+   "label": "Cache Input Tokens",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cache_read_tokens",
+   "fieldtype": "Int",
+   "label": "Cache Read Tokens",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cache_write_tokens",
+   "fieldtype": "Int",
+   "label": "Cache Write Tokens",
+   "read_only": 1
+  },
+  {
    "fieldname": "cost_estimate",
    "fieldtype": "Currency",
    "label": "Cost Estimate",
+   "precision": "6",
    "read_only": 1
   },
   {
