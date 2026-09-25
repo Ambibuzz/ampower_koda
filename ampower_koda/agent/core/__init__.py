@@ -43,7 +43,7 @@ from .contracts import (
     WorkingSet,
     iter_chunks,
 )
-from .elide import compact, hot_cold
+from .elide import compact_for_request, hot_cold
 from .errors import ConfigError, CoreError, ParseError, WorkspaceError
 from .fold import SessionState, fold_turn
 from .graph import CodeGraph, build_graph, pagerank
@@ -60,15 +60,12 @@ from .workspace import LocalWorkspace, Workspace
 
 __all__ = [
     "BlobRef",
-    "Block",
     "Bootstrap",
     "CHARS_PER_TOKEN",
     "CachePlan",
-    "ChatModel",
     "Chunk",
     "CoChangeMemory",
     "CodeGraph",
-    "Completion",
     "ConfigError",
     "ContextBudget",
     "CoreConfig",
@@ -121,7 +118,7 @@ __all__ = [
     "build_map",
     "build_prefix",
     "build_retriever",
-    "compact",
+    "compact_for_request",
     "config_defaults",
     "distil_into",
     "estimate_tokens",

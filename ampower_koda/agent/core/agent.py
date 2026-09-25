@@ -26,7 +26,6 @@ from .contracts.prompt import PromptBudget
 from .contracts.transcript import Block, Transcript
 from .contracts.working_set import WorkingSet
 from .elide.collapse import READ_TOOLS
-from .elide.compact import ThrashGuard, compact
 from .elide.hotcold import hot_cold
 from .fold.document import SessionState
 from .fold.run import fold_turn
@@ -72,7 +71,6 @@ def open_session(
             map_tokens=context.config.context.map_tokens,
             memory_tokens=context.config.context.memory_tokens,
         ),
-        guard=ThrashGuard(),
         notes=bootstrap.notes,
     )
 
@@ -389,15 +387,14 @@ def _tail(state, working: WorkingSet) -> str:
 
 
 def _close(state, utility) -> tuple[Session, SideUsage, tuple[str, ...]]:  # noqa: ANN001
-    """Fold, then compact, then freeze the session for the next turn."""
+    """Update session memory without rewriting history between requests."""
     transcript = state.transcript
     session_state = state.session.state
-    guard = state.session.guard or ThrashGuard()
     side = SideUsage()
     notes: tuple[str, ...] = ()
 
     if utility is None:
-        notes = ("no utility model: this session will not fold or compact",)
+        notes = ("no utility model: this session will not fold",)
     else:
         folded = fold_turn(
             transcript, session_state if isinstance(session_state, SessionState) else None,
@@ -407,26 +404,11 @@ def _close(state, utility) -> tuple[Session, SideUsage, tuple[str, ...]]:  # noq
         session_state = folded.state
         notes = (*notes, *folded.notes)
 
-    if utility is not None:
-        digested = session_state.turns_folded if isinstance(session_state, SessionState) else 0
-        result = compact(
-            transcript,
-            window_tokens=state.session.budget.window,
-            folded_turns=digested,
-            turn=state.session.turn,
-            guard=guard,
-            summariser=utility,
-        )
-        transcript, guard = result.transcript, result.guard
-        side = side.plus(result.usage)
-        notes = (*notes, *result.notices)
-
     return (
         state.session.advanced(
             ledger=state.ledger,
             transcript=transcript,
             state=session_state,
-            guard=guard,
             turn=state.session.turn + 1,
         ),
         side,

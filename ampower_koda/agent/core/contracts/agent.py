@@ -164,8 +164,6 @@ class Session:
     fourth turn."""
 
     marker: TranscriptMarker | None = None
-    guard: object = None
-    """The compaction :class:`~…elide.compact.ThrashGuard`."""
 
     edited: tuple[str, ...] = ()
     turn: int = 0
