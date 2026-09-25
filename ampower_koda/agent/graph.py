@@ -22,6 +22,8 @@ from ampower_koda.agent.cache_usage import persist_usage, provider_cost
 from ampower_koda.agent import koda_core
 from ampower_koda.agent import checkpoint
 from ampower_koda.agent import recovery
+from ampower_koda.agent import verification
+from ampower_koda.agent import python_diagnostics
 from ampower_koda.agent.advisor import directive as advisor_directive
 from ampower_koda.agent.run_control import (
     check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES, MODEL_TIME_RESERVE,
@@ -37,7 +39,7 @@ from ampower_koda.agent.plan_contract import (
     plan_to_markdown,
     validate_plan,
 )
-from ampower_koda.agent.checks import run_health_checks, run_task_checks, CheckResult
+from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, run_task_checks, CheckResult
 from ampower_koda.agent.execution_contract import (
     load_plan, read_snapshot, change_evidence, review_verdict, review_decision, completion_report, revision,
 )
@@ -73,7 +75,7 @@ BASE_REQUEST_NEW_INPUT_BUDGET = 100_000
 PER_TASK_REQUEST_NEW_INPUT_BUDGET = 50_000
 MAX_REQUEST_NEW_INPUT_BUDGET = 250_000
 MAX_REQUEST_PROVIDER_COST_USD = 0.15
-WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
+WRITE_TOOLS = {"edit_file", "write_file", "copy_file", "rename_file", "delete_file"}
 REPLAYABLE_TOOLS = {
     "find_files", "list_directory", "read_file", "search_code", "find_code",
     "read_doctype_schema", "get_file_outline", "validate_code",
@@ -130,6 +132,8 @@ CACHE_READ_PRICE = {"openai/": 0.1, "anthropic/": 0.1, "deepseek/": 0.1, "google
 DEFAULT_CACHE_READ_PRICE = 0.3
 CACHE_WRITE_PRICE = 1.25
 MAX_UNDERSTANDING_CONTEXT_CHARS = 8000
+# A copy at least this long changes by edits: rewriting it whole drops what the reference does.
+COPY_REWRITE_MIN_LINES = 150
 # Room to write a whole file in one call, with the reasoning that precedes it.
 # Output is billed as generated, so a high ceiling costs nothing unused.
 MODEL_ROUND_OUTPUT_TOKENS = 32000
@@ -435,6 +439,19 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
 #: Open-keyed object parameters travel as JSON text, since strict tool schemas cannot express them.
 #: An object sent anyway is serialized before the tool runs; null becomes empty text.
 JSON_TEXT_ARGUMENTS = frozenset({"arguments", "replacements"})
+
+
+def _json_object_argument(value, name: str) -> tuple[dict | None, str]:
+    """Parse a JSON-object tool argument; return (object, "") or (None, why not)."""
+    if not str(value or "").strip():
+        return {}, ""
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError) as error:
+        return None, f"{name} must be a JSON object string, e.g. '{{\"key\": \"value\"}}' ({error})."
+    if not isinstance(parsed, dict):
+        return None, f"{name} must be a JSON object, not {type(parsed).__name__}."
+    return parsed, ""
 
 
 #: Failures of one tool on one target with one cause, since the last write, before
@@ -785,109 +802,295 @@ def _request_spend_pressure(state: dict, request_name: str) -> str:
     return "; ".join(reasons)
 
 
-def _make_tools(app_name: str, read_only: bool = False, *, allowed_paths=None, before=None):
-    """Build LangChain tools bound to a specific app_name."""
+def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_moves=None,
+                delete_paths=(), verification_contract=None, verification_observer=None, copied_files=None,
+                session=None, reader=None):
+    """Build LangChain tools bound to a specific app_name.
+
+    The catalogue is the same in every phase (tools precede messages in cache keys),
+    so read-only safety is enforced here, not by hiding schemas.
+
+    Writes are bounded by the app root only. A task's ``files`` list tells the
+    implementer where to start; it is not a permission list, so a change the
+    task genuinely needs in a neighbouring file does not have to round-trip
+    through a plan amendment. Deletion stays gated on ``delete_paths`` because
+    it is the one irreversible operation here.
+    """
 
     observed = {}
+    copied = copied_files if copied_files is not None else {}  # destination -> reference, across passes
 
     def capture_write(path, *, fresh_read=False):
+        check_active(reserve=5)
         full = agent_tools._resolve_path(app_name, path)
         # _resolve_path resolves symlinks; measure against the resolved root too,
-        # or a junctioned app root turns every approved path into "../../...".
+        # or a junctioned app root turns every written path into "../../...".
         canonical = os.path.relpath(full, os.path.realpath(agent_tools._app_root(app_name))).replace("\\", "/")
-        if allowed_paths is not None and canonical not in allowed_paths:
-            raise ValueError(f"Unapproved write path: {path}. Report the plan blocker; do not expand scope.")
+        if verification_contract is not None and (
+            canonical == verification.CONFIG_PATH or canonical in verification_contract.get("existing_tests", {})
+            or canonical in (verification_contract.get("frozen_tests") or {})
+        ):
+            raise ValueError(f"{canonical} belongs to the frozen verification contract. "
+                             "Repair the implementation or add a new regression test instead of weakening this check.")
         current = read_snapshot(full)
         if fresh_read and current is not None and (full not in observed or observed[full] != current):
             raise ValueError(f"Read {path} again before editing: line anchors or file content may be stale.")
         if before is not None and canonical not in before:
             before[canonical] = current
+        active_journal = checkpoint.journal()
+        if active_journal:
+            baseline = dict(active_journal.state.get("execution_baseline") or {})
+            for key, content in (before or {}).items():
+                baseline.setdefault(key, content)
+            active_journal.update(execution_baseline=baseline)
+        return full, canonical, current
 
     @tool
     def find_files(pattern: str = "", max_depth: int = 6) -> str:
-        """Recursively list the app directory tree using a glob-style pattern.
-        Returns an indented tree view. max_depth defaults to 6.
+        """List the app's files. Without a pattern: an indented tree (max_depth defaults to 6).
+        With a glob ('*.py', 'doctype/**/*.json', '*.{py,js}'): the matching paths, one per line.
         Use only when the supplied task context does not identify the files you need."""
         return agent_tools.find_files(app_name, pattern, max_depth)
 
     @tool
     def list_directory(path: str) -> str:
-        """List files and directories at path (relative to app root). 
+        """List files and directories at path (relative to app root).
         Directories are prefixed with [DIR] in the output."""
         return agent_tools.list_directory(app_name, path)
 
     @tool
-    def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
+    def read_file(path: str, start_line: int = 0, end_line: int = 0, ranges: str = "", purpose: str = "") -> str:
         """Read a file (path relative to app root) with line numbers.
-        - If start_line and end_line are both > 0, reads only that range (1-indexed, inclusive).
-        - Otherwise reads the full file.
-        ALWAYS use this to see exact line numbers before editing."""
+        With purpose ("what get_totals returns and where it stops"), a helper reads the text and you get
+        only its answer, with line numbers: use it to understand. Without purpose you get the exact text,
+        which stays in the conversation: use it for lines you will copy, edit or quote.
+        A code file of 200+ lines comes back as a summary (signatures kept, long bodies elided);
+        then fetch every span you need in ONE call with ranges="40-80,120-160" (ranges="1-N" reads it all).
+        Edit_file receipts show the edited region."""
         full = agent_tools._resolve_path(app_name, path)
         snapshot = read_snapshot(full)
-        result = agent_tools.read_file(app_name, path, start_line, end_line)
-        if snapshot is not None:
+        result = agent_tools.read_file(app_name, path, start_line, end_line, ranges)
+        # A summary shows signatures, not the text an overwrite or edit replaces, and
+        # a result the helper reads reaches the model only as the helper's answer.
+        if (snapshot is not None and " summary of " not in result.split("\n", 1)[0]
+                and not _reader_replaces(purpose, reader, result)):
             observed[full] = snapshot
         return result
 
     @tool
-    def search_code(pattern: str, path: str = "") -> str:
-        """Search for a regex pattern in the codebase. 
-        Returns matches with 3 lines of surrounding context. path is optional directory filter."""
-        return agent_tools.search_code(app_name, pattern, path)
+    def search_code(pattern: str, path: str = "", glob: str = "", output_mode: str = "", context: int = 2,
+                    head_limit: int = 0, purpose: str = "") -> str:
+        """Search source for a regular expression (case-insensitive; | alternation works).
+        output_mode "files" (the default for a directory or the whole app) lists matching files with their
+        match counts, most first; "content" (the default when path is one file) shows each matching line with
+        `context` lines around it. path narrows to a file or directory; glob to names like "*.js" or
+        "page/**/*.py". head_limit caps what is shown (50 files or 40 lines by default, 200 at most), and
+        the result says how many more there are. purpose: a helper reads the matches and returns only
+        what answers it."""
+        return agent_tools.search_code(app_name, pattern, path, glob=glob, output_mode=output_mode,
+                                       context=context, head_limit=head_limit)
 
     @tool
     def read_doctype_schema(doctype_name: str) -> str:
-        """Read DocType JSON schema file. doctype_name e.g. 'Sales Order'."""
+        """Read a DocType's source schema or installed dependency metadata and database columns.
+        Use this to verify actual ERPNext/Frappe fields before writing queries; doctype_name e.g. 'Sales Order'."""
         return agent_tools.read_doctype_schema(app_name, doctype_name)
 
     @tool
-    def get_file_outline(path: str) -> str:
+    def get_file_outline(path: str, purpose: str = "") -> str:
         """Get lightweight outline of a Python/JS/TS file — class/function signatures with line numbers.
-        Much cheaper than reading the whole file. Use to understand structure before reading specific sections."""
+        Much cheaper than reading the whole file. Use to understand structure before reading specific sections.
+        purpose: a helper reads the outline and returns only the signatures that answer it."""
         return agent_tools.get_file_outline(app_name, path)
 
     @tool
     def validate_code(path: str) -> str:
-        """Check for syntax errors in a .py or .js file. Path relative to app root.
-        ALWAYS call this after editing to verify that no syntax errors were introduced."""
-        return agent_tools.validate_code(app_name, path)
+        """Check syntax, undefined JavaScript names, Python type-checker errors and Query Builder fields against installed schema.
+        Source edits already return these diagnostics. Call separately only when the current source has no receipt.
+        Restore missing local declarations/imports; do not silence them as globals. Runtime tests are still needed."""
+        outcome = agent_tools.validate_code(app_name, path)
+        if outcome.startswith('VALID:') and path.endswith('.py'):
+            schema = run_query_schema_checks(app_name, [path])
+            if not schema.passed:
+                return 'VALIDATION_FAILED: Query schema does not match the installed site.\n' + schema.summary()
+            if schema.results:
+                outcome += '\n' + schema.summary()
+            outcome += type_check(path)
+        return outcome
 
-    out = [find_files, list_directory, read_file, search_code, read_doctype_schema, get_file_outline, validate_code]
-    if not read_only:
-        @tool
-        def write_file(path: str, content: str) -> str:
-            """Write or overwrite a file at the given relative path. Parent directories are created if needed."""
-            capture_write(path, fresh_read=True)
-            return agent_tools.write_file(app_name, path, content)
+    @tool
+    def run_tests() -> str:
+        """Execute configured integration tests and .koda/tests behavioral tests.
+        Python test*.py uses unittest against the live site; *.test.cjs/js/mjs uses node --test.
+        Nothing a Python test does persists: database writes roll back, file writes, background jobs and
+        email are discarded, and schema changes or commits are refused.
+        Import the actual changed code, never patch the module under test, and repair
+        failures before completion. A test that passes is frozen for the rest of the run.
+        This tool never accepts shell commands."""
+        contract = verification_contract if verification_contract is not None else verification.prepare_contract(app_name)
+        active_journal = checkpoint.journal()
+        changed = set(before or ()) | set((active_journal.state.get("execution_baseline") or {})
+                                          if active_journal else ())
+        report, receipts = verification.run_verification(app_name, contract, env=_get_bench_env(),
+                                                         required=verification.needs_tests(changed))
+        if verification_observer:
+            verification_observer(report, receipts)
+        return ("TESTS_PASSED\n" if report.passed else "TESTS_FAILED\n") + report.summary()
 
-        @tool
-        def edit_file(path: str, old_string: str, new_string: str) -> str:
-            """Replace FIRST occurrence of old_string with new_string in file.
-            Requires a unique EXACT match including whitespace. Read the current file first."""
-            capture_write(path)
-            return agent_tools.edit_file(app_name, path, old_string, new_string)
+    # The parameter must not be called "kwargs": the tool schema renames that
+    # field to "v__kwargs" and every call then fails before reaching the site.
+    @tool
+    def call_method(method: str, arguments: str = "", purpose: str = "") -> str:
+        """Run a function of this app against the live site and return its result or traceback.
+        method is the full dotted path (e.g. app.module.page.name.name.get_data); arguments is a JSON object
+        string of its keyword arguments, e.g. '{"customer": "CUST-0001", "limit": 20}'. Runs as Administrator
+        with real records and schema; nothing it does persists: database writes are rolled back, and file
+        writes, background jobs and email are discarded (the result says which). Use it to see what a query
+        or endpoint really returns before and after changing it. purpose ("does every row have a
+        due date?"): a helper reads the whole result and returns only the answer."""
+        kwargs, problem = _json_object_argument(arguments, "arguments")
+        if problem:
+            return "CALL_FAILED: " + problem
+        return verification.call_method(app_name, method, kwargs, env=_get_bench_env(),
+                                        limit=READER_INPUT_CHARS if purpose.strip() else verification.MAX_CALL_OUTPUT)
 
-        @tool
-        def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
-            """Replace lines start_line through end_line (1-indexed, inclusive) with new_content.
-            The most reliable tool for editing. Use read_file first to identify the exact line range."""
-            capture_write(path, fresh_read=True)
-            return agent_tools.replace_lines(app_name, path, start_line, end_line, new_content)
+    def read_only_failure(prefix: str) -> str:
+        if session is not None and session.get("plan_sink") is not None:
+            return (f"{prefix}: Writes start after the user approves your plan. Keep investigating, "
+                    "then call submit_plan.")
+        return f"{prefix}: Tool unavailable during read-only review; inspect source and report findings instead."
 
-        @tool
-        def insert_lines(path: str, after_line: int, new_content: str) -> str:
-            """Insert new_content AFTER the specified 1-indexed line number.
-            Use after_line=0 to insert at the beginning of the file."""
-            capture_write(path, fresh_read=True)
-            return agent_tools.insert_lines(app_name, path, after_line, new_content)
+    def remember(full, result):
+        # The model knows what it just wrote: its own write or edit is a current
+        # view of the file, so overwriting it later needs no re-read first.
+        # An edit refreshes a view the model already had; it does not create one.
+        if result.startswith("WRITE_OK:") or (result.startswith("EDIT_OK:") and full in observed):
+            snapshot = read_snapshot(full)
+            if snapshot is not None:
+                observed[full] = snapshot
+        return result
 
-        out.extend([write_file, edit_file, replace_lines, insert_lines])
-    return out
+    def type_check(path):
+        try:
+            return python_diagnostics.receipt(agent_tools._app_root(app_name),
+                                              agent_tools._resolve_path(app_name, path), app_name,
+                                              env=agent_tools.command_environment())
+        except Exception:
+            log_agent_error("Agent Graph: pyright diagnostics", frappe.get_traceback())
+            return ""
+
+    def source_feedback(result, path):
+        if result.startswith(('WRITE_OK:', 'EDIT_OK:', 'COPY_OK:')) and path.endswith(('.py', '.js')):
+            # Report diagnostics in the mutation receipt, before another turn
+            # can build on a broken edit. This does not claim runtime success.
+            checked = agent_tools.validate_code(app_name, path)
+            if checked.startswith('VALID:') and path.endswith('.py'):
+                schema = run_query_schema_checks(app_name, [path])
+                if schema.results:
+                    checked += '\n' + schema.summary()
+                checked += type_check(path)
+            result += '\nAutomatic source checks (integration still required):\n' + checked
+        return result
+
+    @tool
+    def write_file(path: str, content: str) -> str:
+        """Write or overwrite a file at the given relative path. Parent directories are created if needed."""
+        if read_only:
+            return read_only_failure("WRITE_FAILED")
+        full, canonical, current = capture_write(path, fresh_read=True)
+        reference = copied.get(canonical)
+        if reference and current is not None and current.count("\n") >= COPY_REWRITE_MIN_LINES:
+            return (f"WRITE_FAILED: {path} was copied from {reference} so that it keeps the reference's "
+                    "behavior. Change it with edit_file on the parts the task changes (several edits in one "
+                    "response are fine); rewriting it whole drops what the reference does.")
+        return source_feedback(remember(full, agent_tools.write_file(app_name, path, content)), path)
+
+    @tool
+    def copy_file(source_path: str, destination_path: str, replacements: str = "") -> str:
+        """Copy a reference into a new file without regenerating its complete source.
+        Optional replacements, a JSON object string of literal old->new text such as
+        '{"sales_report": "purchase_report"}', rename identity strings such as page names,
+        class names and CSS prefixes. The source is preserved and unrelated existing destinations are
+        never overwritten. Prefer this when adapting a large existing feature; then edit only the
+        requested behavior."""
+        if read_only:
+            return read_only_failure('COPY_FAILED')
+        replacements, problem = _json_object_argument(replacements, "replacements")
+        if problem:
+            return "COPY_FAILED: " + problem
+        source = agent_tools._resolve_path(app_name, source_path)
+        known = observed.get(source)
+        destination, canonical, _ = capture_write(destination_path)
+        result = agent_tools.copy_file(app_name, source_path, destination_path,
+                                      replacements=replacements, expected_sha256=revision(known) if known is not None else '')
+        if result.startswith('COPY_OK:'):
+            copied[canonical] = source_path
+            if known is not None:
+                observed[destination] = read_snapshot(destination)
+                if not any("\n" in old + new for old, new in replacements.items()):
+                    # Single-line replacements keep the copy line for line with its source.
+                    result += (f" It matches {source_path} line for line, so what you read of the source is "
+                               "this file with the replacements applied: edit it from that without reading it again.")
+        return source_feedback(result, destination_path)
+
+    @tool
+    def edit_file(path: str, old_string: str, new_string: str, expected_occurrences: int = 1) -> str:
+        """Replace EXACT text, including whitespace. Read current source first.
+        Default requires a unique match. For an intentional global rename, set expected_occurrences
+        to the exact current count; no write occurs if the count differs. Returns source diagnostics.
+        Send every edit you already know in one response, several to one file included."""
+        if read_only:
+            return read_only_failure("EDIT_FAILED")
+        full, _, _ = capture_write(path)
+        return source_feedback(remember(full, agent_tools.edit_file(
+            app_name, path, old_string, new_string, expected_occurrences)), path)
+
+    @tool
+    def rename_file(source_path: str, destination_path: str) -> str:
+        """Rename a file without changing its bytes or overwriting an existing destination.
+        Read the source first.
+        Use this for filename fixes; writing an empty source does not remove it."""
+        if read_only:
+            return read_only_failure("RENAME_FAILED")
+        full, source, current = capture_write(source_path, fresh_read=True)
+        _, destination, destination_content = capture_write(destination_path)
+        known = current if current is not None else observed.get(full)
+        if known is None and before is not None and before.get(destination) is None:
+            known = before.get(source)
+        expected = revision(known) if known is not None else ""
+        if known is not None:
+            checkpoint.write_intent({source: current, destination: destination_content},
+                {source: None, destination: known}, move={"source": source, "destination": destination, "sha256": expected})
+        result = agent_tools.rename_file(app_name, source_path, destination_path, expected_sha256=expected)
+        if result.startswith("RENAME_OK:") and file_moves is not None:
+            move = {"source": source, "destination": destination, "sha256": expected}
+            if move not in file_moves:
+                file_moves.append(move)
+            active_journal = checkpoint.journal()
+            if active_journal:
+                all_moves = list(active_journal.state.get("file_moves") or [])
+                if move not in all_moves:
+                    all_moves.append(move)
+                active_journal.update(file_moves=all_moves)
+        return result
+
+    @tool
+    def delete_file(path: str) -> str:
+        """Remove an explicitly approved DELETE-task file. Read current source first."""
+        if read_only:
+            return read_only_failure("DELETE_FAILED")
+        _, canonical, current = capture_write(path, fresh_read=True)
+        if canonical not in delete_paths:
+            raise ValueError(f"Deletion is not approved for {path}.")
+        return agent_tools.delete_file(app_name, path, expected_sha256=revision(current))
+
+    catalogue = [find_files, list_directory, read_file, search_code, read_doctype_schema,
+                 get_file_outline, validate_code, run_tests, call_method, write_file, copy_file,
+                 edit_file, rename_file, delete_file]
+    return catalogue
 
 
-# ---------------------------------------------------------------------------
 # Tool-calling loop with detailed realtime logging
-# ---------------------------------------------------------------------------
 
 def _bounded_tool_result(name: str, arguments: dict, result: str) -> str:
     limit = MAX_READ_RESULT_CHARS if name in SELF_BOUNDED_TOOLS else MAX_TOOL_RESULT_CHARS
@@ -1679,7 +1882,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
         max_rounds = min(max_rounds, remaining - 1)
         tools = _make_tools(
             app_name, read_only=read_only_tools,
-            allowed_paths=state.get("allowed_write_paths"), before=before,
+            before=before,
         )
         llm = _get_llm(provider=provider, model=model)
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
