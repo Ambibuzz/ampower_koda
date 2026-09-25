@@ -498,7 +498,9 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
 
         _save_logs(request_name, final_state)
 
-        if final_state.get("error") or not final_state.get("review_passed"):
+        # Repair that stopped short of a pass still delivers its work, with the open findings shown.
+        unresolved = _unresolved_warning(final_state)
+        if final_state.get("error") or not (final_state.get("review_passed") or unresolved):
             final_state.setdefault("error", "Execution ended without a passing final review.")
             _update_status(request_name, user, "Failed",
                 final_state["error"],
@@ -520,20 +522,26 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         worktree_after = worktree_signature(repo_root) if is_follow_up_mode else ""
         run_made_changes = (not is_follow_up_mode) or (worktree_before != worktree_after)
 
-        ok_diff, diff_out = run_git(["diff", "--stat"], cwd=repo_root)
-        ok_ut, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
-        if not ok_diff or not ok_ut:
-            raise RuntimeError("Could not verify the working tree after review: " + (diff_out if not ok_diff else untracked))
-        has_changes = bool((diff_out or "").strip()) or bool((untracked or "").strip())
+        # Porcelain status sees staged, unstaged and untracked work alike.
+        ok_status, status_out = run_git(["status", "--porcelain"], cwd=repo_root)
+        if not ok_status:
+            raise RuntimeError("Could not verify the working tree after review: " + status_out)
+        has_changes = bool((status_out or "").strip())
 
-        if not has_changes or (is_follow_up_mode and not run_made_changes):
-            _update_status(
-                request_name, user, "Completed",
-                "Review passed with no net changes. See Task Execution Results for evidence.",
-                change_summary=final_state.get("change_summary", ""),
-                tokens_used=int(final_state.get("tokens_used") or 0),
-            )
-            return
+        change_summary = "\n\n".join(filter(None, [unresolved, (final_state.get("change_summary") or "").strip()]))
+        if is_follow_up_mode and change_summary:
+            prior_summary = (doc.change_summary or "").strip()
+            if prior_summary:
+                change_summary = f"{prior_summary}\n\n--- Follow-up #{doc.follow_up_count or 1} ---\n{change_summary}"
+
+        # Execution never ends a request: every run, even one with no net changes, goes
+        # through bench and push approval, and only the user-approved deploy completes it.
+        if not has_changes:
+            outcome = " with no net changes on the branch"
+        elif not run_made_changes:
+            outcome = " (no further changes; earlier work kept)"
+        else:
+            outcome = ""
 
         patch_diff = _generate_patch_diff(app_name)
         edits = [e for e in (final_state.get("edits_made") or [])
@@ -542,17 +550,14 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
             edits = _merge_file_edits(as_json_list(doc.files_changed), edits)
         bench_cmds = _compute_bench_commands(app_name, edits)
 
-        change_summary = (final_state.get("change_summary") or "").strip()
-        if is_follow_up_mode and change_summary:
-            prior_summary = (doc.change_summary or "").strip()
-            if prior_summary:
-                change_summary = f"{prior_summary}\n\n--- Follow-up #{doc.follow_up_count or 1} ---\n{change_summary}"
-
         _save_implementation_snapshot(request_name, doc, final_state, is_follow_up_mode)
 
         _update_status(
             request_name, user, "Awaiting Bench Approval",
-            f"{'Follow-up patch' if is_follow_up_mode else 'Implementation'} complete. {len(bench_cmds)} bench commands need approval.",
+            f"{'Follow-up patch' if is_follow_up_mode else 'Implementation'} complete"
+            f"{outcome}"
+            f"{' with unresolved review findings (see the change summary)' if unresolved else ''}. "
+            f"{len(bench_cmds)} bench commands need approval.",
             patch_diff=patch_diff,
             files_changed=dump_json_capped(edits),
             change_summary=change_summary,
@@ -566,9 +571,23 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
-# ---------------------------------------------------------------------------
+def _unresolved_warning(final_state: dict) -> str:
+    """What the delivered work leaves open: a repair that stopped short of a pass, or tests still failing."""
+    parts = []
+    stopped = str(final_state.get("review_stopped") or "").strip()
+    if stopped and not final_state.get("review_passed"):
+        text = "UNRESOLVED - repair stopped before the review passed: " + stopped[:2000]
+        notes = str(final_state.get("review_notes") or "").strip()
+        if notes and notes[:200] not in stopped:
+            text += "\nLast review findings:\n" + notes[:3000]
+        parts.append(text)
+    tests = str(final_state.get("tests_unresolved") or "").strip()
+    if tests:
+        parts.append("UNRESOLVED - tests still fail after repair; they were reported, not fixed:\n" + tests[:3000])
+    return "\n\n".join(parts)
+
+
 # Helpers: bench command computation
-# ---------------------------------------------------------------------------
 
 def _prior_changed_paths(doc) -> list:
     """Canonical paths from the previous run's files_changed list."""
@@ -697,9 +716,7 @@ def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
     return cmds
 
 
-# ---------------------------------------------------------------------------
 # Phase 2b: Bench + Commit — Run bench commands, then branch+commit
-# ---------------------------------------------------------------------------
 
 def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
     """Broadcast a bench command start/result event via Frappe realtime."""
