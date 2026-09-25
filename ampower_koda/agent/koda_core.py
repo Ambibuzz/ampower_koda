@@ -61,6 +61,8 @@ from ampower_koda.agent.prompt_caching import mark_message, native_cache_message
 from ampower_koda.agent.run_control import check_active, MODEL_TIME_RESERVE
 from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
 from ampower_koda.agent.core.budget.request import estimate_messages
+from ampower_koda.agent.core.config.merge import merge_config
+from ampower_koda.agent.core.context.bootstrap import _resolve_config
 from ampower_koda.agent.core import (
     ROLE_PROMPT,
     LocalWorkspace,
@@ -896,8 +898,8 @@ def _app_root(app_name: str) -> str:
 def _model_id(llm) -> str:
     """The model id, for the cache-limit table the prompt assembler consults.
 
-    Only the *family* in the string matters — the core makes no model calls, it
-    only needs to know how wide a block has to be before caching it pays, and a
+    Only the *family* in the string matters here: this table determines how
+    wide a block has to be before caching it pays, and a
     version suffix does not change that. Falls back to the core's default, whose
     table is the conservative one.
     """
@@ -919,6 +921,7 @@ MODEL_WINDOWS = {
     "qwen/qwen-2.5-coder": 32_000,
     "gpt-4o-mini": 128_000,
     "gpt-5": 400_000,
+    "gpt-6": 1_050_000,  # luna, sol, astra (OpenRouter model list, 2026-09)
     "gemini-2.0-flash": 1_000_000,
     "gemini-2.5-pro": 1_000_000,
     "claude-3-5": 200_000,
@@ -940,14 +943,22 @@ def _window_for(model_id: str) -> int:
 
 
 def _overrides(model_id: str) -> dict | None:
-    """Cold-start config for this model, or ``None`` for the core's defaults.
-
-    Only the window is set, because every other budget is derived from it — and
-    the derivation is the core's business, not this module's. Handing over one
-    measured number is a different act from second-guessing the allocator.
-    """
+    """Investigations use question-specific retrieval instead of a global map."""
     window = _window_for(model_id)
-    return {"context": {"window_tokens": window}} if window else None
+    context = {"map_tokens": 0}
+    if window:
+        context["window_tokens"] = window
+    return {"context": context}
+
+
+def request_limits(app_name: str, model_id: str) -> tuple[int, int]:
+    """Resolve the same window and input ceiling for planning and execution."""
+    if app_name:
+        workspace = LocalWorkspace(root_path=Path(_app_root(app_name)))
+        config = _resolve_config(workspace, _overrides(model_id), [])
+    else:
+        config = merge_config(_overrides(model_id))
+    return config.context.window_tokens, config.context.input_tokens
 
 
 def _role_prompt(system_prompt: str) -> str:

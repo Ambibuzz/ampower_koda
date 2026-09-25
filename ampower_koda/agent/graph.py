@@ -13,14 +13,16 @@ import frappe
 from langchain_core.tools import tool
 from langgraph.graph import END, StateGraph
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from ampower_koda.agent.prompt_caching import openai_breakpoints
+from ampower_koda.agent.prompt_caching import mark_message, openai_breakpoints
 from langchain_openai import ChatOpenAI
 
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
+from ampower_koda.agent.cache_usage import persist_usage
 from ampower_koda.agent import koda_core
+from ampower_koda.agent import recovery
 from ampower_koda.agent.run_control import (
-    check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES,
+    check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES, MODEL_TIME_RESERVE,
 )
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.plan_contract import (
@@ -58,12 +60,26 @@ BASE_EXECUTION_CALL_BUDGET = 18
 PER_TASK_CALL_BUDGET = (MAX_TOOL_ROUNDS_EXECUTION + 1) + (MAX_TOOL_ROUNDS_REPAIR + 1)
 FINAL_REVIEW_RESERVE = 16  # review (7), evidence recovery (5), repair/re-review minimum (4)
 REPAIR_REVIEW_RESERVE = 3
+# Direct spend fences complement call-count limits. The request ledger includes
+# understanding/planning too, so execution cannot ignore cost already incurred
+# before it started. A new explicitly scoped follow-up gets a fresh budget.
+BASE_REQUEST_NEW_INPUT_BUDGET = 100_000
+PER_TASK_REQUEST_NEW_INPUT_BUDGET = 50_000
+MAX_REQUEST_NEW_INPUT_BUDGET = 250_000
+MAX_REQUEST_PROVIDER_COST_USD = 0.15
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
 REPLAYABLE_TOOLS = {
-    "find_files", "list_directory", "read_file", "search_code",
+    "find_files", "list_directory", "read_file", "search_code", "find_code",
     "read_doctype_schema", "get_file_outline", "validate_code",
 }
-
+TOOL_FAILURE_PREFIXES = (
+    "Error:", "Tool error:", "Unknown tool:", "Not a file:", "Not a directory:", "Not a file or directory:",
+    "DocType schema not found", "VALIDATION_ERROR", "VALIDATION_FAILED", "READ_FAILED",
+    "WRITE_FAILED", "EDIT_FAILED", "COPY_FAILED", "RENAME_FAILED", "DELETE_FAILED",
+    "TESTS_FAILED", "SYNTAX_ERROR",
+    "VALIDATION_UNAVAILABLE", "CALL_FAILED", "RUNTIME_UNAVAILABLE",
+    "FIND_FAILED", "SEARCH_FAILED", "SUBMIT_FAILED", "EXPLORE_FAILED", "EXPLORE_UNAVAILABLE",
+)
 # Per-phase output stored in conversation_log. High so full phase text is retained
 # (phase outputs are LLM summaries and are naturally well under this in practice).
 MAX_PHASE_OUTPUT_CHARS = 60000
@@ -71,15 +87,35 @@ MAX_PHASE_OUTPUT_CHARS = 60000
 # History trimming: keep recent tool rounds verbatim, compact older ones to text.
 # A "round" is one assistant tool-call message plus all of its tool results.
 KEEP_TOOL_ROUNDS = 4          # recent rounds retained in full
+# Full-input pressure is the only trigger for rewriting retained tool history.
+# A "round" is one assistant tool-call message plus all of its tool results.
 MIN_KEEP_ROUNDS = 1           # latest call/result pair must survive into the next request
 TRIM_CHAR_BUDGET = 48000      # includes tool-call arguments, not only result text
 COMPACT_RESULT_PREVIEW = 140  # chars of each tool result kept in the compact summary
 MAX_COMPACTED_HISTORY_CHARS = 12000
 MAX_TASK_PROMPT_CHARS = 60000
 MAX_TOOL_RESULT_CHARS = 8000
+# A whole source file is read once (about 25k tokens at most) rather than in slices.
+MAX_READ_RESULT_CHARS = 80000
+# Searches and outlines bound themselves and say what they left out; the generic
+# cap would cut them without saying so.
+SELF_BOUNDED_TOOLS = {"read_file", "search_code", "get_file_outline"}
+# Mid-turn, a stale message is retired only where the rewrite is cheap: the
+# rewrite uncaches everything after it, so only messages with at most ~8k
+# tokens after them qualify, once ~1k tokens are free; further back, only a ~20k bulk saving.
+PRUNE_TAIL_CHARS = 8000 * 3.3
+PRUNE_TAIL_MIN_CHARS = 1000 * 3.3
+PRUNE_BULK_CHARS = 20000 * 3.3
+# Prompt-cache prices as multiples of uncached input. A rewrite re-caches what
+# follows it at the write price, so below context pressure a prune rarely pays.
+CACHE_READ_PRICE = {"openai/": 0.1, "anthropic/": 0.1, "deepseek/": 0.1, "google/": 0.25}
+DEFAULT_CACHE_READ_PRICE = 0.3
+CACHE_WRITE_PRICE = 1.25
 MAX_UNDERSTANDING_CONTEXT_CHARS = 8000
-MODEL_ROUND_OUTPUT_TOKENS = 4096
-MODEL_FINAL_OUTPUT_TOKENS = 2048
+# Room to write a whole file in one call, with the reasoning that precedes it.
+# Output is billed as generated, so a high ceiling costs nothing unused.
+MODEL_ROUND_OUTPUT_TOKENS = 32000
+MODEL_FINAL_OUTPUT_TOKENS = 8192
 # Reasoning budget for ALWAYS_REASONING models: half the smallest per-call cap, so every call keeps room.
 MODEL_REASONING_BUDGET_TOKENS = MODEL_FINAL_OUTPUT_TOKENS // 2
 # OpenRouter families that reason on every call (GLM 4.5+, DeepSeek R1, QwQ, "thinking" variants).
@@ -378,6 +414,22 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
                       **direct_options)
 
 
+def _cache_read_price(provider: str, model: str) -> float:
+    """A cached input token's price as a fraction of an uncached one."""
+    if provider in ("OpenAI", "Claude"):
+        return 0.1
+    if provider == "Gemini":
+        return 0.25
+    name = (model or "").lower()
+    return next((price for prefix, price in CACHE_READ_PRICE.items() if name.startswith(prefix)),
+                DEFAULT_CACHE_READ_PRICE)
+
+
+def _prune_pays(freed_chars: float, rewritten_chars: float, calls_left: int, read_price: float) -> bool:
+    """Whether retiring ``freed_chars`` saves more than re-caching what follows the edit."""
+    return freed_chars * read_price * calls_left >= rewritten_chars * (CACHE_WRITE_PRICE - read_price)
+
+
 def _uses_explicit_prompt_cache(provider: str, model: str = "") -> bool:
     """Whether this route needs Anthropic-style cache breakpoints.
 
@@ -406,10 +458,12 @@ def _build_system_message(provider: str, system_prompt: str, model: str = "") ->
 
     Anthropic supports an explicit `cache_control` breakpoint on the system block,
     which caches the large, stable instruction prefix (big cost saver on repeated
-    tool rounds). OpenAI caches stable prefixes automatically, so a plain system
-    message is enough there. Gemini/others fall back to a plain system message.
+    tool rounds). GPT-5.6+ also gets an explicit system boundary. Older OpenAI
+    models and Gemini/others fall back to a plain system message.
     Caching only reduces cost; it never changes model output.
     """
+    if ENABLE_PROMPT_CACHE and openai_breakpoints(provider, model):
+        return mark_message(SystemMessage(content=system_prompt), openai=True)
     if ENABLE_PROMPT_CACHE and _uses_explicit_prompt_cache(provider, model):
         try:
             return SystemMessage(content=_cacheable_content(system_prompt))
@@ -423,6 +477,8 @@ def _build_system_message(provider: str, system_prompt: str, model: str = "") ->
 
 def _build_task_message(provider: str, task_prompt: str, model: str = "") -> HumanMessage:
     """Cache the stable task body too; it is often much larger than system text."""
+    if ENABLE_PROMPT_CACHE and openai_breakpoints(provider, model):
+        return mark_message(HumanMessage(content=task_prompt), openai=True)
     if ENABLE_PROMPT_CACHE and _uses_explicit_prompt_cache(provider, model):
         try:
             return HumanMessage(content=_cacheable_content(task_prompt))
@@ -459,17 +515,22 @@ def _tool_call_key(name: str, arguments: dict) -> str:
     return f"{name}\0{json.dumps(normalized, sort_keys=True, separators=(',', ':'), default=repr)}"
 
 
+def _tool_result_succeeded(result: str) -> bool:
+    """Classify every public tool failure prefix consistently."""
+    return not result.startswith(TOOL_FAILURE_PREFIXES)
+
+
 def _invoke_limited(model, messages: list, max_tokens: int):
     """Apply an output ceiling where the provider supports a per-call limit."""
+    check_active(reserve=MODEL_TIME_RESERVE)
     try:
-        return model.invoke(messages, max_tokens=max_tokens)
+        result = model.invoke(messages, max_tokens=max_tokens)
     except TypeError:
-        return model.invoke(messages)
+        check_active(reserve=MODEL_TIME_RESERVE)
+        result = model.invoke(messages)
+    check_active()
+    return result
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _extract_file_paths(text: str) -> list[str]:
     """Extract app-relative file paths from text produced by understand/plan phases."""
@@ -484,6 +545,21 @@ def _extract_file_paths(text: str) -> list[str]:
         for m in _re.finditer(pat, text):
             paths.add(m.group(0))
     return sorted(paths)
+
+
+#: Tokens that calls outside a running tool loop (explore, the plan check) charged to a
+#: request. The loop adds them to its own total, so its next write does not undercount.
+_SIDE_TOKENS: dict[str, int] = {}
+
+
+def add_side_tokens(request_name: str, tokens: int) -> None:
+    if request_name and tokens > 0:
+        _SIDE_TOKENS[request_name] = _SIDE_TOKENS.get(request_name, 0) + int(tokens)
+
+
+def _output_share(window: int, wanted: int) -> int:
+    """An output cap that leaves the window room for a working prompt: at most a quarter of it."""
+    return max(recovery.MIN_OUTPUT_TOKENS, min(int(wanted), int(window) // 4))
 
 
 def _app_file_exists(app_name: str, rel_path: str) -> bool:
@@ -567,6 +643,9 @@ def _log_stage(state: dict, stage: str, status: str, summary: str) -> list:
     return logs
 
 
+_persist_token_usage = persist_usage  # module-level seam that tests replace
+
+
 def _publish_agent_log(request_name: str, log_type: str, **kwargs):
     """Publish a detailed agent_log realtime event."""
     if not request_name:
@@ -588,18 +667,51 @@ def _publish_agent_log(request_name: str, log_type: str, **kwargs):
         )
 
 
-def _persist_token_usage(request_name: str, total_tokens: int):
-    """Write the running token total to the request so the form shows live usage."""
+def _request_spend_budget(state: dict) -> tuple[int, float]:
+    """Fresh-input and provider-cost ceilings for one complete request."""
+    tasks = max(1, len(state.get("execution_tasks") or []))
+    fresh = min(
+        MAX_REQUEST_NEW_INPUT_BUDGET,
+        BASE_REQUEST_NEW_INPUT_BUDGET + PER_TASK_REQUEST_NEW_INPUT_BUDGET * tasks,
+    )
+    return fresh, MAX_REQUEST_PROVIDER_COST_USD
+
+
+def _request_spend_pressure(state: dict, request_name: str) -> str:
+    """Describe overspend without terminating a recoverable workflow.
+
+    This is intentionally based on uncached input and the provider's reported
+    bill, not total context tokens. Cache reads can make total input look huge
+    without costing the same; conversely, a cold oversized prompt must count.
+    The caller uses this as a telemetry/compaction signal, never as an error.
+    """
     if not request_name:
-        return
+        return ""
     try:
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "tokens_used", int(total_tokens or 0))
-        frappe.db.commit()
-    except Exception:
-        log_agent_error(
-            "Agent Graph: persist token usage",
-            f"request={request_name}\n{frappe.get_traceback()}",
-        )
+        row = frappe.db.get_value(
+            DOCTYPE_NAME,
+            request_name,
+            ["cache_input_tokens", "cache_read_tokens", "cost_estimate"],
+            as_dict=True,
+        ) or {}
+    except (AttributeError, TypeError):
+        # Minimal/offline Frappe stubs and pre-migration sites have no readable
+        # ledger. Existing call-count valves still apply there.
+        return ""
+    input_used = int((row.get("cache_input_tokens", 0) if isinstance(row, dict)
+                      else getattr(row, "cache_input_tokens", 0)) or 0)
+    cache_read = int((row.get("cache_read_tokens", 0) if isinstance(row, dict)
+                      else getattr(row, "cache_read_tokens", 0)) or 0)
+    fresh_used = max(0, input_used - cache_read)
+    cost_used = float((row.get("cost_estimate", 0) if isinstance(row, dict)
+                       else getattr(row, "cost_estimate", 0)) or 0)
+    fresh_limit, cost_limit = _request_spend_budget(state)
+    reasons = []
+    if fresh_used >= fresh_limit:
+        reasons.append(f"{fresh_used:,} new input tokens reached the {fresh_limit:,} limit")
+    if cost_used >= cost_limit:
+        reasons.append(f"provider cost ${cost_used:.6f} reached the ${cost_limit:.2f} limit")
+    return "; ".join(reasons)
 
 
 def _make_tools(app_name: str, read_only: bool = False, *, allowed_paths=None, before=None):
@@ -705,6 +817,23 @@ def _make_tools(app_name: str, read_only: bool = False, *, allowed_paths=None, b
 # ---------------------------------------------------------------------------
 # Tool-calling loop with detailed realtime logging
 # ---------------------------------------------------------------------------
+
+def _bounded_tool_result(name: str, arguments: dict, result: str) -> str:
+    limit = MAX_READ_RESULT_CHARS if name in SELF_BOUNDED_TOOLS else MAX_TOOL_RESULT_CHARS
+    if len(result) <= limit:
+        return result
+    # Several spans cannot be relabelled as one contiguous range.
+    if name == 'read_file' and not _re.match(r'\[[^\]\n]*\] lines \d+-\d+,', result):
+        complete = result[:limit].rsplit('\n', 1)[0]
+        numbered = _re.findall(r'^\s*(\d+) \| .*$', complete, _re.M)
+        total = _re.search(r'(?:of |\] )(\d+)(?: lines)?$', result.split('\n', 1)[0])
+        if numbered and total:
+            start, end = int(numbered[0]), int(numbered[-1])
+            return (f'[{arguments.get("path", "")}] lines {start}-{end} of {total[1]}\n'
+                    + complete.split('\n', 1)[1]
+                    + f'\n[Output limit reached. Continue with read_file start_line={end + 1}; use a focused end_line.]')
+    return result[:limit] + '\n[Output limit reached; request a narrower path or source range.]'
+
 
 def _compact_round_summary(round_entry: dict) -> list[str]:
     """One short line per tool call in a round, for the compacted-history block."""
@@ -1019,6 +1148,31 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
 # ---------------------------------------------------------------------------
 # Agent turn helper
 # ---------------------------------------------------------------------------
+
+def _queue_followup(history: dict, previous_output: str, feedback: str, *, kind: str = "") -> None:
+    """Append the previous answer and new feedback after the retained rounds.
+
+    The opening prompt never changes, so the cached prefix stays byte-identical.
+    """
+    rounds = history.get("rounds") or []
+    history.setdefault("followups", []).append({
+        "after": rounds[-1]["number"] if rounds else 0,
+        "kind": kind,
+        "messages": [
+            AIMessage(content=previous_output or "(no output)"),
+            HumanMessage(content=feedback),
+        ],
+    })
+
+
+def _queue_directive(history: dict, text: str) -> None:
+    """Anchor new context after retained rounds without inventing an assistant turn."""
+    rounds = history.get("rounds") or []
+    history.setdefault("followups", []).append({
+        "after": rounds[-1]["number"] if rounds else 0,
+        "messages": [HumanMessage(content=text)],
+    })
+
 
 def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool, max_rounds: int = 20,
                     history: dict | None = None) -> dict:
