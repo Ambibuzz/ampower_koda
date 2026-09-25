@@ -25,6 +25,7 @@ from .run_control import check_active
 from .tools import ARCHIVE_DIRECTORY, _app_root, command_environment
 
 CONFIG_PATH = ".koda/verification.json"
+GUIDANCE_PATH = ".koda/verification.md"
 TEST_DIRECTORY = ".koda/tests"
 DEFAULT_TIMEOUT = 120
 MAX_TIMEOUT = 300
@@ -613,14 +614,12 @@ def prepare_contract(app_name: str, *, editable_tests=()) -> dict:
         checked.append({"name": str(command.get("name") or argv[0]),
                         "argv": argv, "cwd": cwd, "timeout_seconds": timeout})
     approved_edits = set(editable_tests)
-    guidance = []
-    for relative in ('.koda/verification.md', '.koda/live_acceptance.md'):
-        note = _inside(root, relative)
-        if note.is_file():
-            with note.open(encoding='utf-8') as handle:
-                excerpt = handle.read(4000)
-            guidance.append(relative + '\n' + excerpt)
-    return {"config": content, "commands": checked, "guidance": '\n\n'.join(guidance), "existing_tests": {
+    guidance = ""
+    note = _inside(root, GUIDANCE_PATH)
+    if note.is_file():
+        with note.open(encoding="utf-8") as handle:
+            guidance = GUIDANCE_PATH + "\n" + handle.read(4000)
+    return {"config": content, "commands": checked, "guidance": guidance, "existing_tests": {
         p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in test_files(root) if p.relative_to(root).as_posix() not in approved_edits
     }}
