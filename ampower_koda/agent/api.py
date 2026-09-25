@@ -317,6 +317,8 @@ def approve_plan(request_name: str, plan_json: str = None):
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, {
         "status": "Implementing",
+        # A failed plan revision leaves its error while the plan awaits approval.
+        "error_log": "",
         "patch_diff": "",
     })
     frappe.db.commit()
@@ -328,6 +330,44 @@ def approve_plan(request_name: str, plan_json: str = None):
         request_name=request_name,
     )
     return {"status": "ok", "message": _("Plan approved. Starting implementation.")}
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def revise_plan(request_name: str, feedback: str, plan_json: str = None):
+    """Answer the proposed plan in words; the agent revises it in the same investigation.
+
+    ``plan_json`` keeps edits the user made to the plan before asking.
+    """
+    if not request_name:
+        frappe.throw(_("Request name is required."))
+    feedback = (feedback or "").strip()
+    if not feedback:
+        frappe.throw(_("Say what the plan should change."))
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    if doc.status != "Awaiting Approval":
+        frappe.throw(_("Cannot revise the plan. Agent status is {0}.").format(doc.status))
+    _validate_provider_key(doc)
+    values = {"status": "Queued", "error_log": ""}
+    if plan_json:
+        try:
+            edited = load_plan(plan_json)
+        except PlanValidationError as exc:
+            frappe.throw(str(exc))
+        values.update(plan_json=json.dumps(edited, ensure_ascii=True), agent_plan=plan_to_markdown(edited))
+    frappe.db.set_value(DOCTYPE_NAME, request_name, values)
+    frappe.db.commit()
+
+    enqueue_job(
+        "ampower_koda.agent.executor.run_planning_phase",
+        queue="default",
+        timeout=1800,
+        request_name=request_name,
+        plan_feedback=feedback[:20000],
+    )
+    return {"status": "ok", "message": _("Revising the plan from your feedback.")}
 
 
 @frappe.whitelist()

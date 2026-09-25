@@ -271,8 +271,11 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
 # ---------------------------------------------------------------------------
 
 @managed_job
-def run_planning_phase(request_name: str) -> None:
-    """Run the planning phase (understand + plan) and pause for plan approval."""
+def run_planning_phase(request_name: str, plan_feedback: str = "") -> None:
+    """Investigate and plan in the request's session, then pause for plan approval.
+
+    ``plan_feedback``, the user's answer to the plan, continues the same investigation.
+    """
     frappe.set_user("Administrator")
     try:
         config = _get_doc_config(request_name)
@@ -285,15 +288,21 @@ def run_planning_phase(request_name: str) -> None:
 
     user = config["user"]
     doc = config["doc"]
+    plan_feedback = (plan_feedback or "").strip()
 
     try:
-        revert_msg = _revert_previous_changes(
-            config["target_app_name"], config["base_branch"],
-            request_name=request_name, user=user,
-            branch_prefix=config["branch_prefix"],
-        )
-        if revert_msg:
-            _update_status(request_name, user, "Queued", revert_msg)
+        if plan_feedback:
+            # Nothing was implemented while the plan awaited approval.
+            _update_status(request_name, user, "Understanding", "Revising the plan from your feedback...")
+        else:
+            revert_msg = _revert_previous_changes(
+                config["target_app_name"], config["base_branch"],
+                request_name=request_name, user=user,
+                branch_prefix=config["branch_prefix"],
+            )
+            if revert_msg:
+                _update_status(request_name, user, "Queued", revert_msg)
+            _update_status(request_name, user, "Understanding", "Exploring codebase...")
 
         graph = koda_session.build_planning_graph()
         initial = {
@@ -312,11 +321,24 @@ def run_planning_phase(request_name: str) -> None:
             "edits_made": [],
             "stage_log": [],
         }
+        if plan_feedback:
+            initial.update({
+                "plan_feedback": plan_feedback,
+                "plan_object": json.loads(doc.plan_json or "{}"),
+                "stage_log": _parse_stage_log(doc.stage_log or ""),
+                "tokens_used": int(doc.tokens_used or 0),
+            })
 
         final_state = graph.invoke(initial)
 
         if final_state.get("error"):
             _save_logs(request_name, final_state)
+            if plan_feedback and doc.plan_json:
+                # The plan being answered is still valid: offer it again with the error.
+                _update_status(request_name, user, "Awaiting Approval",
+                    "The plan could not be revised; the previous plan is unchanged: " + final_state["error"],
+                    error_log=final_state.get("error_log") or final_state["error"])
+                return
             _update_status(request_name, user, "Failed",
                 final_state["error"],
                 error_log=final_state.get("error_log") or final_state["error"])
