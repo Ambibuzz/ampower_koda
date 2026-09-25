@@ -20,7 +20,7 @@ from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
 from ampower_koda.agent import koda_core
 from ampower_koda.agent.run_control import (
-    MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES,
+    check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES,
 )
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.plan_contract import (
@@ -543,15 +543,14 @@ def _log_stage(state: dict, stage: str, status: str, summary: str) -> list:
                 f"[{l['timestamp']}] {l['stage']} - {l['status']}: {l['summary']}"
                 for l in logs
             )
-            frappe.db.set_value(DOCTYPE_NAME, request_name, {
+            set_request_value(request_name, {
                 "status": stage if status == "started" else state.get("current_stage", stage),
                 "stage_log": stage_text[:50000],
             })
-            if status == "started":
-                frappe.db.set_value(DOCTYPE_NAME, request_name, "status", stage)
             frappe.db.commit()
 
             user = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
+            check_active()
             frappe.publish_realtime("agent_progress", {
                 "request_name": request_name,
                 "status": stage,
@@ -572,6 +571,7 @@ def _publish_agent_log(request_name: str, log_type: str, **kwargs):
     """Publish a detailed agent_log realtime event."""
     if not request_name:
         return
+    check_active()
     try:
         user = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
         payload = {
@@ -586,6 +586,7 @@ def _publish_agent_log(request_name: str, log_type: str, **kwargs):
             "Agent Graph: publish agent_log",
             f"request={request_name}\ntype={log_type}\n{frappe.get_traceback()}",
         )
+
 
 def _persist_token_usage(request_name: str, total_tokens: int):
     """Write the running token total to the request so the form shows live usage."""

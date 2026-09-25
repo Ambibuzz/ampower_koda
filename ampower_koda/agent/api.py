@@ -33,6 +33,8 @@ from ampower_koda.agent.git_ops import (
 from ampower_koda.agent.graph import _app_file_exists, _get_bench_env
 from ampower_koda.agent import tools as agent_tools
 
+from ampower_koda.agent.run_control import enqueue_job, stop_job
+
 DOCTYPE_NAME = "Agent Request"
 
 # Statuses from which a new run or follow-up may be started (agent is idle or finished).
@@ -56,31 +58,6 @@ BUSY_STATUSES = (
 # here because two endpoints now append to the same field and a cap that only
 # one of them applied would let the other grow past it.
 BENCH_LOG_MAX_CHARS = 50000
-
-
-def _remember_job(request_name: str, job) -> None:
-    """Record which RQ job is running this request.
-
-    Without it ``cancel_agent_request`` could only relabel the row: the worker
-    kept editing files, running bench commands and pushing branches, and the
-    next ``_update_status`` from that still-running job overwrote "Cancelled"
-    with whatever phase it had reached. The id is the only handle on the worker,
-    and it exists for exactly as long as it takes to write it down.
-
-    Never raises. Losing the handle degrades cancel back to a status change; it
-    must not fail the enqueue that just succeeded.
-    """
-    job_id = getattr(job, "id", None)
-    if not job_id:
-        return
-    try:
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "rq_job_id", str(job_id))
-        frappe.db.commit()
-    except Exception:
-        log_agent_error(
-            "Agent API: persist rq_job_id",
-            f"request={request_name}\njob={job_id}\n{frappe.get_traceback()}",
-        )
 
 
 def _reconcile_if_dead(doc) -> bool:
@@ -183,6 +160,7 @@ def start_agent(request_name: str):
         "plan_json": "",
         "approved_plan_json": "",
         "execution_results": "",
+        "execution_checkpoint": "",
         "bench_log": "",
         "patch_diff": "",
         "conversation_log": "",
@@ -192,6 +170,9 @@ def start_agent(request_name: str):
         "follow_up_count": 0,
         "implementation_snapshot": "",
         "tokens_used": 0,
+        "cache_input_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
         "cost_estimate": 0,
         # files_changed is a JSON column with a json_valid() CHECK constraint —
         # "" is not valid JSON, so clear it with NULL (allowed) instead.
@@ -199,13 +180,12 @@ def start_agent(request_name: str):
     })
     frappe.db.commit()
 
-    job = frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_planning_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
     )
-    _remember_job(request_name, job)
     return {"status": "ok", "message": _("Planning phase started.")}
 
 
@@ -244,13 +224,14 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         "status": "Implementing",
         "follow_up_message": follow_up[:50000],
         "follow_up_count": follow_up_count,
+        "execution_checkpoint": "",
         "error_log": "",
         "bench_log": "",
         "patch_diff": "",
     })
     frappe.db.commit()
 
-    job = frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
@@ -258,7 +239,6 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         preserve_branch=1,
         is_follow_up=1,
     )
-    _remember_job(request_name, job)
     return {"status": "ok", "message": _("Follow-up patch started on existing branch (plan preserved).")}
 
 
@@ -274,6 +254,7 @@ def _approve_structured_plan(doc, value=None):
         "approved_plan_json": json.dumps(plan, ensure_ascii=True),
         "agent_plan": plan_to_markdown(plan),
         "execution_results": "",
+        "execution_checkpoint": "",
     })
 
 
@@ -304,13 +285,12 @@ def execute_existing_plan(request_name: str):
     })
     frappe.db.commit()
 
-    job = frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
     )
-    _remember_job(request_name, job)
     return {"status": "ok", "message": _("Implementation phase started.")}
 
 
@@ -337,13 +317,12 @@ def approve_plan(request_name: str, plan_json: str = None):
     })
     frappe.db.commit()
 
-    job = frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
         request_name=request_name,
     )
-    _remember_job(request_name, job)
     return {"status": "ok", "message": _("Plan approved. Starting implementation.")}
 
 
@@ -563,13 +542,13 @@ def approve_bench(request_name: str, commands: str = None):
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Building")
     frappe.db.commit()
 
-    job = frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_bench_and_commit",
         queue="default",
         timeout=1800,
         request_name=request_name,
+        clear_checkpoint=True,
     )
-    _remember_job(request_name, job)
 
     cmds = []
     try:
@@ -605,15 +584,15 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
     frappe.db.commit()
 
-    job = frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_deploy_phase",
         queue="default",
         timeout=600,
         request_name=request_name,
+        clear_checkpoint=True,
         do_push=bool(push_branch),
         do_pr=bool(create_pr),
     )
-    _remember_job(request_name, job)
 
     if push_branch and create_pr:
         msg = _("Pushing branch and creating PR...")
@@ -1212,15 +1191,15 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
     frappe.db.commit()
 
-    job = frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_deploy_phase",
         queue="default",
         timeout=600,
         request_name=request_name,
+        clear_checkpoint=True,
         do_push=bool(push_branch),
         do_pr=bool(create_pr),
     )
-    _remember_job(request_name, job)
 
     if push_branch and create_pr:
         msg = _("Committing, pushing, and creating PR...")
@@ -1244,4 +1223,7 @@ def cancel_agent_request(request_name: str):
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Cancelled")
     frappe.db.commit()
+    stop_job(doc.get("rq_job_id") or "")
     return {"status": "ok", "message": _("Request cancelled.")}
+
+

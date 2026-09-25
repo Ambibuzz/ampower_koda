@@ -18,6 +18,7 @@ from ampower_koda.agent.graph import (
     build_planning_graph,
     build_execution_graph,
 )
+from ampower_koda.agent.run_control import managed_job, check_active, set_request_value
 from ampower_koda.agent.git_ops import (
     branch_exists,
     generate_branch_name,
@@ -232,7 +233,7 @@ def _get_doc_config(request_name: str) -> dict:
 
 def _update_status(request_name: str, user: str, status: str, message: str = "", **kwargs):
     """Persist the status (plus any allowed fields) and broadcast progress via realtime."""
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", status)
+    set_request_value(request_name, "status", status)
     allowed_fields = [
         "branch_name", "pr_url", "pr_number", "conversation_log",
         "agent_plan", "files_changed", "error_log", "tokens_used",
@@ -243,8 +244,9 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
     if kwargs:
         for k, v in kwargs.items():
             if k in allowed_fields:
-                frappe.db.set_value(DOCTYPE_NAME, request_name, k, v)
+                set_request_value(request_name, k, v)
     frappe.db.commit()
+    check_active()
     payload = {"request_name": request_name, "status": status, "message": message, **kwargs}
     frappe.publish_realtime("agent_progress", payload, user=user)
 
@@ -253,6 +255,7 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
 # Phase 1: Planning (Understand + Plan)
 # ---------------------------------------------------------------------------
 
+@managed_job
 def run_planning_phase(request_name: str) -> None:
     """Run the planning phase (understand + plan) and pause for plan approval."""
     frappe.set_user("Administrator")
@@ -260,8 +263,8 @@ def run_planning_phase(request_name: str) -> None:
         config = _get_doc_config(request_name)
     except Exception as e:
         log_agent_error("Agent Planning Config Error", frappe.get_traceback())
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Failed")
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "error_log", str(e))
+        set_request_value(request_name, "status", "Failed")
+        set_request_value(request_name, "error_log", str(e))
         frappe.db.commit()
         return
 
@@ -316,7 +319,7 @@ def run_planning_phase(request_name: str) -> None:
         if not tasks:
             raise ValueError("Planning completed without a structured task list")
 
-        frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        set_request_value(request_name, {
             "agent_plan": plan,
             "plan_json": json.dumps(plan_object, ensure_ascii=True),
             "approved_plan_json": "",
@@ -342,6 +345,7 @@ def run_planning_phase(request_name: str) -> None:
 # Phase 2: Execution (Implement + Review)
 # ---------------------------------------------------------------------------
 
+@managed_job
 def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_up: int = 0) -> None:
     """Create/reuse the working branch, run implement + review, then await bench approval.
 
@@ -354,8 +358,8 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         config = _get_doc_config(request_name)
     except Exception as e:
         log_agent_error("Agent Execution Config Error", frappe.get_traceback())
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Failed")
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "error_log", str(e))
+        set_request_value(request_name, "status", "Failed")
+        set_request_value(request_name, "error_log", str(e))
         frappe.db.commit()
         return
 
@@ -578,7 +582,7 @@ def _save_implementation_snapshot(request_name: str, doc, final_state: dict, is_
     prior = (doc.implementation_snapshot or "").strip()
     if is_follow_up and prior:
         snapshot = f"{prior}\n\n--- Follow-up run ---\n{snapshot}"
-    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+    set_request_value(request_name, {
         "implementation_snapshot": snapshot[:50000],
     })
 
@@ -680,6 +684,7 @@ def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
     }, user=user)
 
 
+@managed_job
 def run_bench_and_commit(request_name: str) -> None:
     """Run the approved bench commands, then pause for push approval so the user can test."""
     frappe.set_user("Administrator")
@@ -687,8 +692,8 @@ def run_bench_and_commit(request_name: str) -> None:
         config = _get_doc_config(request_name)
     except Exception as e:
         log_agent_error("Agent Bench Config Error", frappe.get_traceback())
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Failed")
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "error_log", str(e))
+        set_request_value(request_name, "status", "Failed")
+        set_request_value(request_name, "error_log", str(e))
         frappe.db.commit()
         return
 
@@ -725,6 +730,7 @@ def run_bench_and_commit(request_name: str) -> None:
         bench_output_parts = []
         failed_cmds = []
         for cmd in immediate_cmds:
+            check_active(reserve=930)
             _publish_bench_log(user, request_name, cmd, True, "Running...")
             try:
                 result = subprocess.run(
@@ -735,6 +741,7 @@ def run_bench_and_commit(request_name: str) -> None:
                     timeout=900,
                     env=bench_env,
                 )
+                check_active()
                 out = (result.stdout or "") + (result.stderr or "")
                 ok = result.returncode == 0
                 status_str = "OK" if ok else f"FAILED (exit {result.returncode})"
@@ -817,6 +824,7 @@ def run_bench_and_commit(request_name: str) -> None:
 # Phase 3: Deployment (Push + Pull Request)
 # ---------------------------------------------------------------------------
 
+@managed_job
 def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True) -> None:
     """Commit the changes, then optionally push the branch and open a pull request."""
     frappe.set_user("Administrator")
@@ -824,8 +832,8 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
         config = _get_doc_config(request_name)
     except Exception as e:
         log_agent_error("Agent Deploy Config Error", frappe.get_traceback())
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Failed")
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "error_log", str(e))
+        set_request_value(request_name, "status", "Failed")
+        set_request_value(request_name, "error_log", str(e))
         frappe.db.commit()
         return
 
@@ -851,6 +859,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
         _update_status(request_name, user, "Pushing", "Committing changes...")
         user_msg = (doc.user_message or "")[:200]
         commit_msg = f"[AI Agent] {doc.request_type or 'Improvement'}: {request_name}\n\n{user_msg}"
+        check_active(reserve=150)
         ok, msg = commit_changes(
             app_name, commit_msg,
             config["git_user_name"], config["git_user_email"],
@@ -878,6 +887,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
 
         if do_push:
             _update_status(request_name, user, "Pushing", f"Pushing branch '{branch_name}' to GitHub...")
+            check_active(reserve=150)
             ok, msg = push_branch(
                 app_name, branch_name,
                 config["github_repo_url"], config["github_token"],
@@ -892,6 +902,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
             user_message = (doc.user_message or "")[:500]
             pr_title = f"[AI Agent] {doc.request_type or 'Improvement'}: {request_name}"
             pr_body = f"## Request\n{user_message}\n\n## Plan\n{doc.agent_plan or ''}"
+            check_active(reserve=150)
             ok, msg, pr_url, pr_number = create_pull_request(
                 pr_title, pr_body, branch_name,
                 config["github_repo_url"], config["github_token"],
@@ -1006,7 +1017,7 @@ def _save_logs(request_name: str, final_state: dict):
     conversation_log = _append_conversation_log(request_name, new_block)
 
     try:
-        frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        set_request_value(request_name, {
             "stage_log": stage_text[:50000],
             "conversation_log": conversation_log,
         })
