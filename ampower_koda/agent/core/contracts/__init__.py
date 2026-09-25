@@ -38,15 +38,11 @@ from .prompt import (
 from .repo_map import FileRanks, MirrorSet, RepoMap
 from .repository import (
     RepositoryIndex,
-    chunk_by_digest,
     definitions_by_name,
     files_referencing,
     iter_chunks,
     iter_definitions,
-    iter_indexable_chunks,
     with_file,
-    with_skip,
-    without_file,
 )
 from .retrieval import LEG_TRUST, UNKNOWN_LEG_TRUST, Hit, LegName, LegResult, SearchResult
 from .session import CoChangeMemory, RepoMemory, SessionContext
@@ -61,7 +57,7 @@ from .symbols import (
     ReferenceKind,
     SymbolRole,
 )
-from .transcript import Block, BlockKind, Transcript, transcript_of
+from .transcript import Block, BlockKind, Transcript
 from .working_set import WorkingSet, WorkingSpan
 
 __all__ = [
@@ -126,15 +122,10 @@ __all__ = [
     "UtilityModel",
     "WorkingSet",
     "WorkingSpan",
-    "chunk_by_digest",
     "definitions_by_name",
     "files_referencing",
     "is_indexable_role",
     "iter_chunks",
     "iter_definitions",
-    "iter_indexable_chunks",
-    "transcript_of",
     "with_file",
-    "with_skip",
-    "without_file",
 ]

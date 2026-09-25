@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
+from collections.abc import Iterable
 from typing import Literal
 
 from ..errors import CoreError
@@ -166,5 +166,3 @@ class Transcript:
         )
 
 
-def transcript_of(blocks: Sequence[Block]) -> Transcript:
-    return Transcript(blocks=tuple(blocks))

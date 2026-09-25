@@ -6,7 +6,7 @@ from .agent import ROLE_PROMPT, open_session, run_turn
 from .budget import ContextBudget, TokenCalibrator, allocate
 from .config import CoreConfig, config_defaults, merge_config
 from .constants import CHARS_PER_TOKEN
-from .context import Bootstrap, TurnBoundaries, begin_turn, build_context, rebase, safe_cut_index
+from .context import Bootstrap, build_context
 from .contracts import (
     BlobRef,
     CachePlan,
@@ -42,7 +42,6 @@ from .contracts import (
     UtilityModel,
     WorkingSet,
     iter_chunks,
-    iter_indexable_chunks,
 )
 from .elide import compact, hot_cold
 from .errors import ConfigError, CoreError, ParseError, WorkspaceError
@@ -108,7 +107,6 @@ __all__ = [
     "ToolHost",
     "ToolOutcome",
     "Transcript",
-    "TurnBoundaries",
     "TurnMeters",
     "TurnResult",
     "TurnUsage",
@@ -118,7 +116,6 @@ __all__ = [
     "WorkspaceError",
     "allocate",
     "assemble",
-    "begin_turn",
     "build_context",
     "build_graph",
     "build_map",
@@ -131,18 +128,15 @@ __all__ = [
     "fold_turn",
     "hot_cold",
     "iter_chunks",
-    "iter_indexable_chunks",
     "merge_config",
     "open_session",
     "pagerank",
-    "rebase",
     "record",
     "record_read",
     "rehydrate",
     "render_ledger",
     "run_tool",
     "run_turn",
-    "safe_cut_index",
     "search",
     "working_set_for",
 ]

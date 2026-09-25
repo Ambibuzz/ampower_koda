@@ -46,34 +46,10 @@ def with_file(index: RepositoryIndex, analysis: FileAnalysis) -> RepositoryIndex
     return replace(index, files=files, skipped=skipped)
 
 
-def with_skip(index: RepositoryIndex, skip: SkippedFile) -> RepositoryIndex:
-    """Return a new index recording ``skip`` and dropping any analysis for it."""
-    files = {path: entry for path, entry in index.files.items() if path != skip.path}
-    skipped = dict(index.skipped)
-    skipped[skip.path] = skip
-    return replace(index, files=files, skipped=skipped)
-
-
-def without_file(index: RepositoryIndex, path: str) -> RepositoryIndex:
-    """Return a new index with ``path`` removed entirely — analysed or skipped."""
-    if path not in index.files and path not in index.skipped:
-        return index
-    files = {key: entry for key, entry in index.files.items() if key != path}
-    skipped = {key: entry for key, entry in index.skipped.items() if key != path}
-    return replace(index, files=files, skipped=skipped)
-
-
 def iter_chunks(index: RepositoryIndex) -> Iterator[Chunk]:
     """Yield every chunk in the index, files in codepoint order."""
     for path in index.paths:
         yield from index.files[path].chunks
-
-
-def iter_indexable_chunks(index: RepositoryIndex) -> Iterator[Chunk]:
-    """Yield only chunks that contribute to corpus-wide statistics."""
-    for chunk in iter_chunks(index):
-        if chunk.indexable:
-            yield chunk
 
 
 def iter_definitions(index: RepositoryIndex) -> Iterator[tuple[str, Definition]]:
@@ -102,11 +78,3 @@ def files_referencing(index: RepositoryIndex, name: str) -> tuple[str, ...]:
         for path in index.paths
         if any(reference.name == name for reference in index.files[path].references)
     )
-
-
-def chunk_by_digest(index: RepositoryIndex, digest: str) -> Chunk | None:
-    """Resolve a chunk by its content hash."""
-    for chunk in iter_chunks(index):
-        if chunk.digest == digest:
-            return chunk
-    return None
