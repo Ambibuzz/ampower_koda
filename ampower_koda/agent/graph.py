@@ -57,7 +57,7 @@ from ampower_koda.agent.prompts import (
 )
 
 
-from ampower_koda.agent.history_prune import describe_call, prune_price, prune_rounds
+from ampower_koda.agent.history_prune import describe_call, drop_followups, prune_price, prune_rounds
 # Runaway guards, not work units: a turn ends when the model reports, and the
 # request-wide call budget bounds the whole run.
 MAX_TOOL_ROUNDS_EXECUTION = 60
@@ -2889,25 +2889,136 @@ def review_node(state: dict) -> dict:
             "still fetch; get it first. review_passed is false exactly when a P0/P1 issue or an unverified "
             "criterion remains."
         )
-        history = {"task_prompt": prompt}
-        turn_updates = _run_agent_turn(
-            {**state, **updates}, "Reviewing", prompt, read_only_tools=True,
-            max_rounds=MAX_TOOL_ROUNDS_REVIEW, history=history,
-        )
-        updates.update(turn_updates)
-        updates.pop("_write_baseline", None)
-        updates.pop("_tool_edited_paths", None)
-        updates.pop("_file_moves", None)
-        turn_error = updates.pop("error", None)
-        steps = updates.get("intermediate_steps") or []
-        output = steps[-1].get("output", "") if steps else ""
-        decision, notes = review_decision(_extract_review_json(output), criteria)
-        if updates.get("review_stopped"):
-            notes = str(state.get("review_notes") or "")  # the last findings go out with the warning
-        elif turn_error or updates.get("turn_exhausted"):
-            notes = turn_error or "Reviewer exhausted its call limit; verification is incomplete."
-            updates["turn_exhausted"] = False
-            decision = "needs_evidence"
+        histories = state.get("review_history") or {}
+        prior_attempts = int(state.get("review_attempts", 0) or 0)
+        reuse_history = bool(prior_attempts and prior_attempts % REVIEW_HISTORY_RECHECKS)
+        history = histories.get(active["id"]) if reuse_history else None
+        history = history if isinstance(history, dict) else {}
+        opening_prompt = history.get("task_prompt")
+        previous_snapshot = history.get("reviewed_content")
+        if isinstance(opening_prompt, str) and isinstance(previous_snapshot, dict):
+            # Continue the same reviewer conversation after implementation has
+            # repaired its finding. The previous source/tool reads remain a
+            # cacheable prefix; only the actual repair delta and current receipts
+            # are appended. Explicit supersession prevents stale source from
+            # being treated as current.
+            delta_baseline = dict(previous_snapshot)
+            for path in paths:
+                delta_baseline.setdefault(path, None)
+            _, repair_diff = change_evidence(
+                delta_baseline, reviewed_content.get, limit=12000
+            )
+            directive = (
+                "## REVIEW RECHECK AFTER IMPLEMENTATION REPAIR\n"
+                "Continue the same complete review. The current repair diff below supersedes any older "
+                "source lines or tool results for those paths. Preserve previously satisfied criteria, "
+                "verify the concrete prior finding is resolved, and inspect the changed regions for regressions. "
+                "Converge: a new finding in code this repair did not change is P2 unless it makes the request "
+                "fail outright (P0); do not deepen a criterion the previous pass accepted. "
+                "Use read-only tools only when this delta is truncated or a connected dependency is missing.\n\n"
+                "### PRIOR FINDING\n" + str(state.get("review_notes") or "")[:4000]
+                + "\n\n### CURRENT REPAIR DIFF\n" + repair_diff
+                + "\n\n### CURRENT SOURCE REVISIONS\n" + json.dumps({
+                    path: revision(reviewed_content.get(path)) for path in paths
+                }, ensure_ascii=True)
+                + "\n\n### CURRENT IMPLEMENTATION CLAIM\n" + json.dumps(
+                    _compact_execution_results(claims), ensure_ascii=True)
+                + "\n\n### CURRENT STATIC CHECKS\n" + health.summary()
+                + "\n\n### CURRENT EXECUTED BEHAVIORAL CHECKS\n" + json.dumps(
+                    updates.get("verification_receipts", []), ensure_ascii=True)
+            )
+            # The repair changed the source: earlier reads, and calls that failed
+            # against the old revision, may run again.
+            for key in ("seen_calls", "seen_results", "failed_calls", "failure_causes"):
+                history.setdefault(key, {}).clear()
+            # Each recheck restates the prior finding and the full current delta.
+            drop_followups(history, "review_recheck")
+            _queue_followup(
+                history,
+                str(history.get("last_verdict") or state.get("review_notes") or ""),
+                directive,
+                kind="review_recheck",
+            )
+            prompt = opening_prompt
+        else:
+            history["task_prompt"] = prompt
+        history["reviewed_content"] = dict(reviewed_content)
+        decision, notes = "invalid", ""
+        prior_unmet = set()
+        # The recovery pass continues the first pass's retained tool rounds, so
+        # its smaller round budget is spent on reads that have not happened yet.
+        output = ""
+        for recovery_pass in range(2):
+            turn_updates = _run_agent_turn(
+                {**state, **updates}, "Reviewing", prompt, read_only_tools=True,
+                max_rounds=MAX_TOOL_ROUNDS_REVIEW if recovery_pass == 0 else MAX_TOOL_ROUNDS_REVIEW_RECOVERY,
+                history=history,
+            )
+            updates.update(turn_updates)
+            updates.pop("_write_baseline", None)
+            updates.pop("_tool_edited_paths", None)
+            updates.pop("_file_moves", None)
+            if updates.get("review_stopped"):
+                notes = str(state.get("review_notes") or "")  # the last findings go out with the warning
+                break
+            # A reviewer turn that failed (a provider error, a full context) is retried
+            # like missing evidence, and after its bounded retries reported, never fatal.
+            turn_error = updates.pop("error", None)
+            steps = updates.get("intermediate_steps") or []
+            output = steps[-1].get("output", "") if steps else ""
+            payload = _extract_review_json(output)
+            decision, notes = review_decision(payload, criteria)
+            if prior_unmet and decision != "invalid":
+                now_satisfied = {e["criterion"] for e in payload["evidence"] if e["status"] == "satisfied"}
+                resolved = payload.get("resolved_findings", [])
+                valid_resolutions = isinstance(resolved, list) and all(
+                    isinstance(item, dict) and type(item.get("criterion")) is int
+                    and isinstance(item.get("explanation"), str) and item["explanation"].strip()
+                    for item in resolved
+                )
+                resolved_ids = {item["criterion"] for item in resolved} if valid_resolutions else set()
+                if (prior_unmet & now_satisfied) - resolved_ids:
+                    decision, notes = "invalid", "Invalid review result: earlier concrete findings need explicit resolution evidence."
+            if updates.get("turn_exhausted") and not turn_error and decision in {"pass", "repair"}:
+                # The forced no-tools final call still produced a complete,
+                # well-formed verdict. Reaching the round cap is not a reason
+                # to discard it; only an incomplete or invalid verdict is.
+                updates["turn_exhausted"] = False
+                _publish_agent_log(state.get("request_name", ""), "review_verdict_after_cap",
+                                   decision=decision, recovery=recovery_pass)
+            if updates.get("turn_exhausted") and recovery_pass == 0 and not turn_error:
+                # A per-pass cap is why the bounded evidence recovery exists.
+                updates["turn_exhausted"] = False
+            if turn_error or updates.get("turn_exhausted"):
+                notes = turn_error or "Reviewer exhausted its call limit; verification is incomplete."
+                # Exhausting this read-only pass is recoverable if the overall
+                # execution budget still has room for a fresh evidence pass.
+                updates["turn_exhausted"] = False
+                decision = "needs_evidence"
+                break
+            if decision not in {"invalid", "needs_evidence"}:
+                break
+            if recovery_pass == 0:
+                entries = payload.get("evidence", []) if isinstance(payload, dict) else []
+                # A malformed envelope may still contain a valid concrete finding.
+                prior_unmet = {e["criterion"] for e in entries if isinstance(e, dict)
+                    and type(e.get("criterion")) is int and 1 <= e["criterion"] <= len(criteria)
+                    and e.get("status") == "unmet"} if isinstance(entries, list) else set()
+                _queue_followup(history, output, (
+                    "## REVIEWER RECOVERY\n"
+                    + _review_recovery_reason(decision, notes, payload, criteria) + "\n\n"
+                    "The tool results from your first pass are retained above; do not re-read them. "
+                    "Use read-only tools only for current source you have not fetched yet, preserve all "
+                    "concrete findings, then return the complete verdict as JSON only. Read test sources "
+                    "and execution receipts for runtime criteria. If changed server logic has no executed "
+                    "evidence, run it with call_method, or report the scenario implementation must add and "
+                    "run; verify client/UI behavior from source. "
+                    'If any earlier unmet criterion becomes satisfied, include resolved_findings '
+                    '[{"criterion":1,"explanation":"Current source evidence resolving the earlier finding"}]. '
+                    "Every concrete finding must remain or be explicitly resolved."
+                ))
+        history["last_verdict"] = output
+        updates["review_history"] = {active["id"]: history}
         passed = decision == "pass" and not halted()
         if decision == "repair" and not halted():
             updates["review_repairable"] = True
@@ -2930,6 +3041,25 @@ def review_node(state: dict) -> dict:
                 ) + ") after recovery and two fresh review attempts: " + notes[:1500]
         elif decision in {"pass", "repair"}:
             updates["review_format_retries"] = 0
+    if (not halted()
+            and any(_read_current(state, p) != content for p, content in reviewed_content.items())):
+        passed, notes = False, "Files changed during review. Verify current source again before accepting the work."
+        updates["review_repairable"] = False
+        rechecks = int(state.get("review_rechecks", 0) or 0) + 1
+        if rechecks <= MAX_REVIEW_RECHECKS:
+            # This is neither an implementation defect nor a terminal error:
+            # the verdict simply describes an obsolete snapshot.  Re-enter
+            # review with current bytes without spending a repair attempt.
+            updates["review_retry_requested"] = True
+            updates["review_rechecks"] = rechecks
+            attempt = int(state.get("review_attempts", 0) or 0)
+        else:
+            updates["review_stopped"] = (
+                f"Source kept changing during review after {rechecks} snapshots; "
+                "automatic re-review stopped to avoid approving unstable files."
+            )
+    elif passed or updates.get("review_repairable"):
+        updates["review_rechecks"] = 0
     updates.update({"review_passed": passed, "review_notes": notes, "review_attempts": attempt})
     results = list(state.get("task_results") or [])
     result = {
