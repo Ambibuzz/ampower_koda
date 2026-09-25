@@ -11,8 +11,8 @@ from copy import deepcopy
 from datetime import datetime
 
 import frappe
-from langchain_core.tools import tool
 from langgraph.graph import END, StateGraph
+from langchain_core.tools import StructuredTool, tool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from ampower_koda.agent.prompt_caching import mark_message, native_cache_messages, openai_breakpoints, rolling_messages, terminal_model
 from langchain_openai import ChatOpenAI
@@ -25,7 +25,8 @@ from ampower_koda.agent import checkpoint
 from ampower_koda.agent import recovery
 from ampower_koda.agent import verification
 from ampower_koda.agent import python_diagnostics
-from ampower_koda.agent.advisor import directive as advisor_directive
+from ampower_koda.agent.advisor import Advisor, directive as advisor_directive
+from ampower_koda.agent import repair_budget
 from ampower_koda.agent.run_control import (
     check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES, MODEL_TIME_RESERVE,
 )
@@ -44,7 +45,7 @@ from ampower_koda.agent.plan_contract import (
 )
 from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, run_task_checks, CheckResult, HealthReport
 from ampower_koda.agent.execution_contract import (
-    load_plan, read_snapshot, change_evidence, review_verdict, review_decision, completion_report, revision,
+    load_plan, read_snapshot, change_evidence, review_verdict, review_decision, completion_report, completion_report_problem, revision,
 )
 from ampower_koda.agent.execution_evidence import source_context, SourceMemory
 from ampower_koda.agent.prompts import (
@@ -61,6 +62,7 @@ from ampower_koda.agent.prompts import (
 from ampower_koda.agent.history_prune import describe_call, prune_price, prune_rounds
 MAX_TOOL_ROUNDS_EXECUTION = 18
 MAX_TOOL_ROUNDS_REPAIR = 8        # a retry continues from current source with a remaining-work list
+MIN_REPAIR_ROUNDS = 30            # a pass with fewer calls left than this first extends the budget
 MAX_TOOL_ROUNDS_REVIEW = 6
 MAX_TOOL_ROUNDS_REVIEW_RECOVERY = 4  # continues the first pass's history, so these are new reads only
 MAX_REVIEW_ATTEMPTS = 2           # per task and for final integration
@@ -70,7 +72,11 @@ BASE_EXECUTION_CALL_BUDGET = 18
 # plan 11 rounds for the first attempt and none for the retry.
 PER_TASK_CALL_BUDGET = (MAX_TOOL_ROUNDS_EXECUTION + 1) + (MAX_TOOL_ROUNDS_REPAIR + 1)
 FINAL_REVIEW_RESERVE = 16  # review (7), evidence recovery (5), repair/re-review minimum (4)
-REPAIR_REVIEW_RESERVE = 3
+# One repair must leave room for the reviewer's normal pass and its bounded
+# evidence-recovery pass, including each forced conclusion call.
+REPAIR_REVIEW_RESERVE = (MAX_TOOL_ROUNDS_REVIEW + 1) + (MAX_TOOL_ROUNDS_REVIEW_RECOVERY + 1)
+MAX_AUTOMATIC_REPAIR_GRANTS = 2
+AUTOMATIC_REPAIR_ALLOWANCE = MAX_TOOL_ROUNDS_EXECUTION + 1 + REPAIR_REVIEW_RESERVE
 # Direct spend fences complement call-count limits. The request ledger includes
 # understanding/planning too, so execution cannot ignore cost already incurred
 # before it started. A new explicitly scoped follow-up gets a fresh budget.
@@ -103,7 +109,6 @@ MAX_PHASE_OUTPUT_CHARS = 60000
 MIN_KEEP_ROUNDS = 1           # latest call/result pair must survive into the next request
 COMPACT_RESULT_PREVIEW = 140  # chars of each tool result kept in the compact summary
 MAX_COMPACTED_HISTORY_CHARS = 12000
-MAX_TASK_PROMPT_CHARS = 60000
 MAX_TOOL_RESULT_CHARS = 8000
 # A whole source file is read once (about 25k tokens at most) rather than in slices.
 MAX_READ_RESULT_CHARS = 80000
@@ -846,7 +851,8 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
     """Build LangChain tools bound to a specific app_name.
 
     The catalogue is the same in every phase (tools precede messages in cache keys),
-    so read-only safety is enforced here, not by hiding schemas.
+    so read-only safety is enforced here, not by hiding schemas. A session adds
+    ``submit_plan`` and ``explore``.
 
     Writes are bounded by the app root only. A task's ``files`` list tells the
     implementer where to start; it is not a permission list, so a change the
@@ -1146,7 +1152,38 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
     catalogue = [find_files, list_directory, read_file, search_code, find_code, read_doctype_schema,
                  get_file_outline, validate_code, run_tests, call_method, write_file, copy_file,
                  edit_file, rename_file, delete_file]
-    return catalogue
+    if session is None:
+        return catalogue
+
+    # A session keeps one catalogue in every phase (tools precede messages in
+    # the provider's cache key); each phase decides what these two may do.
+    plan_sink, explorer = session.get("plan_sink"), session.get("explorer")
+
+    def submit_plan_call(plan, findings: str = "") -> str:
+        if plan_sink is None:
+            return "SUBMIT_FAILED: The plan is already approved. Implement it; do not submit another plan."
+        return plan_sink.accept(plan, findings)
+
+    # The plan travels as a typed object: escaping a whole plan inside a string argument fails.
+    submit_plan = StructuredTool.from_function(
+        func=submit_plan_call, name="submit_plan", args_schema=SUBMIT_PLAN_SCHEMA,
+        description=(
+            "Submit your implementation plan for the user's approval; only during investigation. "
+            "plan follows the schema; findings is what you verified, as path:line evidence, for the user "
+            "and the reviewer: current behavior, the reference contract (KEEP/CHANGE) for an adaptation, "
+            "the full inventory for an exhaustive request, and what your tools could not verify. "
+            "Validation errors come back as the result; fix them and submit again."))
+
+    @tool
+    def explore(question: str) -> str:
+        """Hand a broad question to a helper that searches and reads many files in its own context and
+        returns only path:line findings (about 1-2k tokens). Use it for questions that span the app ("where
+        is X decided", "every place that hardcodes Y"); read a file yourself when you know which one."""
+        if explorer is None:
+            return "EXPLORE_UNAVAILABLE: search and read directly."
+        return explorer(question)
+
+    return [*catalogue, submit_plan, explore]
 
 
 # Tool-calling loop with detailed realtime logging
@@ -1907,18 +1944,44 @@ def _queue_directive(history: dict, text: str) -> None:
     })
 
 
+def _implementation_advisor(state: dict, provider: str, model: str, request_name: str):
+    """An advisor for this implementation pass, or None without a task."""
+    if not state.get("execution_tasks"):
+        return None
+    _, criteria, _ = _execution_context(state)
+    contract = ("## USER REQUEST\n" + str(state.get("user_message") or "")[:3000]
+                + "\n\n## ACCEPTANCE CRITERIA\n" + "\n".join(f"{i}. {c}" for i, c in enumerate(criteria, 1)))
+    # Low effort: it reads one round's diff, it does not plan.
+    return Advisor(_get_llm(provider=provider, model=model, session_id=request_name, reasoning_effort="low"),
+                   contract)
+
+
 def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool, max_rounds: int = 20,
-                    history: dict | None = None) -> dict:
+                    history: dict | None = None, session: dict | None = None) -> dict:
     """Run one agent turn for the given phase. Returns state updates.
 
     ``history`` lets a follow-on turn (reviewer recovery) continue from the
     retained tool rounds of the previous one instead of starting cold.
+
+    ``session`` runs the turn as one phase of the request-long conversation, extending one
+    cached prefix. Keys: ``plan_sink``, ``explorer``, ``stop_when``, ``after_round``.
     """
-    before = {}
+    before = dict(state.get("execution_baseline") or {}) if not read_only_tools else {}
+    file_moves = []
     progress = {"tokens": state.get("tokens_used", 0), "calls": 0}
+    budget_updates = {}
+    verified = {'value': state.get('verification_progress') or {},
+                'receipts': state.get('verification_receipts') or []}
+    def observe_verification(report, receipts):
+        verified['value'] = repair_budget.observe(verified['value'], report, receipts)
+        paths = set(before) | set(state.get('execution_baseline') or {})
+        paths.update(path for task in state.get('execution_tasks', []) for path in task.get('files', []))
+        revisions = {path: revision(_read_current(state, path)) for path in sorted(paths)}
+        verified['receipts'] = receipts
+        for receipt in receipts:
+            receipt['source_revisions'] = dict(revisions)
+        checkpoint.update(verification_progress=verified['value'], verification_receipts=receipts)
     try:
-        if len(prompt) > MAX_TASK_PROMPT_CHARS:
-            return {"error": "Execution context exceeds the prompt limit; shorten the task contract or custom prompt. No criteria were silently discarded."}
         app_name = state.get("target_app_name", "")
         provider = state.get("ai_provider", "OpenAI")
         model = state.get("ai_model", "gpt-4o-mini")
@@ -1926,25 +1989,41 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 
         remaining = state.get("tool_rounds_limit", 1000) - state.get("tool_rounds_used", 0)
         if not read_only_tools and state.get("execution_tasks"):
-            if state.get("integration_mode"):
-                remaining -= REPAIR_REVIEW_RESERVE
-            else:
-                pending = max(1, len(state["execution_tasks"]) - state.get("task_index", 0))
-                remaining = (remaining - FINAL_REVIEW_RESERVE) // pending
-        elif read_only_tools and state.get("execution_tasks") and not state.get("integration_mode") and not state.get("is_follow_up"):
-            # A no-op task still needs independent verification, but cannot use
-            # final integration's allocation or the minimum for future tasks.
-            future_tasks = max(0, len(state["execution_tasks"]) - state.get("task_index", 0) - 1)
-            remaining -= FINAL_REVIEW_RESERVE + 2 * future_tasks
+            remaining -= REPAIR_REVIEW_RESERVE  # a repair must leave the review that checks it room to run
+        if remaining < min(max_rounds + 1, MIN_REPAIR_ROUNDS + 1):
+            budget_updates = repair_budget.extend(state, allowance=AUTOMATIC_REPAIR_ALLOWANCE,
+                                                  max_grants=MAX_AUTOMATIC_REPAIR_GRANTS)
+            if budget_updates:
+                state = {**state, **budget_updates}
+                verified['value'] = state['verification_progress']
+                remaining += AUTOMATIC_REPAIR_ALLOWANCE
+                checkpoint.update(**budget_updates)
+                _publish_agent_log(request_name, 'repair_budget_extended',
+                    grants=state['automatic_repair_budget_grants'], call_limit=state['tool_rounds_limit'],
+                    reason='Executed tests show improvement or completed behavior awaiting review.')
         if remaining < 2:
-            return {"error": "Execution call budget exhausted before verification completed."}
+            return {"review_stopped": "The execution call budget ran out before the work passed review."}
         max_rounds = min(max_rounds, remaining - 1)
+        verification_contract = state.get("verification_contract")
+        if verification_contract is None:
+            verification_contract = _prepare_verification_contract(state)
+            checkpoint.update(verification_contract=verification_contract)
+        copied_files = dict(state.get("copied_files") or {})
+        reader = tool_reader(provider, model, request_name)
         tools = _make_tools(
             app_name, read_only=read_only_tools,
-            before=before,
+            before=before, file_moves=file_moves,
+            delete_paths=_approved_deletions(state),
+            verification_contract=verification_contract,
+            verification_observer=observe_verification,
+            copied_files=copied_files,
+            session=session,
+            reader=reader,
         )
-        llm = _get_llm(provider=provider, model=model)
+        llm = _get_llm(provider=provider, model=model, session_id=request_name)
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
+        shared_context = (_shared_request_context(state)
+                          if state.get("execution_tasks") and session is None else "")
         content, tool_edited_paths, total_tokens, rounds_used, exhausted = _run_tool_calling_loop(
             llm, tools, system_prompt, prompt,
             request_name=request_name,
@@ -1954,6 +2033,14 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             require_writes=not read_only_tools,
             progress=progress,
             history=history,
+            validate_final=completion_report_problem if phase == "Implementing" else None,
+            shared_context=shared_context,
+            cache_phase=phase.lower(),
+            advisor=_implementation_advisor(state, provider, model, request_name)
+            if phase == "Implementing" and not read_only_tools else None,
+            stop_when=(session or {}).get("stop_when"),
+            reader=reader,
+            after_round=(session or {}).get("after_round"),
         )
         content = _message_content_to_str(content)
         max_output = MAX_PHASE_OUTPUT_CHARS
@@ -1961,12 +2048,18 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             {"phase": phase, "output": (content[:max_output] if content else "")}
         ]
         result = {
+            **budget_updates,
             "current_stage": phase,
             "intermediate_steps": steps,
             "tokens_used": total_tokens,
             "tool_rounds_used": state.get("tool_rounds_used", 0) + rounds_used,
             "turn_exhausted": exhausted,
             "_write_baseline": before,
+            "_file_moves": file_moves,
+            "copied_files": copied_files,
+            "verification_contract": verification_contract,
+            'verification_progress': verified['value'],
+            'verification_receipts': verified['receipts'],
         }
         if tool_edited_paths:
             result["_tool_edited_paths"] = tool_edited_paths
@@ -1980,18 +2073,20 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             {"phase": phase, "output": f"Error: {e}"}
         ]
         return {
+            **budget_updates,
             "current_stage": phase,
             "intermediate_steps": steps,
             "_write_baseline": before,
+            "_file_moves": file_moves,
             "tokens_used": progress["tokens"],
             "tool_rounds_used": state.get("tool_rounds_used", 0) + progress["calls"],
             "error": str(e),
+            'verification_progress': verified['value'],
+            'verification_receipts': verified['receipts'],
         }
 
 
-# ---------------------------------------------------------------------------
-# Graph nodes — Planning phase
-# ---------------------------------------------------------------------------
+# Planner calls: the plan coverage check and blocked-implementation amendments
 
 def understand_node(state: dict) -> dict:
     """Explore the codebase with the retrieval core and summarize it for planning.
