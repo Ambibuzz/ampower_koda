@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from math import isfinite
+
 from ..constants import (
     COCHANGE_HALF_LIFE_DAYS,
     COCHANGE_MAX_COMMITS,
@@ -96,6 +98,33 @@ class RetrievalConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RerankConfig:
+    """Bounded dedicated reranking, independent of the conversational model."""
+
+    enabled: bool = True
+    model: str = "cohere/rerank-v3.5"
+    candidates: int = 60
+    per_file: int = 3
+    query_chars: int = 4000
+    document_chars: int = 3000
+    timeout_seconds: float = 5.0
+    min_score: float = 0.1
+    """A model-specific relevance floor, not a probability of correctness."""
+
+    def validate(self) -> None:
+        if not self.model.strip():
+            raise ConfigError("rerank.model", "cannot be empty")
+        for name, low, high in (("candidates", 1, 100), ("per_file", 1, 10),
+                                ("query_chars", 256, 8000), ("document_chars", 256, 8000)):
+            if not low <= getattr(self, name) <= high:
+                raise ConfigError(f"rerank.{name}", f"must be between {low} and {high}")
+        if not isfinite(self.timeout_seconds) or not 0 < self.timeout_seconds <= 30:
+            raise ConfigError("rerank.timeout_seconds", "must be greater than 0 and at most 30")
+        if not isfinite(self.min_score) or not 0 <= self.min_score <= 1:
+            raise ConfigError("rerank.min_score", "must be between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
 class HistoryConfig:
     """How much git history feeds co-change memory."""
 
@@ -141,6 +170,7 @@ class CoreConfig:
     history: HistoryConfig = field(default_factory=HistoryConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    rerank: RerankConfig = field(default_factory=RerankConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
 
     def __post_init__(self) -> None:

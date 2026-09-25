@@ -10,6 +10,7 @@ from .schema import (
     IndexingConfig,
     ModelsConfig,
     RetrievalConfig,
+    RerankConfig,
     SecurityConfig,
     config_defaults,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "IndexingConfig",
     "ModelsConfig",
     "RetrievalConfig",
+    "RerankConfig",
     "SecurityConfig",
     "config_defaults",
     "merge_config",
