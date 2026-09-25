@@ -8,6 +8,7 @@ Commands are frozen before implementation and are never inferred from model pros
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,13 +20,106 @@ import tempfile
 import time
 
 from .run_control import check_active
-from .tools import command_environment
+from .tools import _app_root, command_environment
 
 CONFIG_PATH = ".koda/verification.json"
 TEST_DIRECTORY = ".koda/tests"
 DEFAULT_TIMEOUT = 120
 MAX_TIMEOUT = 300
 MAX_OUTPUT = 8000
+
+# Connect to the bench site the agent runs on, so tests and calls see the real
+# schema and records; commits are disabled and the connection is rolled back.
+# SQL that MariaDB commits on its own (DDL, COMMIT, START TRANSACTION, LOCK...)
+# is refused, since no rollback could undo it; with autocommit off the server
+# opens the next transaction itself, so begin() has nothing to do.
+#
+# Frappe resolves its log files relative to the working directory ("../logs"
+# and "<site>/logs"), as bench does, so the runner starts in the sites folder.
+# A failure here is the harness's, not the app's: it is reported with a marker
+# the host classifies as an environment failure, never as a code defect for
+# the model to repair.
+_SITE_CONNECT = """
+import os, sys, traceback
+SITE = os.environ.get('KODA_SITE')
+_COMMITTING = {'create', 'alter', 'drop', 'truncate', 'rename', 'commit', 'begin', 'start', 'grant', 'revoke',
+               'lock', 'unlock', 'analyze', 'optimize', 'repair', 'flush'}
+def _commits(query):
+    words = str(query or '').lower().split(None, 2)[:2] + ['', '']
+    if words[0] in ('create', 'drop') and words[1] == 'temporary':
+        return False  # temporary tables commit nothing
+    return words[0] in _COMMITTING or words[0] == 'set' and words[1].startswith('autocommit')
+if SITE:
+    try:
+        os.chdir(os.environ['KODA_SITES_PATH'])
+        import frappe
+        frappe.init(site=SITE, sites_path=os.environ['KODA_SITES_PATH'])
+        frappe.connect()
+        frappe.set_user('Administrator')
+        frappe.flags.in_test = True
+        frappe.in_test = True  # Frappe v16 reads the module attribute; v15 the flag
+        frappe.db.commit = lambda *args, **kwargs: None
+        frappe.db.begin = lambda *args, **kwargs: None
+        _unguarded_sql = frappe.db.sql
+        def _guarded_sql(query, *args, **kwargs):
+            if _commits(query):
+                raise frappe.ValidationError(
+                    'Koda runner refused "' + ' '.join(str(query).split())[:100] + '": it would commit on the '
+                    'live site and could not be rolled back. Use existing DocTypes and fields; schema changes '
+                    'reach the site through bench migrate after the user approves them.')
+            return _unguarded_sql(query, *args, **kwargs)
+        frappe.db.sql = _guarded_sql
+    except Exception:
+        traceback.print_exc(limit=6)
+        print('KODA_RUNNER_ERROR could not connect to site ' + SITE, flush=True)
+        sys.exit(3)
+def site_disconnect():
+    if SITE:
+        frappe.db.rollback()
+        frappe.destroy()
+"""
+
+_UNITTEST_BODY = """
+import importlib.util, json, os, pathlib, sys, unittest
+sys.path.insert(0, os.environ['KODA_APP_PARENT'])
+if SITE:
+    print('KODA_SITE ' + SITE + ': tests run against the live site; database writes are rolled back.', flush=True)
+    try:
+        contain()  # before the tests import anything, so they bind the held enqueue and sendmail
+    except Exception:
+        release()
+        traceback.print_exc(limit=6)
+        print('KODA_RUNNER_ERROR could not contain the tests', flush=True)
+        site_disconnect()
+        sys.exit(3)
+def case_ids(group):
+    for case in group:
+        if isinstance(case, unittest.TestSuite): yield from case_ids(case)
+        else: yield case.id()
+try:
+    suite = unittest.TestSuite()
+    for index, filename in enumerate(sys.argv[1:]):
+        sys.path.insert(0, str(pathlib.Path(filename).parent))
+        spec = importlib.util.spec_from_file_location('koda_test_' + str(index), filename)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module))
+    tests = sorted(case_ids(suite))
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+finally:
+    if SITE:
+        release()
+        print('KODA_CALL_CONTAINED ' + json.dumps(contained()), flush=True)
+    site_disconnect()
+identity = lambda case: getattr(case, 'test_case', case).id()
+failed = sorted({identity(case) for case, _ in result.failures + result.errors} | {identity(case) for case in result.unexpectedSuccesses})
+skipped = sorted({identity(case) for case, _ in result.skipped + result.expectedFailures} - set(failed))
+summary = {'total': result.testsRun, 'tests': tests, 'failed': failed, 'skipped': skipped,
+           'passed': max(0, result.testsRun - len(failed) - len(skipped))}
+print('KODA_TEST_SUMMARY ' + json.dumps(summary), flush=True)
+sys.exit(0 if result.wasSuccessful() and summary['passed'] else 1)
+"""
 
 # Nothing call_method does may outlive it: writes outside the scratch dir go to an overlay,
 # real deletes/renames are refused, jobs and mail are recorded, and an audit hook blocks bypasses.
@@ -348,6 +442,16 @@ def contained():
     return {'files': len(_written), 'jobs': len(_jobs), 'emails': len(_mails), 'shown': [item[:200] for item in shown]}
 """
 
+# Tests run under the same containment as call_method: nothing they do outlives the run.
+_UNITTEST_RUNNER = _SITE_CONNECT + _CALL_CONTAINMENT + _UNITTEST_BODY
+RUNNER_ERROR = "KODA_RUNNER_ERROR"
+CONTAINED_MARKER = "KODA_CALL_CONTAINED "
+#: A stopped runner cannot count; its overlay, jobs and emails end with it all the same.
+UNCOUNTED = "database writes rolled back; file writes, background jobs and emails discarded"
+ENVIRONMENT_NOTE = ("\nThis is a problem in the Koda test environment, not in the app. Do not change the app to "
+                    "work around it; report it as a blocker.")
+
+
 def test_summary(output: str) -> dict | None:
     """Read a checked runner summary; it never overrides a failing exit code."""
     for line in reversed(output.splitlines()):
@@ -408,6 +512,76 @@ def test_files(root: Path) -> list[Path]:
         _inside(root, path.relative_to(root).as_posix())
     return paths
 
+
+
+def prepare_contract(app_name: str, *, editable_tests=()) -> dict:
+    """Snapshot host configuration and pre-existing regression tests once."""
+    root = Path(_app_root(app_name)).resolve()
+    path = _inside(root, CONFIG_PATH)
+    content = path.read_text(encoding="utf-8") if path.is_file() else None
+    config = json.loads(content) if content is not None else {}
+    if not isinstance(config, dict) or set(config) - {"commands"}:
+        raise ValueError(f"{CONFIG_PATH} must contain a commands array")
+    commands = config.get("commands", [])
+    if not isinstance(commands, list) or len(commands) > 8:
+        raise ValueError("verification commands must be an array of at most eight entries")
+    checked = []
+    for command in commands:
+        if not isinstance(command, dict):
+            raise ValueError("Each verification command must be an object")
+        argv = command.get("argv")
+        timeout = command.get("timeout_seconds", DEFAULT_TIMEOUT)
+        cwd = command.get("cwd", ".")
+        if (not isinstance(argv, list) or not argv
+                or not all(isinstance(arg, str) and arg and "\0" not in arg for arg in argv)):
+            raise ValueError("Verification argv must be a nonempty array of strings (no shell)")
+        if type(timeout) is not int or not 1 <= timeout <= MAX_TIMEOUT:
+            raise ValueError(f"Verification timeout_seconds must be between 1 and {MAX_TIMEOUT}")
+        if not isinstance(cwd, str) or not _inside(root, cwd).is_dir():
+            raise ValueError("Verification cwd must be an existing directory inside the app")
+        checked.append({"name": str(command.get("name") or argv[0]),
+                        "argv": argv, "cwd": cwd, "timeout_seconds": timeout})
+    approved_edits = set(editable_tests)
+    guidance = []
+    for relative in ('.koda/verification.md', '.koda/live_acceptance.md'):
+        note = _inside(root, relative)
+        if note.is_file():
+            with note.open(encoding='utf-8') as handle:
+                excerpt = handle.read(4000)
+            guidance.append(relative + '\n' + excerpt)
+    return {"config": content, "commands": checked, "guidance": '\n\n'.join(guidance), "existing_tests": {
+        p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in test_files(root) if p.relative_to(root).as_posix() not in approved_edits
+    }}
+
+
+def contract_context(contract: dict) -> str:
+    commands = [command['name'] for command in contract.get('commands', [])]
+    guidance = contract.get('guidance') or ''
+    tests = sorted(contract.get('existing_tests') or {})
+    inventory = ''
+    if tests:
+        shown = tests[:24]
+        inventory = ('Existing regression tests (already present; read and reuse before adding coverage):\n'
+                     + '\n'.join('- ' + path for path in shown) + '\n'
+                     + (f'{len(tests) - len(shown)} more under {TEST_DIRECTORY}.\n' if len(tests) > len(shown) else '')
+                     + 'Indexed search may omit this hidden directory; that is not evidence that tests are absent.\n')
+    if not commands and not guidance and not tests: return ''
+    return ('## EXISTING VERIFICATION CONTRACT\n'
+            + ('Configured checks: ' + ', '.join(commands) + '.\n' if commands else '')
+            + inventory
+            + 'Read this contract before choosing interfaces or replacing existing behavior. Use run_tests; '
+              'the complete configured suite must pass before the work is reviewed.\n'
+            + guidance)
+
+
+def needs_tests(paths) -> bool:
+    """Whether a change set must ship executed tests: only server Python does.
+
+    Client JavaScript tests would need a stubbed browser and Frappe, and prove little about the page.
+    """
+    return any(p.endswith(".py") and not p.startswith(".koda/") and not p.endswith("__init__.py")
+               for p in paths)
 
 
 def _stop_process(proc) -> None:
@@ -508,3 +682,26 @@ def _bounded(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit // 3] + f"\n... {len(text) - limit} chars omitted ...\n" + text[-(limit - limit // 3):]
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
+def _containment(output: str) -> tuple[str, str, str]:
+    """Strip the runner's discarded-side-effects record: ``(output, header phrase, shown items)``."""
+    lines = output.splitlines(keepends=True)
+    for index in range(len(lines) - 1, -1, -1):
+        if not lines[index].startswith(CONTAINED_MARKER):
+            continue
+        try:
+            record = json.loads(lines[index][len(CONTAINED_MARKER):])
+            files, jobs, emails = (int(record[key]) for key in ("files", "jobs", "emails"))
+            shown = "\n".join(str(item) for item in record.get("shown") or [])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            break
+        del lines[index]
+        phrase = (f"database writes rolled back; {_plural(files, 'file write')}, "
+                  f"{_plural(jobs, 'background job')} and {_plural(emails, 'email')} discarded")
+        return "".join(lines), phrase, shown
+    return output, UNCOUNTED, ""
