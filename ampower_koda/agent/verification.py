@@ -444,8 +444,38 @@ def contained():
     return {'files': len(_written), 'jobs': len(_jobs), 'emails': len(_mails), 'shown': [item[:200] for item in shown]}
 """
 
+_CALL_RUNNER = _SITE_CONNECT + _CALL_CONTAINMENT + """
+import json, sys, traceback
+sys.path.insert(0, os.environ['KODA_APP_PARENT'])
+method, kwargs = sys.argv[1], json.loads(sys.argv[2])
+code = 1
+try:
+    contain()
+except Exception:
+    release()
+    traceback.print_exc(limit=6)
+    print('KODA_RUNNER_ERROR could not contain the call', flush=True)
+    site_disconnect()
+    sys.exit(3)
+try:
+    result = frappe.get_attr(method)(**kwargs)
+    print('KODA_CALL_RESULT ' + json.dumps(result, default=str, ensure_ascii=False, indent=1), flush=True)
+    code = 0
+except Exception:
+    traceback.print_exc(limit=8)
+finally:
+    release()  # the rollback and teardown below are the runner's, not the method's
+    messages = [m.get('message', m) if isinstance(m, dict) else m for m in (frappe.local.message_log or [])]
+    if messages:
+        print('KODA_CALL_MESSAGES ' + json.dumps(messages, default=str, ensure_ascii=False), flush=True)
+    print('KODA_CALL_CONTAINED ' + json.dumps(contained()), flush=True)
+    site_disconnect()
+sys.exit(code)
+"""
 # Tests run under the same containment as call_method: nothing they do outlives the run.
 _UNITTEST_RUNNER = _SITE_CONNECT + _CALL_CONTAINMENT + _UNITTEST_BODY
+CALL_TIMEOUT = 60
+MAX_CALL_OUTPUT = 6000
 RUNNER_ERROR = "KODA_RUNNER_ERROR"
 CONTAINED_MARKER = "KODA_CALL_CONTAINED "
 #: A stopped runner cannot count; its overlay, jobs and emails end with it all the same.
@@ -840,6 +870,59 @@ def _containment(output: str) -> tuple[str, str, str]:
                   f"{_plural(jobs, 'background job')} and {_plural(emails, 'email')} discarded")
         return "".join(lines), phrase, shown
     return output, UNCOUNTED, ""
+
+
+def call_method(app_name: str, method: str, kwargs: dict | None = None, *, env: dict | None = None,
+                timeout: int = CALL_TIMEOUT, limit: int = MAX_CALL_OUTPUT) -> str:
+    """Run one function of the target app against the live site and return what it did.
+
+    This is the check a fixture cannot make: the real query against real
+    records, the real permission and validation paths, the real response shape.
+    Runs as Administrator in a separate process; DB writes roll back, file writes go to a
+    discarded overlay, real deletes/renames are refused, and jobs and email are only recorded.
+    SQL that would commit on its own (DDL, COMMIT, START TRANSACTION, LOCK) is refused.
+    Not contained: raw cursor SQL, Redis, realtime, network, child processes, native writes.
+
+    ``limit`` bounds the returned text; a helper reading it for a purpose takes more.
+    """
+    method = str(method or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+", method) or \
+            not method.startswith(app_name + "."):
+        return f"CALL_FAILED: method must be a dotted path inside {app_name}, e.g. {app_name}.module.file.function"
+    if kwargs is not None and not isinstance(kwargs, dict):
+        return "CALL_FAILED: kwargs must be an object of keyword arguments."
+    root = Path(_app_root(app_name)).resolve()
+    command_env = _runner_environment(root, env)
+    if not command_env.get("KODA_SITE"):
+        return "RUNTIME_UNAVAILABLE: no Frappe site is connected to this worker; use run_tests instead."
+    argv = [sys.executable, "-c", _CALL_RUNNER, method, json.dumps(kwargs or {}, default=str)]
+    try:
+        # The overlay and the call's temporary files live here and go with it.
+        with tempfile.TemporaryDirectory(prefix="koda-call-", ignore_cleanup_errors=True) as scratch:
+            scratch = os.path.realpath(scratch)
+            temporary = os.path.join(scratch, "tmp")
+            os.mkdir(temporary)
+            code, output, timed_out = _execute(argv, Path(command_env["KODA_SITES_PATH"]), {
+                **command_env, "KODA_CALL_SCRATCH": scratch,
+                "TMPDIR": temporary, "TEMP": temporary, "TMP": temporary}, timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"RUNTIME_UNAVAILABLE: could not start the site runner: {type(exc).__name__}: {exc}"
+    if RUNNER_ERROR in output:
+        return "RUNTIME_UNAVAILABLE: " + _bounded(output, MAX_CALL_OUTPUT) + ENVIRONMENT_NOTE
+    output, contained, discarded = _containment(output)
+    discarded = "\n[discarded]\n" + discarded if discarded else ""
+    if timed_out:
+        return (f"CALL_FAILED: {method} did not return within {timeout}s and was stopped ({contained})\n"
+                + _bounded(output, limit) + discarded)
+    marker = output.find("KODA_CALL_RESULT ")
+    if code == 0 and marker >= 0:
+        logged, result = output[:marker].strip(), output[marker + len("KODA_CALL_RESULT "):].strip()
+        text = f"CALL_OK: {method} on site {command_env['KODA_SITE']} ({contained})\n" + result + discarded
+        if logged:
+            text += "\n[printed while running]\n" + logged
+        return _bounded(text, limit)
+    return (f"CALL_FAILED: {method} raised (exit={code}; {contained})\n" + _bounded(output, limit)
+            + discarded)
 
 
 def run_verification(app_name: str, contract: dict, *, env: dict | None = None,
