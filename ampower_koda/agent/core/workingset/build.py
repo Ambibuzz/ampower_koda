@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 
+from ampower_koda.agent.frappe_rpc import call_options
+
 from ..constants import (
     LEDGER_RECENT_WINDOW,
+    WORKING_SET_CALLERS,
     WORKING_SET_EXCERPT_CHARS,
     WORKING_SET_FULL_SPAN_CHARS,
     WORKING_SET_FULL_SPANS,
@@ -68,12 +71,13 @@ def _relevant(hits: Sequence[Hit]) -> tuple[Hit, ...]:
 
 def _collect(hits: Sequence[Hit], ledger: Ledger | None, query: str = "",
              index: RepositoryIndex | None = None) -> list[WorkingSpan]:
-    """Retrieved spans (the best ones whole), then established refs."""
+    """Retrieved spans (the best ones whole), their callers, then established refs."""
     spans: list[WorkingSpan] = []
     seen: set[str] = set()
 
     retrieved = list(_retrieved(hits, query, index))
-    for span in (*retrieved, *_established(ledger)):
+    related = list(_related(retrieved, index)) if index is not None else []
+    for span in (*retrieved, *related, *_established(ledger)):
         if span.location in seen or _overlaps(span, spans):
             continue
         seen.add(span.location)
@@ -160,6 +164,80 @@ def _lines(chunks: Iterable[Chunk], start: int, end: int) -> dict[int, str]:
         for number, text in zip(range(part.span.start, part.span.end + 1), body):
             lines.setdefault(number, text)
     return lines
+
+
+def _related(spans: Sequence[WorkingSpan], index: RepositoryIndex) -> Iterable[WorkingSpan]:
+    """One hop out from the complete spans: who calls them, and which client RPC reaches them.
+
+    The retrieved spans answer "what matches the request"; the entry point
+    that runs them is often worded differently and ranks below the floor.
+    """
+    produced = 0
+    names: list[str] = []
+    for span in spans:
+        if not span.body or not span.symbol:
+            continue
+        path, _, lines = span.location.rpartition(":")
+        start, _, end = lines.partition("-")
+        bare = span.symbol.rsplit(".", 1)[-1]
+        names.append(bare)
+        for caller in _callers(index, bare, path, int(start), int(end or start)):
+            if produced >= WORKING_SET_CALLERS:
+                return
+            names.append(caller.symbol.rsplit(".", 1)[-1])
+            produced += 1
+            yield caller
+    for site in _rpc_sites(index, names):
+        yield site
+        return
+
+
+def _callers(index: RepositoryIndex, name: str, path: str, start: int, end: int) -> Iterable[WorkingSpan]:
+    for file_path, analysis in index.files.items():
+        for reference in analysis.references:
+            if reference.name != name or (file_path == path and start <= reference.line <= end):
+                continue
+            owner = _enclosing(analysis.definitions, reference.line)
+            if owner is None:
+                continue
+            yield WorkingSpan(
+                location=f"{file_path}:{owner.extent.start}-{owner.extent.end}",
+                symbol=owner.qualified_name,
+                excerpt=_line_text(analysis.chunks, owner.name_line),
+                origin="related",
+            )
+
+
+def _rpc_sites(index: RepositoryIndex, names: Sequence[str]) -> Iterable[WorkingSpan]:
+    """Client code whose ``frappe.call`` method path ends in one of ``names``."""
+    wanted = {name for name in names if name}
+    for file_path, analysis in index.files.items():
+        if not file_path.endswith((".js", ".ts")):
+            continue
+        for chunk in analysis.chunks:
+            if "frappe" not in chunk.body:
+                continue
+            for options in call_options(chunk.body):
+                method = str(options.get("method") or "")
+                if method.rsplit(".", 1)[-1] in wanted:
+                    yield WorkingSpan(location=chunk.location, symbol=chunk.identity,
+                                      excerpt=f"frappe.call {method}", origin="related")
+                    break
+
+
+def _enclosing(definitions, line: int):
+    """The innermost definition containing ``line``."""
+    best = None
+    for definition in definitions:
+        if definition.extent.start <= line <= definition.extent.end:
+            if best is None or definition.extent.line_count < best.extent.line_count:
+                best = definition
+    return best
+
+
+def _line_text(chunks: Iterable[Chunk], line: int) -> str:
+    text = _lines(chunks, line, line).get(line, "")
+    return " ".join(text.split())[:120]
 
 
 def _overlaps(span: WorkingSpan, spans: Sequence[WorkingSpan]) -> bool:

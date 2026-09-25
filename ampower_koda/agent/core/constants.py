@@ -263,6 +263,8 @@ WORKING_SET_OUTLINE_FILES: Final[int] = 2
 WORKING_SET_OUTLINE_CHARS: Final[int] = 2_400
 """A names-only outline, ``symbol@line``, of the top files."""
 
+WORKING_SET_CALLERS: Final[int] = 2
+
 TYPO_MIN_LENGTH: Final[int] = 6
 """Only longer prose words are corrected; short words are too often real."""
 
