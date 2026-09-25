@@ -20,6 +20,7 @@ from ..constants import (
     MEMORY_MAX_TOKENS,
 )
 from ..errors import ConfigError
+from ..budget.request import DEFAULT_INPUT_TOKENS
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,10 @@ class ContextConfig:
 
     map_tokens: int = MAP_MAX_TOKENS
 
+    input_tokens: int = DEFAULT_INPUT_TOKENS
+    """Full-input cleanup threshold, capped by model capacity and reply space.
+    History stays intact below it; pressure cleanup targets two thirds of it."""
+
     ledger_soft_tokens: int = 0
     """0 lets the allocator decide. A non-zero value is an explicit override and
     wins outright — the key predates the allocator, and a number a developer
@@ -60,6 +65,8 @@ class ContextConfig:
     def validate(self) -> None:
         if self.window_tokens <= 0:
             raise ConfigError("context.window_tokens", "must be positive")
+        if self.input_tokens <= 0:
+            raise ConfigError("context.input_tokens", "must be positive")
         if self.memory_tokens < 0:
             raise ConfigError("context.memory_tokens", "cannot be negative")
         if self.map_tokens < 0:
@@ -84,11 +91,11 @@ class RetrievalConfig:
     """How wide a search reaches."""
 
     limit: int = DEFAULT_SEARCH_LIMIT
-    """Hits returned to the caller. The candidate pool behind it is 40-60 wide
-    and costs nothing, because candidates never enter the prompt."""
+    """Hits returned to the caller. Candidate generation is local; dedicated
+    reranking has its own bounded request and never enters the chat prompt."""
 
     expand: bool = True
-    """Run the structural, graph and history legs when the query is anchored.
+    """Run the structural, graph and history legs from retrieved candidates.
     Turning it off leaves a purely lexical retriever, which is a useful thing to
     be able to measure against."""
 

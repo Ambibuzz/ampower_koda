@@ -89,6 +89,8 @@ class ModelRequest:
     and is asking for prose; offering tools would invite a call it will then
     have to refuse."""
 
+    input_tokens_limit: int = 0
+
     @property
     def system_text(self) -> str:
         """The system blocks concatenated, for a driver that wants one string."""
