@@ -52,9 +52,15 @@ from pathlib import Path
 
 import frappe
 from ampower_koda.agent.errors import log_agent_error
+from ampower_koda.agent.cache_usage import persist_usage, provider_cost
+from ampower_koda.agent import recovery
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent.prompt_caching import mark_message, native_cache_messages, openai_breakpoints, terminal_model
+from ampower_koda.agent.run_control import check_active, MODEL_TIME_RESERVE
+from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
+from ampower_koda.agent.core.budget.request import estimate_messages
 from ampower_koda.agent.core import (
     ROLE_PROMPT,
     LocalWorkspace,
@@ -119,17 +125,9 @@ class LangChainChatModel:
     class turns that into LangChain messages and turns the reply back into a
     :class:`ModelTurn`.
 
-    **It never raises.** A turn arrives here with up to sixty rounds of reads
-    behind it, and an exception thrown out of round forty-one discards all of
-    them. Every failure becomes ``ModelTurn(failed=True)``, which the loop
-    records as the answer and returns with the session intact.
-
-    **It publishes what it sends.** The realtime feed the Agent Request form
-    reads used to be written by the tool loop, which no longer exists here. The
-    driver is the right replacement: it sees every request, so on each round it
-    publishes the transcript blocks that appeared since the last one. That is
-    strictly more truthful than publishing at call time — what shows in the UI
-    is what the model was actually shown.
+    It never raises: every failure becomes ``ModelTurn(failed=True)``, so the
+    loop keeps the session. Each round it publishes the transcript's new tool
+    blocks to the form's realtime feed.
     """
 
     def __init__(self, llm, provider: str, request_name: str = "", spent: int = 0) -> None:
@@ -137,28 +135,31 @@ class LangChainChatModel:
         self.provider = (provider or "").strip()
         self.request_name = request_name
         self.rounds = 0
+        # Seeded with earlier spend: it is written to the row as the running total.
         self.total_tokens = spent
-        """Seeded with what earlier phases already spent. The number is written
-        straight to the request row, and a phase that started its count at zero
-        would overwrite the running total with its own share of it."""
-
+        # Why the last call failed; session ``notes`` also carry ordinary remarks.
         self.failure = ""
-        """Why the last call failed, for the caller that has to report it.
-
-        Kept here rather than dug out of the turn's ``notes``, which also carry
-        ordinary session remarks — "co-change memory unavailable" is the first
-        of them on any tree without a git log, and reporting *that* as the
-        reason a request failed sends someone to look at the wrong thing."""
-        self._published = 0
+        self._published: set[tuple[str, str]] = set()
+        # Read off the client, so the cache decision uses the id actually called.
         self.model_id = _model_id(llm)
-        """The model, for the cache decision. Read off the client rather than
-        passed in, so it is the id actually being called."""
-        self._bound = llm.bind_tools(_tool_schemas()) if hasattr(llm, "bind_tools") else llm
+        self._schemas = _tool_schemas()
+        self._bound = llm.bind_tools(self._schemas) if hasattr(llm, "bind_tools") else llm
+        self._calibrator = TokenCalibrator()
+        self._request_estimate = 0
+        self._request_limit = 0
+        self._cache_request_kind = "initial"
 
-    # -- the port -----------------------------------------------------------
+    # the port
+
+    def estimate_request(self, request: ModelRequest) -> int:
+        raw = estimate_messages(self._messages(request), self._schemas)
+        return max(raw, self._calibrator.estimate(raw))
 
     def respond(self, request: ModelRequest) -> ModelTurn:
+        check_active(reserve=MODEL_TIME_RESERVE)
         self.rounds += 1
+        self._cache_request_kind = ("forced_final" if request.force_terminal else
+                                    "initial" if self.rounds == 1 else "continuation")
         self._publish_new_blocks(request.transcript)
 
         try:
@@ -166,70 +167,98 @@ class LangChainChatModel:
         except Exception as error:  # pragma: no cover - defensive; see class docstring
             return self._failed("could not build the request", error)
 
-        model = self.llm if request.force_terminal else self._bound
+        self._request_estimate = estimate_messages(messages, self._schemas)
+        self._request_limit = request.input_tokens_limit
+        measured = max(self._request_estimate, self._calibrator.estimate(self._request_estimate))
+        if request.input_tokens_limit and measured > request.input_tokens_limit:
+            return self._failed("context budget exceeded", ValueError(
+                f"estimated {measured:,} input tokens, limit {request.input_tokens_limit:,}"))
+
+        model = (terminal_model(self.llm, self._schemas, self._bound, provider=self.provider)
+                 if request.force_terminal else self._bound)
+        options = {}
+        if self.provider == "OpenRouter":
+            extra = dict(getattr(self.llm, "extra_body", None) or {})
+            session_id = extra.get("session_id") or self.request_name or request.plan.session_id
+            if session_id:
+                options["extra_body"] = {**extra, "session_id": session_id}
+        check_active(reserve=MODEL_TIME_RESERVE)
         try:
-            reply = model.invoke(messages, max_tokens=request.max_tokens)
+            reply = model.invoke(messages, max_tokens=request.max_tokens, **options)
         except TypeError:
             # Not every LangChain provider accepts a per-call max_tokens.
             try:
-                reply = model.invoke(messages)
+                reply = model.invoke(messages, **options)
             except Exception as error:
                 return self._failed("the model call failed", error)
         except Exception as error:
             return self._failed("the model call failed", error)
 
+        check_active()
         return self._turn(reply)
 
-    # -- request ------------------------------------------------------------
+    # request
 
     def _messages(self, request: ModelRequest) -> list:
-        """System blocks, the conversation, then the tail — in that order.
+        """System blocks, then the conversation — in that order.
 
-        The tail is last and is never cached: it is the session state, the
-        ledger and this message's working set, and it changes every round. That
-        asymmetry is the point of the whole cache plan — the expensive stable
-        half sits above a boundary and is read, and the volatile half below it
-        is cheap because it is small.
+        Retrieval and memory snapshots are recorded in history rather than
+        sent as a trailing message, so message-end cache entries stay reusable.
         """
         messages: list = [self._system(request)]
-        messages.extend(_replay(request.transcript))
-        return messages
+        markers = {}
+        if _takes_cache_control(self.model_id):
+            for marker in (request.plan.previous_marker, request.plan.marker):
+                if marker is not None:
+                    markers[marker.index] = marker.ttl
+        messages.extend(_replay(request.transcript, markers))
+        return native_cache_messages(messages, self.provider)
 
     def _system(self, request: ModelRequest):
         """The system blocks, with a cache breakpoint where the plan asks for one.
 
-        Anthropic takes an explicit ``cache_control`` marker; OpenAI and DeepSeek
-        cache long stable prefixes on their own; everything else gets one plain
-        string. In all three cases the *text* is identical, so the plan's
-        boundaries only ever change the price.
-
-        The choice is made on the **model**, not on the provider name. An
-        Anthropic model reached through OpenRouter is spelled
-        ``anthropic/claude-sonnet-4`` with ``provider == "OpenRouter"``, and
-        keying on the provider sent it the uncached path — so the one model
-        family that *requires* an explicit marker was the one family that never
-        got one, and every round paid full price for the whole prefix.
+        Anthropic uses ``cache_control``; GPT-5.6+ uses explicit system
+        boundaries alongside implicit conversation caching. Older OpenAI and
+        DeepSeek models cache stable prefixes automatically. The choice is made
+        on the model id, so Anthropic models reached through OpenRouter still
+        get ``cache_control``.
         """
         blocks = [block for block in request.plan.blocks if not block.is_empty]
         if not blocks:
             return SystemMessage(content=ROLE_PROMPT)
-        if not _takes_cache_control(self.model_id):
+        openai = openai_breakpoints(self.provider, self.model_id)
+        if not _takes_cache_control(self.model_id) and not openai:
             return SystemMessage(content="\n\n".join(block.text for block in blocks))
 
         content = []
         for block in blocks:
             part = {"type": "text", "text": block.text}
-            if block.breakpoint:
-                part["cache_control"] = {"type": "ephemeral"}
+            if block.breakpoint and block.ttl != "none":
+                if openai:
+                    # Keep implicit caching for the rolling conversation; at
+                    # most two explicit system boundaries plus its latest one.
+                    part["prompt_cache_breakpoint"] = {"mode": "explicit"}
+                else:
+                    part["cache_control"] = {"type": "ephemeral", "ttl": block.ttl}
             content.append(part)
         return SystemMessage(content=content)
 
-    # -- reply --------------------------------------------------------------
+    # reply
 
     def _turn(self, reply) -> ModelTurn:
         usage = _usage(reply)
+        cost = provider_cost(reply)
+        actual_input = usage.input_tokens + usage.cache_read + usage.cache_write
+        self._calibrator = self._calibrator.observe(self._request_estimate, actual_input)
         self.total_tokens += usage.observed
-        _persist_tokens(self.request_name, self.total_tokens)
+        _persist_tokens(
+            self.request_name,
+            self.total_tokens,
+            input_tokens=actual_input,
+            cache_read_tokens=usage.cache_read,
+            cache_write_tokens=usage.cache_write,
+            cost_delta=cost,
+        )
 
         text = _text_of(reply)
         if text:
@@ -243,6 +272,15 @@ class LangChainChatModel:
             output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read,
             cache_write_tokens=usage.cache_write,
+            cache_phase="understanding",
+            cache_request_kind=self._cache_request_kind,
+            cache_read_ratio=round(usage.cache_read / max(1, actual_input), 4),
+            cache_new_input_tokens=max(0, actual_input - usage.cache_read),
+            provider_cost=cost,
+            context_input_tokens=actual_input,
+            context_estimated_tokens=self._request_estimate,
+            input_budget_tokens=self._request_limit,
+            upstream_provider=(getattr(reply, "response_metadata", None) or {}).get("upstream_provider"),
         )
 
         calls = tuple(
@@ -257,7 +295,10 @@ class LangChainChatModel:
             text=text,
             calls=calls,
             usage=usage,
-            stopped_at_limit=_hit_output_limit(reply),
+            stopped_at_limit=recovery.hit_output_limit(reply),
+            provider_context_json=(json.dumps({key: reply.additional_kwargs[key]
+                for key in ('reasoning_details', 'reasoning') if key in getattr(reply, 'additional_kwargs', {})})
+                if any(key in getattr(reply, 'additional_kwargs', {}) for key in ('reasoning_details', 'reasoning')) else ''),
         )
 
     def _failed(self, detail: str, error: Exception) -> ModelTurn:
@@ -268,12 +309,17 @@ class LangChainChatModel:
         )
         return ModelTurn(text=f"[{detail}: {error}]", failed=True, detail=f"{detail}: {error}")
 
-    # -- progress -----------------------------------------------------------
+    # progress
 
     def _publish_new_blocks(self, transcript) -> None:
-        """Publish the transcript blocks added since the previous round."""
-        blocks = transcript.blocks
-        for block in blocks[self._published :]:
+        """Stable call IDs keep progress correct after history shrinks."""
+        for block in transcript.blocks:
+            if block.kind not in ("tool_use", "tool_result"):
+                continue
+            key = (block.kind, block.call_id)
+            if key in self._published:
+                continue
+            self._published.add(key)
             if block.kind == "tool_use":
                 _publish(
                     self.request_name, "tool_call",
@@ -284,10 +330,9 @@ class LangChainChatModel:
                     self.request_name, "tool_result",
                     tool_name=block.tool, result_preview=block.text[:500], round=self.rounds,
                 )
-        self._published = len(blocks)
 
 
-def _replay(transcript) -> list:
+def _replay(transcript, markers=None) -> list:
     """The transcript as LangChain messages, pairs kept together.
 
     A ``tool_use`` block becomes an ``AIMessage`` carrying one tool call, and its
@@ -296,20 +341,26 @@ def _replay(transcript) -> list:
     works right up until the worker restarts, and a resumed session would then
     replay its tool calls with no arguments at all.
 
-    Consecutive calls in one round each get their own ``AIMessage``. One message
-    with several calls is the tidier wire format and it is not worth the risk
-    here: the core emits calls in strict emission order and every provider
-    accepts a one-call-per-message sequence, while grouping requires the driver
-    to reconstruct round boundaries the transcript does not record.
+    Rounds carrying provider reasoning retain their original parallel call group.
+    Legacy transcripts without that metadata keep their one-call message shape.
     """
     messages: list = []
-    for block in transcript.blocks:
+    grouped = set()
+    calls_by_id = {block.call_id: block for block in transcript.blocks if block.kind == 'tool_use'}
+    for index, block in enumerate(transcript.blocks):
+        before = len(messages)
         if block.kind == "tool_use":
-            messages.append(AIMessage(content="", tool_calls=[{
-                "name": block.tool,
-                "args": _arguments(block),
-                "id": block.call_id,
-            }]))
+            if block.call_id in grouped:
+                continue
+            call_blocks = [block]
+            provider_context = {}
+            if block.provider_context_json and block.parallel_call_ids and all(i in calls_by_id for i in block.parallel_call_ids):
+                call_blocks = [calls_by_id[i] for i in block.parallel_call_ids]
+                grouped.update(block.parallel_call_ids)
+                provider_context = json.loads(block.provider_context_json)
+            messages.append(AIMessage(content='', tool_calls=[{
+                'name': call.tool, 'args': _arguments(call), 'id': call.call_id,
+            } for call in call_blocks], additional_kwargs=provider_context))
         elif block.is_result:
             messages.append(ToolMessage(content=block.text or "(no output)",
                                         tool_call_id=block.call_id))
@@ -318,6 +369,8 @@ def _replay(transcript) -> list:
                 HumanMessage(content=block.text) if block.role == "user"
                 else AIMessage(content=block.text)
             )
+        if markers and index in markers and len(messages) > before:
+            messages[-1] = mark_message(messages[-1], markers[index])
     return messages
 
 
@@ -391,10 +444,8 @@ def _text_of(reply) -> str:
 def _usage(reply) -> TurnUsage:
     """What the round cost, split the way the core's two budgets need it.
 
-    Cache reads are pulled out of the input count rather than left in it. The
-    loop re-sends its whole prefix every round, so a meter that charged reads at
-    full price grew with the square of the round count — an 80k ceiling closed
-    on round four of a nominal sixty.
+    Cache reads and writes are pulled out of the input count, so re-sending the
+    cached prefix each round is not charged at full price.
     """
     metadata = getattr(reply, "usage_metadata", None) or {}
     details = metadata.get("input_token_details") or {}
@@ -409,23 +460,7 @@ def _usage(reply) -> TurnUsage:
     )
 
 
-def _hit_output_limit(reply) -> bool:
-    """Whether the reply stopped because it ran out of output budget.
-
-    Worth detecting rather than ignoring: the loop offers two continuations and
-    then says plainly that it was cut off, and a truncated answer read as a
-    complete one is the failure that makes a cut-off worse than an error.
-    """
-    metadata = getattr(reply, "response_metadata", None) or {}
-    reason = str(
-        metadata.get("finish_reason") or metadata.get("stop_reason") or ""
-    ).lower()
-    return reason in ("length", "max_tokens", "model_length")
-
-
-# ---------------------------------------------------------------------------
 # Seam 2 — the utility model
-# ---------------------------------------------------------------------------
 
 
 class LangChainUtility:
@@ -442,11 +477,10 @@ class LangChainUtility:
         self.request_name = request_name
 
     def complete(self, system: str, user: str, *, max_tokens: int) -> Completion:
+        check_active(reserve=MODEL_TIME_RESERVE)
+        messages = [SystemMessage(content=system), HumanMessage(content=user)]
         try:
-            reply = self.llm.invoke([
-                SystemMessage(content=system),
-                HumanMessage(content=user),
-            ])
+            reply = self.llm.invoke(messages, max_tokens=max_tokens)
         except Exception as error:
             log_agent_error(
                 "Koda core: utility model",
@@ -454,6 +488,7 @@ class LangChainUtility:
             )
             return Completion(failed=True, detail=str(error))
 
+        check_active()
         usage = _usage(reply)
         return Completion(
             text=_text_of(reply)[: max_tokens * 8],
@@ -465,9 +500,7 @@ class LangChainUtility:
         )
 
 
-# ---------------------------------------------------------------------------
 # Seam 3 — the tool host
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -965,14 +998,4 @@ def _publish(request_name: str, log_type: str, **payload) -> None:
         )
 
 
-def _persist_tokens(request_name: str, total: int) -> None:
-    if not request_name:
-        return
-    try:
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "tokens_used", int(total))
-        frappe.db.commit()
-    except Exception:
-        log_agent_error(
-            "Koda core: persist token usage",
-            f"request={request_name}\n{frappe.get_traceback()}",
-        )
+_persist_tokens = persist_usage  # module-level seam that tests replace
