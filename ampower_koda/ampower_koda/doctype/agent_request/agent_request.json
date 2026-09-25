@@ -47,6 +47,8 @@
   "debug_section",
   "pending_bench_commands",
   "rq_job_id",
+  "agent_run_id",
+  "execution_checkpoint",
   "conversation_log",
   "understanding_snapshot",
   "implementation_snapshot",
@@ -242,11 +244,11 @@
    "label": "Agent Plan"
   },
   {
+   "description": "Display of the structured plan. Edit Structured Plan JSON to adjust tasks.",
    "fieldname": "agent_plan",
    "fieldtype": "Markdown Editor",
    "label": "Agent Plan",
-   "read_only": 1,
-   "description": "Display of the structured plan. Edit Structured Plan JSON to adjust tasks."
+   "read_only": 1
   },
   {
    "collapsible": 1,
@@ -308,6 +310,20 @@
    "fieldtype": "Data",
    "hidden": 1,
    "label": "RQ Job ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "agent_run_id",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Agent Run ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "execution_checkpoint",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Execution Checkpoint",
    "read_only": 1
   },
   {
@@ -391,29 +407,29 @@
    "options": "Agent Prompt Configuration"
   },
   {
+   "description": "Canonical task contract. Changes are validated before approval.",
    "fieldname": "plan_json",
    "fieldtype": "Code",
-   "options": "JSON",
    "label": "Structured Plan JSON",
-   "description": "Canonical task contract. Changes are validated before approval."
+   "options": "JSON"
   },
   {
    "fieldname": "approved_plan_json",
    "fieldtype": "Long Text",
-   "label": "Approved Plan JSON",
    "hidden": 1,
+   "label": "Approved Plan JSON",
    "read_only": 1
   },
   {
    "fieldname": "execution_results",
    "fieldtype": "Code",
-   "options": "JSON",
    "label": "Task Execution Results",
+   "options": "JSON",
    "read_only": 1
   }
  ],
  "links": [],
- "modified": "2026-09-08 12:00:00.000000",
+ "modified": "2026-09-24 11:00:00.000000",
  "modified_by": "Administrator",
  "module": "Ampower Koda",
  "name": "Agent Request",
