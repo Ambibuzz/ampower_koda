@@ -9,6 +9,8 @@ import sys
 import frappe
 
 from ampower_koda.agent.errors import log_agent_error
+from ampower_koda.agent.core.constants import CACHE_DIRECTORY
+from ampower_koda.agent.core.globs import compile_globs
 from ampower_koda.agent.javascript_validation import globals_configs, validate_javascript_names
 
 
@@ -53,7 +55,44 @@ def _resolve_path(app_name: str, relative_path: str) -> str:
     path = os.path.realpath(os.path.join(root, relative_path))
     if os.path.commonpath([root, path]) != root:
         raise ValueError(f"Path outside app: {relative_path}")
+    if _archived(os.path.relpath(path, root)):
+        raise ValueError(f"{relative_path} holds tests archived from earlier runs; they are not part of this request.")
     return path
+
+
+#: Tests left by earlier runs are archived here; they are not part of the current request.
+ARCHIVE_DIRECTORY = ".koda/archive"
+ARCHIVE_PARTS = tuple(ARCHIVE_DIRECTORY.split("/"))
+#: The directory of Koda's own index caches: machine output that only ever matched as noise.
+CACHE_PARTS = tuple(CACHE_DIRECTORY.split("/")[:2])
+
+
+def _under(relative: str, parts: tuple[str, ...]) -> bool:
+    return tuple(relative.replace("\\", "/").split("/")[:len(parts)]) == parts
+
+
+def _archived(relative: str) -> bool:
+    """Archived tests of earlier runs: no tool lists, searches or opens them."""
+    return _under(relative, ARCHIVE_PARTS)
+
+
+def _unlisted(relative: str) -> bool:
+    """Paths a listing or search skips: archived tests and Koda's caches."""
+    return _archived(relative) or _under(relative, CACHE_PARTS)
+
+
+def _glob_matcher(glob: str):
+    """Unanchored matcher for a glob relative to the searched directory; None for no glob.
+
+    "wt/*.py" also matches "page/wt/a.py"; a glob without "/" matches the file name.
+    """
+    return compile_globs([glob.replace("\\", "/")], anchored=False) if glob and glob.strip() else None
+
+
+def _glob_missed(glob: str, files: str) -> str:
+    """The result when files existed but the glob excluded every one."""
+    return (f"Glob {glob!r} matched no files; it excluded all {files}. A glob matches paths relative to the "
+            "searched directory, at any depth: '*.py', 'doctype/**/*.json', '*.{py,js}'.")
 
 
 def list_directory(app_name: str, path: str) -> str:
@@ -66,7 +105,8 @@ def list_directory(app_name: str, path: str) -> str:
         full = _resolve_path(app_name, path)
         if not os.path.isdir(full):
             return f"Not a directory: {path}"
-        entries = sorted(os.listdir(full))
+        root = os.path.realpath(_app_root(app_name))
+        entries = sorted(e for e in os.listdir(full) if not _unlisted(os.path.relpath(os.path.join(full, e), root)))
         lines = []
         for e in entries:
             p = os.path.join(full, e)
@@ -83,27 +123,30 @@ IGNORE_DIRS = {
 }
 
 
-def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
-    """Recursively list the app directory tree. Returns an indented tree view.
+def _walked_dirs(dirpath: str, dirnames: list[str], app_root: str) -> list[str]:
+    """The subdirectories of ``dirpath`` a listing or search descends into, sorted."""
+    return sorted(d for d in dirnames if d not in IGNORE_DIRS and not d.endswith(".egg-info")
+                  and not _unlisted(os.path.relpath(os.path.join(dirpath, d), app_root)))
 
-    - path: relative to app root.
-    - pattern: optional filename glob filter (e.g. '*.py', '*.json').
+
+def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
+    """List the app's files: an indented tree, or with ``pattern`` the matching paths, one per line.
+
+    - pattern: optional glob on file paths relative to the app, matched at any
+      depth (e.g. '*.py', 'doctype/**/*.json', '*.{py,js}').
     - max_depth: depth of recursion (defaults to 6).
 
     Call this FIRST to map the codebase structure before reading individual files.
     """
     try:
-        import fnmatch
         root = _app_root(app_name)
+        within = _glob_matcher(pattern)
         lines = []
-        count = 0
+        count = listed = excluded = 0
         max_entries = 1500
 
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in sorted(dirnames)
-                if d not in IGNORE_DIRS and not d.endswith(".egg-info")
-            ]
+            dirnames[:] = _walked_dirs(dirpath, dirnames, root)
 
             rel_dir = os.path.relpath(dirpath, root)
             depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
@@ -112,19 +155,26 @@ def find_files(app_name: str, pattern: str = "", max_depth: int = 6) -> str:
                 continue
 
             indent = "  " * depth
-            dir_name = os.path.basename(dirpath) if rel_dir != "." else "."
-            lines.append(f"{indent}{dir_name}/")
-            count += 1
+            if within is None:
+                dir_name = os.path.basename(dirpath) if rel_dir != "." else "."
+                lines.append(f"{indent}{dir_name}/")
+                count += 1
 
             for fname in sorted(filenames):
-                if pattern and not fnmatch.fnmatch(fname, pattern):
+                relative_file = os.path.relpath(os.path.join(dirpath, fname), root).replace(os.sep, '/')
+                if within is not None and within(relative_file) is None:
+                    excluded += 1
                     continue
-                lines.append(f"{indent}  {fname}")
+                listed += 1
+                # A filtered listing is flat: full paths, no directories without a match.
+                lines.append(relative_file if within is not None else f"{indent}  {fname}")
                 count += 1
                 if count >= max_entries:
                     lines.append(f"\n... (truncated at {max_entries} entries)")
                     return "\n".join(lines)
 
+        if excluded and not listed:
+            return _glob_missed(pattern, f"{excluded} files in the app")
         return "\n".join(lines) if lines else "(empty)"
     except Exception as ex:
         return _tool_error("find_files", ex, f"Error: {ex}")
