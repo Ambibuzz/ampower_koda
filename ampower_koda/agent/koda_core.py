@@ -45,9 +45,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 
 import frappe
@@ -59,6 +60,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.prompt_caching import mark_message, native_cache_messages, openai_breakpoints, terminal_model
 from ampower_koda.agent.run_control import check_active, MODEL_TIME_RESERVE
+from ampower_koda.agent.reranking import OpenRouterReranker
 from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
 from ampower_koda.agent.core.budget.request import estimate_messages
 from ampower_koda.agent.core.config.merge import merge_config
@@ -80,7 +82,8 @@ from ampower_koda.agent.core.constants import DEFAULT_ARCHITECT_MODEL
 from ampower_koda.agent.git_ops import get_repo_root, run_git, worktree_signature
 from ampower_koda.agent.core.contracts.escalation import SideUsage
 from ampower_koda.agent.core.contracts.model import Completion
-from ampower_koda.agent.core.retrieval.tokenize import split_words
+from ampower_koda.agent.core.retrieval.excerpts import excerpt
+from ampower_koda.agent.core.retrieval.query import plain_query
 from ampower_koda.agent.core.tools.catalogue import CATALOGUE
 
 #: Frappe doctype the graph's request rows live in.
@@ -583,6 +586,10 @@ class UnderstandingHost:
 _SESSIONS: dict[str, Session] = {}
 _SESSIONS_LOCK = threading.Lock()
 
+
+# Shared retrieval for a task the user is writing by hand
+
+
 #: Sessions held in this worker before the oldest is dropped. Small: a session
 #: holds an index of a whole app, and a worker serving eleven requests at once
 #: is not the shape this runs in.
@@ -621,8 +628,39 @@ def forget_session(request_name: str) -> None:
 # Model-free retrieval for a task the user is writing by hand
 # ---------------------------------------------------------------------------
 
-#: One read-only session per app root, reused while the checkout is unchanged.
-#: Keyed separately from ``_SESSIONS`` because those carry a request's transcript.
+@lru_cache(maxsize=16)
+def _rerank_client(site: str, api_key: str, model: str, timeout: float) -> OpenRouterReranker:
+    """Keep result caches separate by site, credentials, model and deadline."""
+    return OpenRouterReranker(api_key=api_key, model=model, timeout_seconds=timeout)
+
+
+def _with_reranker(session: Session) -> Session:
+    """Inject the service at the host boundary; the core imports no HTTP client."""
+    config = session.context.config.rerank
+    client = None
+    if config.enabled:
+        site = str(getattr(getattr(frappe, "local", None), "site", "") or "")
+        try:
+            settings = frappe.get_single("Agent Settings")
+            api_key = settings.get_password("openrouter_api_key") or ""
+        except Exception:
+            # Outside a Frappe site, the standard environment key supports
+            # scripts. A site never borrows another site's process-global key.
+            api_key = "" if site else os.environ.get("OPENROUTER_API_KEY", "")
+        if api_key.strip():
+            client = _rerank_client(site, api_key.strip(), config.model, config.timeout_seconds)
+    return replace(session, retriever=replace(session.retriever, reranker=client))
+
+
+def _without_reranker(session: Session) -> Session:
+    """The session with local ranking only: no paid reranking request."""
+    if getattr(session.retriever, "reranker", None) is None:
+        return session
+    return replace(session, retriever=replace(session.retriever, reranker=None))
+
+
+#: One read-only session per app root, reused while the checkout is unchanged; held without
+#: the reranker, which is attached per call.
 _APP_SESSIONS: dict[str, tuple[str, Session]] = {}
 
 
@@ -638,35 +676,36 @@ def _tree_key(app_name: str) -> str:
 
 
 def remember_app_session(app_name: str, session: Session) -> None:
-    """Hold a session for model-free searches while the checkout is unchanged."""
+    """Hold a session for searches while the checkout is unchanged."""
     try:
-        entry = (_tree_key(app_name), session)
+        entry = (_tree_key(app_name), _without_reranker(session))
     except Exception:
         return  # not a git checkout, or git unavailable: fall back to cold start
     with _SESSIONS_LOCK:
         _APP_SESSIONS[_app_root(app_name)] = entry
 
 
-def _app_session(app_name: str) -> Session:
+def _app_session(app_name: str, *, rerank: bool = True) -> Session:
     root = _app_root(app_name)
     key = _tree_key(app_name)
     with _SESSIONS_LOCK:
         held = _APP_SESSIONS.get(root)
     if held is not None and held[0] == key:
-        return held[1]
+        return _with_reranker(held[1]) if rerank else _without_reranker(held[1])
     session = open_session(LocalWorkspace(root_path=Path(root)))
     with _SESSIONS_LOCK:
         _APP_SESSIONS[root] = (key, session)
-    return session
+    return _with_reranker(session) if rerank else session
 
 
-def suggest_context(app_name: str, query: str, *, limit: int = 12) -> list[dict]:
+def suggest_context(app_name: str, query: str, *, limit: int = 12, rerank: bool = True) -> list[dict]:
     """Rank code spans for a task description with the retriever planning used.
 
-    No model call. Cold start on a large app takes tens of seconds, which is why
+    No chat call. Cold start on a large app takes tens of seconds, which is why
     the API runs this in a job and streams the result back over realtime.
+    ``rerank=False`` skips the paid reranker, whose spend the cost ledger cannot see.
     """
-    return suggestions_for(_app_session(app_name), query, limit=limit)
+    return suggestions_for(_app_session(app_name, rerank=rerank), query, limit=limit)
 
 
 def suggestions_for(session: Session, query: str, *, limit: int = 12) -> list[dict]:
@@ -676,64 +715,26 @@ def suggestions_for(session: Session, query: str, *, limit: int = 12) -> list[di
     same location dedup ``working_set_for`` does before the model's first round —
     kept as structured hits rather than its rendered ``path:start-end`` lines.
     """
+    query = plain_query(query)
     index = session.retriever.index
     seen: set[tuple[str, int, int]] = set()
     out: list[dict] = []
-    for hit in search(session.retriever, query, limit=limit).hits:
+    limit = max(1, min(limit, 50))
+    for hit in search(session.retriever, query, limit=min(50, limit * 3)).hits:
         chunk = hit.chunk
         definition = _enclosing_definition(index, chunk.path, chunk.span.start, chunk.span.end, chunk.identity)
         start, end = (definition.extent.start, definition.extent.end) if definition else (chunk.span.start, chunk.span.end)
         if (chunk.path, start, end) in seen:
             continue
         seen.add((chunk.path, start, end))
-        score = hit.score * (NAME_MATCH_BOOST if _names_file(query, chunk.path) else 1.0)
         out.append({
             "path": chunk.path, "start": start, "end": end,
             "symbol": definition.qualified_name if definition else (chunk.identity or ""),
-            "snippet": _headline(chunk.body), "score": round(score, 3), "note": hit.note,
+            "snippet": excerpt(chunk.body, query), "score": round(hit.score, 3), "note": hit.note,
         })
-    out.sort(key=lambda ref: -ref["score"])
+        if len(out) >= limit:
+            break
     return out
-
-
-NAME_MATCH_BOOST = 1.5
-MIN_NAME_PHRASE_CHARS = 6
-
-
-def _names_file(query: str, path: str) -> bool:
-    """Whether the query spells out the file's name, as words or as a token.
-
-    "the Document Traceability client script" names ``document_traceability.js``
-    but the lexical scorer cannot tell: ``document`` and ``traceability`` are in
-    nearly every chunk of that app, so their weight is close to zero, and the
-    ranking is decided by whichever look-alike file has the shorter chunk.
-    Short stems (``api``, ``utils``) are ignored; they name nothing.
-    """
-    phrase = " ".join(split_words(Path(path).stem))
-    if len(phrase) < MIN_NAME_PHRASE_CHARS:
-        return False
-    return phrase in " ".join(split_words(query))
-
-
-_DEFINITION_LINE = re.compile(
-    r"^\s*(?:async\s+def|def|class|function|frappe\.ui\.form\.on|frappe\.pages)\b"
-    r"|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:function|\()"
-)
-_NOISE_LINE = re.compile(r'^\s*(?:#|//|/\*|\*|"""|\'\'\'|\)|\]|\}|$)')
-
-
-def _headline(body: str, limit: int = 120) -> str:
-    """The line a person would recognise the chunk by.
-
-    A window rarely starts on anything meaningful — a closing bracket, a
-    licence comment — so prefer the first definition inside it, then the first
-    line that is neither blank nor punctuation nor a comment.
-    """
-    lines = body.splitlines()
-    chosen = next((line for line in lines if _DEFINITION_LINE.match(line)), None)
-    if chosen is None:
-        chosen = next((line for line in lines if not _NOISE_LINE.match(line)), "")
-    return chosen.strip()[:limit]
 
 
 def _enclosing_definition(index, path: str, start: int, end: int, identity: str = ""):

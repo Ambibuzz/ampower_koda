@@ -107,6 +107,8 @@ MAX_READ_RESULT_CHARS = 80000
 # Searches and outlines bound themselves and say what they left out; the generic
 # cap would cut them without saying so.
 SELF_BOUNDED_TOOLS = {"read_file", "search_code", "get_file_outline"}
+FIND_CODE_HITS = 8
+FIND_CODE_EXCERPT_CHARS = 160
 # A result fetched with a purpose is read by a bare model call and the conversation
 # gets only its answer, so the full result is not re-sent with every later request.
 READER_TOOLS = frozenset({"read_file", "search_code", "get_file_outline", "call_method"})
@@ -891,6 +893,27 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
                                        context=context, head_limit=head_limit)
 
     @tool
+    def find_code(query: str) -> str:
+        """Find where something is implemented from a plain description ("where an order's items are
+        priced", "report filter rendering") when you do not know the names to search_code for. Returns the
+        best-matching functions and blocks, ranked: path:start-end, the enclosing name and a short excerpt."""
+        try:
+            hits = koda_core.suggest_context(app_name, query, limit=FIND_CODE_HITS, rerank=False)
+        except Exception:
+            log_agent_error("Agent Graph: find_code", frappe.get_traceback())
+            return "FIND_FAILED: the code index is unavailable; use search_code."
+        if not hits:
+            return f"No code matched: {query}. Try search_code with names or phrases from the UI."
+        rows = []
+        for hit in hits:
+            excerpt = " ".join(str(hit.get("snippet") or "").split())
+            if len(excerpt) > FIND_CODE_EXCERPT_CHARS:
+                excerpt = excerpt[:FIND_CODE_EXCERPT_CHARS] + "…"
+            symbol = f" {hit['symbol']}" if hit.get("symbol") else ""
+            rows.append(f"{hit['path']}:{hit['start']}-{hit['end']}{symbol} — {excerpt}")
+        return "\n".join(rows)
+
+    @tool
     def read_doctype_schema(doctype_name: str) -> str:
         """Read a DocType's source schema or installed dependency metadata and database columns.
         Use this to verify actual ERPNext/Frappe fields before writing queries; doctype_name e.g. 'Sales Order'."""
@@ -1084,7 +1107,7 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
             raise ValueError(f"Deletion is not approved for {path}.")
         return agent_tools.delete_file(app_name, path, expected_sha256=revision(current))
 
-    catalogue = [find_files, list_directory, read_file, search_code, read_doctype_schema,
+    catalogue = [find_files, list_directory, read_file, search_code, find_code, read_doctype_schema,
                  get_file_outline, validate_code, run_tests, call_method, write_file, copy_file,
                  edit_file, rename_file, delete_file]
     return catalogue
