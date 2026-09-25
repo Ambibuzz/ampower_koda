@@ -29,7 +29,8 @@ from ampower_koda.agent.run_control import (
     check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES, MODEL_TIME_RESERVE,
 )
 from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
-from ampower_koda.agent.core.budget.request import cleanup_target, estimate_messages, input_limit
+from ampower_koda.agent.core.budget.request import cleanup_target, estimate_messages, input_limit, serialized_tokens
+from ampower_koda.agent.core.constants import DEFAULT_WINDOW_TOKENS
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.plan_contract import (
@@ -147,6 +148,9 @@ ALWAYS_REASONING = _re.compile(r"glm-(?:4\.[5-9]|[5-9])|deepseek-r1|qwq|thinking
 # Sized for the largest valid plan plus its overview and scope.
 PLAN_OUTPUT_TOKENS_PER_TASK = 450
 MODEL_PLAN_OUTPUT_TOKENS = 1000 + MAX_PLAN_TASKS * PLAN_OUTPUT_TOKENS_PER_TASK
+# OpenRouter counts hidden reasoning inside ``max_tokens``; reserve room for it
+# on top of the visible plan so the answer still fits.
+OPENROUTER_REASONING_ALLOWANCE_TOKENS = 16000
 
 
 # Provider-native prompt caching for the stable system prefix (safe no-op when unsupported).
@@ -2088,6 +2092,145 @@ def _structured_plan_model(llm, provider: str):
     return structured
 
 
+def _plan_run_config(run_name: str, *, round_number: int, mode: str) -> dict:
+    """Trace name, tags and round metadata for one planner call."""
+    return {
+        "run_name": run_name,
+        "tags": ["plan", f"plan:{mode}"],
+        "metadata": {"plan_round": round_number, "plan_mode": mode},
+    }
+
+
+def _charge_plan_call(raw_response, request_name: str, total_tokens: int, *, round_label: int) -> int:
+    usage = getattr(raw_response, "usage_metadata", None)
+    if not usage:
+        return total_tokens
+    total_tokens += int(usage.get("total_tokens") or 0)
+    details = usage.get("input_token_details") or {}
+    input_tokens = int(usage.get('input_tokens') or 0)
+    cache_read = int(details.get('cache_read') or 0)
+    cache_write = int(details.get('cache_creation') or 0)
+    cost = provider_cost(raw_response)
+    _publish_agent_log(request_name, "token_usage",
+        round=round_label,
+        tokens_this_round=usage.get("total_tokens", 0),
+        tokens_total=total_tokens,
+        input_tokens=max(0, input_tokens - cache_read - cache_write),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
+        context_input_tokens=input_tokens,
+        cache_phase='planning',
+        provider_cost=cost,
+        upstream_provider=(getattr(raw_response, "response_metadata", None) or {}).get("upstream_provider"),
+    )
+    _persist_token_usage(request_name, total_tokens, input_tokens=input_tokens,
+                         cache_read_tokens=cache_read, cache_write_tokens=cache_write, cost_delta=cost)
+    return total_tokens
+
+
+def _plan_output_tokens(provider: str) -> int:
+    """Output cap for one planner call, including reasoning room on OpenRouter."""
+    if provider == "OpenRouter":
+        return MODEL_PLAN_OUTPUT_TOKENS + OPENROUTER_REASONING_ALLOWANCE_TOKENS
+    return MODEL_PLAN_OUTPUT_TOKENS
+
+
+def _plan_budget(provider: str, state: dict | None = None) -> dict:
+    """Mutable output cap shared by every planner call in one stage.
+
+    Once a call had to grow the cap, later repair and patch calls start from
+    the grown value instead of rediscovering the same truncation. ``window``
+    is the model's context window, from which each call derives the real
+    room it has; ``ceiling`` records a smaller limit the provider rejected
+    above, once known.
+    """
+    state = state or {}
+    try:
+        window, _ = koda_core.request_limits(state.get("target_app_name", ""), state.get("ai_model", "gpt-4o-mini"))
+    except Exception:  # noqa: BLE001 - an unknown window only limits growth, never the call
+        window = 0
+    return {"max_tokens": _plan_output_tokens(provider), "window": int(window or 0), "ceiling": 0}
+
+
+def _invoke_structured(llm, provider: str, schema: dict, messages: list, config: dict, *,
+                       budget: dict, request_name: str, total_tokens: int, round_label: int) -> tuple[dict, int]:
+    """One planner call that grows its output cap when the reply is truncated.
+
+    Every attempt is charged. Truncation at the context window's ceiling raises
+    ``PlanValidationError``. Returns the structured response and the token total.
+    """
+    estimate = estimate_messages(messages) + serialized_tokens(schema)
+    window = int(budget.get("window") or 0) or DEFAULT_WINDOW_TOKENS
+    ceiling = max(int(budget["max_tokens"]), recovery.output_ceiling(window, estimate))
+    if budget.get("ceiling"):
+        ceiling = min(ceiling, int(budget["ceiling"]))
+    cap = recovery.OutputCap(budget["max_tokens"], ceiling)
+
+    def call(max_tokens: int):
+        check_active(reserve=MODEL_TIME_RESERVE)
+        return _structured_model(llm, provider, schema, max_tokens=max_tokens).invoke(messages, config=config)
+
+    def note(previous: int, grown: int, reasoning: int) -> None:
+        _publish_agent_log(request_name, "llm_response", round=round_label,
+            preview=(f"Planner ran out of output room at {previous:,} tokens"
+                     + (f" ({reasoning:,} spent reasoning)" if reasoning else "")
+                     + f"; retrying with a {grown:,}-token cap"))
+
+    outcome = recovery.invoke_growing(
+        call, cap,
+        raw_of=lambda reply: reply.get("raw") if isinstance(reply, dict) else None,
+        on_retry=note,
+    )
+    # Wasted attempts are still billed; keep the running total where the
+    # caller can read it back when this ends in PlanValidationError.
+    for chargeable in outcome.wasted:
+        total_tokens = _charge_plan_call(chargeable, request_name, total_tokens, round_label=round_label)
+    raw = outcome.reply.get("raw") if isinstance(outcome.reply, dict) else None
+    total_tokens = _charge_plan_call(raw, request_name, total_tokens, round_label=round_label)
+    budget["max_tokens"] = cap.value
+    if cap.ceiling < ceiling:
+        budget["ceiling"] = cap.ceiling
+    budget["total_tokens"] = total_tokens
+    if outcome.truncated:
+        raise PlanValidationError([
+            f"Planner output reached the model output limit ({cap.value:,} tokens is all this model has left"
+            + (f"; {outcome.reasoning_tokens:,} spent reasoning" if outcome.reasoning_tokens else "") + ")"])
+    return outcome.reply, total_tokens
+
+
+def _structured_model(llm, provider: str, schema: dict, *, max_tokens: int | None = None):
+    """Bind ``schema`` using the provider's structured-output API.
+
+    The output cap and extra_body go on a copy of the model before wrapping:
+    kwargs passed to the wrapped sequence never reach the request.
+    """
+    update: dict = {}
+    if max_tokens:
+        fields = getattr(type(llm), "model_fields", {})
+        for name in ("max_tokens", "max_output_tokens"):
+            if name in fields:
+                update[name] = int(max_tokens)
+                break
+    if provider == "OpenRouter":
+        # Keep the usage flag and sticky-routing session_id already in extra_body.
+        body = dict(getattr(llm, "extra_body", None) or {})
+        body["provider"] = {**dict(body.get("provider") or {}), "require_parameters": True}
+        update["extra_body"] = body
+    if update:
+        llm = llm.model_copy(update=update)
+    # Native structured-output path per wrapper: OpenAI/OpenRouter enforce json_schema (strict),
+    # Claude only has json_schema on newer models so use tool input, Gemini rejects json_schema.
+    method = {
+        "Claude": "function_calling",
+        "Gemini": "json_mode",
+    }.get(provider, "json_schema")
+    options = {"method": method, "include_raw": True}
+    if provider in ("OpenAI", "OpenRouter"):
+        options["strict"] = True
+    return llm.with_structured_output(schema, **options)
+
+
 def _unpack_structured_plan(result) -> tuple[object, dict]:
     if not isinstance(result, dict) or "parsed" not in result:
         raise PlanValidationError(["Provider returned no structured plan result"])
@@ -2210,6 +2353,16 @@ def plan_node(state: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Graph nodes — Execution phase
 # ---------------------------------------------------------------------------
+
+def _check_plan_input(state: dict, messages: list, schema: dict, budget: dict) -> None:
+    estimate = estimate_messages(messages) + serialized_tokens(schema)
+    window, ceiling = koda_core.request_limits(state.get("target_app_name", ""), state.get("ai_model", "gpt-4o-mini"))
+    limit = input_limit(window, budget["max_tokens"], ceiling)
+    if estimate > limit:
+        raise ValueError(f"Planning context exceeds the input budget ({estimate:,} > {limit:,} tokens).")
+
+
+# Graph nodes — Execution phase
 
 def prepare_execution_node(state: dict) -> dict:
     """Freeze the validated contract once, before any task writes."""
