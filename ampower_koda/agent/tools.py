@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
 # Agent tools for reading/writing and searching the target app codebase
 
+import difflib
 import os
 import re
 import site
@@ -300,35 +301,45 @@ def write_file(app_name: str, path: str, content: str) -> str:
         return _tool_error("write_file", ex, f"WRITE_FAILED: Error: {ex}")
 
 
-def edit_file(app_name: str, path: str, old_string: str, new_string: str) -> str:
-    """Replace the FIRST occurrence of old_string with new_string in a file.
+def edit_file(app_name: str, path: str, old_string: str, new_string: str, expected_occurrences: int = 1) -> str:
+    """Replace exact text, requiring an explicit count for a deliberate repeated rename.
 
     - path: relative to app root.
-    - old_string: Must match EXACTLY, including whitespace and indentation.
+    - old_string: the current text; a unique match that differs only in whitespace is also accepted.
 
-    For multi-line edits or replacing specific ranges, use replace_lines instead.
+    CRLF files keep CRLF. The receipt shows the edited region with current line numbers.
     """
     try:
         full = _resolve_path(app_name, path)
         if not os.path.isfile(full):
             return f"EDIT_FAILED: Not a file: {path}"
-        with open(full, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        if not old_string or content.count(old_string) != 1:
-            preview = content[:3000]
-            if len(content) > 3000:
-                preview += f"\n... ({len(content)} chars total, showing first 3000)"
+        original = read_bytes(full)
+        content = original.decode("utf-8", errors="surrogateescape")
+        if content.count("\r\n") * 2 > content.count("\n"):  # mostly CRLF: edits keep those line endings
+            old_string, new_string = _crlf(old_string), _crlf(new_string)
+        matches = content.count(old_string) if old_string else 0
+        if type(expected_occurrences) is not int or not 1 <= expected_occurrences <= 1000:
+            return 'EDIT_FAILED: expected_occurrences must be an integer from 1 to 1000.'
+        loose = (_loose_edit(content, old_string, new_string)
+                 if old_string and matches == 0 and expected_occurrences == 1 else None)
+        if loose is not None:
+            first, end, new_string, how = loose
+            content = content[:first] + new_string + content[end:]
+            _write_source(app_name, full, content.encode("utf-8", errors="surrogateescape"), original)
+            return f"EDIT_OK: Updated {path}; old_string matched once {how}.\n" + _edit_excerpt(
+                content, first, new_string, 1)
+        if not old_string or matches != expected_occurrences:
             return (
-                f"EDIT_FAILED: old_string must match exactly once in {path} ({len(content)} chars, {content.count(chr(10))+1} lines). "
-                f"Use read_file to inspect the file and copy the exact string to match, "
-                f"including whitespace and indentation."
+                f"EDIT_FAILED: old_string matched {matches} times in {path}; expected {expected_occurrences}. "
+                + _anchor_help(content, old_string, matches)
             )
-        content = content.replace(old_string, new_string, 1)
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"EDIT_OK: Updated {path} successfully."
+        first = content.find(old_string)
+        content = content.replace(old_string, new_string)
+        _write_source(app_name, full, content.encode("utf-8", errors="surrogateescape"), original)
     except Exception as ex:
         return _tool_error("edit_file", ex, f"EDIT_FAILED: Error: {ex}")
+    return f"EDIT_OK: Updated {path} successfully.\n" + _edit_excerpt(
+        content, first, new_string, expected_occurrences)
 
 
 def replace_lines(app_name: str, path: str, start_line: int, end_line: int, new_content: str) -> str:
@@ -416,6 +427,122 @@ def insert_lines(app_name: str, path: str, after_line: int, new_content: str) ->
         )
     except Exception as ex:
         return _tool_error("insert_lines", ex, f"EDIT_FAILED: Error: {ex}")
+
+
+def _crlf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\n", "\r\n")
+
+
+def _indent(line: str) -> str:
+    return line[:len(line) - len(line.lstrip(" \t"))]
+
+
+def _loose_edit(content: str, old_string: str, new_string: str):
+    """``(start, end, new_string, how)`` where only whitespace kept ``old_string`` from matching, or None.
+
+    Needs one unique run of stripped lines off by a consistent indent, which ``new_string`` gets too.
+    """
+    wanted = old_string.split("\n")
+    trailing = wanted[-1] == ""
+    if trailing:
+        wanted = wanted[:-1]
+    if not wanted or not any(len(line.strip()) >= 4 for line in wanted):
+        return None
+    lines = content.split("\n")
+    keys = [line.strip() for line in wanted]
+    places = [i for i in range(len(lines) - len(wanted) + 1)
+              if lines[i].strip() == keys[0] and all(lines[i + k].strip() == keys[k] for k in range(len(keys)))]
+    if len(places) != 1:
+        return None
+    first = places[0]
+    actual = lines[first:first + len(wanted)]
+    change = None  # (added prefix, removed prefix), the same for every non-blank line
+    for given, found in zip(wanted, actual):
+        if not given.strip():
+            continue
+        g, f = _indent(given), _indent(found)
+        this = ("", "") if g == f else (f[:len(f) - len(g)], "") if f.endswith(g) else \
+            ("", g[:len(g) - len(f)]) if g.endswith(f) else None
+        if this is None or (change is not None and this != change):
+            return None
+        change = this
+    added, removed = change or ("", "")
+
+    def shift(line: str) -> str:
+        if not line.strip():
+            return line
+        if removed and line.startswith(removed):
+            return line[len(removed):]
+        return added + line
+
+    start = sum(len(line) + 1 for line in lines[:first])
+    end = start + sum(len(line) + 1 for line in actual) - 1
+    if trailing and end < len(content):
+        end += 1
+    elif actual[-1].endswith("\r") and not wanted[-1].endswith("\r"):
+        end -= 1  # old_string stops before the line break, so the line keeps its CR
+    how = ("with its indentation corrected; new_string was shifted the same way" if added or removed
+           else "when trailing whitespace is ignored")
+    return start, end, "\n".join(shift(line) for line in new_string.split("\n")), how
+
+
+EDIT_EXCERPT_CONTEXT = 3
+EDIT_EXCERPT_MAX_LINES = 40
+ANCHOR_MATCH_LINES = 10
+
+
+def _anchor_help(content: str, old_string: str, matches: int) -> str:
+    """What the file holds where a failed anchor was aimed, so the retry needs no read.
+
+    A miss gets the closest numbered window; a wrong count gets each copy's line.
+    """
+    lines = [line.rstrip("\r") for line in content.split("\n")]
+    if matches:
+        starts, offset = [], content.find(old_string)
+        while offset != -1 and len(starts) < ANCHOR_MATCH_LINES:
+            starts.append(content.count("\n", 0, offset) + 1)
+            offset = content.find(old_string, offset + len(old_string))
+        if matches == 1:
+            return f"It occurs once, at line {starts[0]}: pass expected_occurrences=1 to replace that copy."
+        where = ", ".join(map(str, starts)) + (", …" if matches > len(starts) else "")
+        return (f"It occurs at lines {where}. Widen old_string with neighboring text until it is unique, "
+                f"or pass expected_occurrences={matches} to replace every copy.")
+    wanted = [line.strip() for line in (old_string or "").split("\n")]
+    probe = next((line for line in wanted if len(line) >= 4), "")
+    if not probe or not lines:
+        return "Copy the exact current text, including whitespace and indentation."
+    matcher = difflib.SequenceMatcher(autojunk=False)
+    matcher.set_seq2(probe)
+    best, score = 0, 0.0
+    for index, line in enumerate(lines):
+        matcher.set_seq1(line.strip())
+        if matcher.real_quick_ratio() > score and matcher.quick_ratio() > score:
+            ratio = matcher.ratio()
+            if ratio > score:
+                best, score = index, ratio
+    if score < 0.5:
+        return ("No similar text was found; the code may have moved or been removed. Search for it "
+                "rather than guessing the anchor again.")
+    offset = wanted.index(probe)
+    low = max(0, best - offset - EDIT_EXCERPT_CONTEXT)
+    high = min(len(lines), low + len(wanted) + 2 * EDIT_EXCERPT_CONTEXT)
+    window = "\n".join(f"{number:5d} | {lines[number - 1]}" for number in range(low + 1, high + 1))
+    return ("The closest current text is below; copy old_string from it exactly, including whitespace "
+            f"and indentation:\n{window}")
+
+
+def _edit_excerpt(content: str, offset: int, new_string: str, occurrences: int) -> str:
+    """The first replaced region as it now reads, numbered, with a little context."""
+    lines = [line.rstrip("\r") for line in content.split("\n")]
+    start = content.count("\n", 0, offset)
+    end = start + new_string.count("\n")
+    low, high = max(0, start - EDIT_EXCERPT_CONTEXT), min(len(lines), end + EDIT_EXCERPT_CONTEXT + 1)
+    numbered = [f"{number:5d} | {lines[number - 1]}" for number in range(low + 1, high + 1)]
+    if len(numbered) > EDIT_EXCERPT_MAX_LINES:
+        half = EDIT_EXCERPT_MAX_LINES // 2
+        numbered = numbered[:half] + ["  ... |"] + numbered[-half:]
+    note = f"\n[first of {occurrences} replacements shown]" if occurrences > 1 else ""
+    return "\n".join(numbered) + note
 
 
 def get_file_outline(app_name: str, path: str) -> str:
