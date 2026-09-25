@@ -685,7 +685,9 @@ def _app_file_exists(app_name: str, rel_path: str) -> bool:
     """True if rel_path resolves to a real file inside the app (best-effort)."""
     try:
         return os.path.isfile(agent_tools._resolve_path(app_name, rel_path))
-    except Exception:
+    except PermissionError:
+        raise
+    except (OSError, ValueError):
         return False
 
 
@@ -3226,30 +3228,11 @@ def review_node(state: dict) -> dict:
 
 
 def _get_bench_env() -> dict:
-    """Build a subprocess environment with the correct Node.js on PATH.
-    nvm installs Node under ~/.nvm/versions/node/<version>/bin but background
-    workers inherit a bare PATH that points to the system Node (v12).
-    This helper finds the nvm-managed Node and prepends it to PATH."""
-    env = os.environ.copy()
-    nvm_dir = env.get("NVM_DIR", os.path.expanduser("~/.nvm"))
-    versions_dir = os.path.join(nvm_dir, "versions", "node")
-    if os.path.isdir(versions_dir):
-        candidates = sorted(
-            (d for d in os.listdir(versions_dir) if d.startswith("v")),
-            reverse=True,
-        )
-        for ver in candidates:
-            bin_dir = os.path.join(versions_dir, ver, "bin")
-            node_bin = os.path.join(bin_dir, "node")
-            if os.path.isfile(node_bin):
-                env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
-                break
-    return env
+    """Use one Node environment for syntax, behavioral tests and bench commands."""
+    return agent_tools.command_environment()
 
 
-# ---------------------------------------------------------------------------
-# Conditional edge
-# ---------------------------------------------------------------------------
+# Conditional edge and checkpointing, for the session's execution graph
 
 def should_retry_implement(state: dict) -> str:
     if state.get("error") or state.get("review_stopped"):
