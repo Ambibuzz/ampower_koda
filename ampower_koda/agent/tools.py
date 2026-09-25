@@ -9,6 +9,9 @@ import sys
 import frappe
 
 from ampower_koda.agent.errors import log_agent_error
+from ampower_koda.agent.atomic import atomic_write, read_bytes
+from ampower_koda.agent import checkpoint
+from ampower_koda.agent.run_control import check_active
 from ampower_koda.agent.core.constants import CACHE_DIRECTORY
 from ampower_koda.agent.core.globs import compile_globs
 from ampower_koda.agent.javascript_validation import globals_configs, validate_javascript_names
@@ -34,6 +37,18 @@ def command_environment() -> dict:
                 env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
                 break
     return env
+
+
+def _write_source(app_name, full, content, original, *, exclusive=False):
+    path = os.path.relpath(full, os.path.realpath(_app_root(app_name))).replace("\\", "/")
+    def prepare():
+        check_active(reserve=5)
+        checkpoint.write_intent(
+            {path: original.decode("utf-8", errors="surrogateescape") if original is not None else None},
+            {path: content.decode("utf-8", errors="surrogateescape")})
+    atomic_write(full, content, expected=original, before_replace=prepare, exclusive=exclusive,
+                 on_temporary=lambda temporary: checkpoint.temporary_file(temporary, path))
+
 
 def _tool_error(tool: str, exc: Exception, message: str) -> str:
     log_agent_error(f"Agent Tool: {tool}", f"{exc}\n{frappe.get_traceback()}")
@@ -278,9 +293,8 @@ def write_file(app_name: str, path: str, content: str) -> str:
     """
     try:
         full = _resolve_path(app_name, path)
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(content)
+        original = read_bytes(full)
+        _write_source(app_name, full, content.encode("utf-8", errors="surrogateescape"), original)
         return f"WRITE_OK: Wrote {len(content)} chars to {path}"
     except Exception as ex:
         return _tool_error("write_file", ex, f"WRITE_FAILED: Error: {ex}")
