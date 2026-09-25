@@ -145,6 +145,7 @@ def start_agent(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status not in RESTARTABLE_STATUSES:
         _reconcile_if_dead(doc)
         if doc.status not in RESTARTABLE_STATUSES:
@@ -202,9 +203,12 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         frappe.throw(_("Follow-up message is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    if doc.status not in RESTARTABLE_STATUSES:
+    doc.check_permission("write")
+    # Delivered work waiting on its bench commands (or back from a failed build) can be refined too.
+    allowed = (*RESTARTABLE_STATUSES, "Awaiting Bench Approval")
+    if doc.status not in allowed:
         _reconcile_if_dead(doc)
-        if doc.status not in RESTARTABLE_STATUSES:
+        if doc.status not in allowed:
             frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
     if not (doc.branch_name or "").strip():
         frappe.throw(_("Follow-up fix needs an existing branch on this request."))
@@ -334,6 +338,7 @@ def reject_plan(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status != "Awaiting Approval":
         frappe.throw(_("Cannot reject. Agent status is {0}.").format(doc.status))
 
@@ -1218,6 +1223,7 @@ def cancel_agent_request(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status in ("Completed", "Failed", "Cancelled"):
         return {"status": "noop", "message": _("Request already finished.")}
 
