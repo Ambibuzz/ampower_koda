@@ -306,57 +306,134 @@ def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0, 
         return _tool_error("read_file", ex, f"Error: {ex}")
 
 
-def search_code(app_name: str, pattern: str, path: str = "") -> str:
-    """Search for a regex pattern in the codebase.
+SEARCH_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".vue", ".json", ".html", ".jinja",
+                   ".j2", ".md", ".txt", ".css", ".scss", ".less", ".sql", ".toml", ".cfg", ".ini", ".yml",
+                   ".yaml", ".xml")
+SEARCH_SKIP_SUFFIXES = (".min.js", ".min.css", ".bundle.js")
+SEARCH_MAX_FILE_BYTES = 2_000_000
+SEARCH_LINE_CHARS = 240
+SEARCH_MAX_CHARS = 20_000
+SEARCH_DEFAULT_LIMIT = {"files": 50, "content": 40}
+SEARCH_MAX_LIMIT = 200
+SEARCH_MAX_CONTEXT = 8
 
-    - pattern: A standard regex pattern to search for.
-    - path: Optional directory filter (relative to app root).
 
-    Returns matches with 3 lines of surrounding context and line numbers.
+def _search_files(app_name: str, root: str):
+    """(full, app-relative) searchable files under ``root``, a file or directory, in path order."""
+    app_root = os.path.realpath(_app_root(app_name))
+    if os.path.isfile(root):
+        yield root, os.path.relpath(root, app_root).replace(os.sep, "/")
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = _walked_dirs(dirpath, dirnames, app_root)
+        for name in sorted(filenames):
+            if not name.endswith(SEARCH_SUFFIXES) or name.endswith(SEARCH_SKIP_SUFFIXES):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(full) > SEARCH_MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            yield full, os.path.relpath(full, app_root).replace(os.sep, "/")
+
+
+def _read_lines(full: str) -> list[str] | None:
+    """A searched file's lines, or None, logged, when it cannot be read."""
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            return f.readlines()
+    except Exception as e:
+        log_agent_error("Agent Tool: search_code read", f"path={full}\n{e}\n{frappe.get_traceback()}")
+        return None
+
+
+def search_code(app_name: str, pattern: str, path: str = "", *, glob: str = "", output_mode: str = "",
+                context: int = 2, head_limit: int = 0) -> str:
+    """Search for a regular expression, case-insensitively, one line at a time.
+
+    ``output_mode`` defaults to "content" for one file and "files" (match counts) otherwise.
     """
     try:
-        root = _resolve_path(app_name, path) if path else _app_root(app_name)
-        if path and not os.path.isdir(root):
-            return f"Not a directory: {path}"
-        regex = re.compile(pattern, re.MULTILINE | re.IGNORECASE)
-        app_root = _app_root(app_name)
-        results = []
-        context_lines = 3
-        max_results = 80
+        root = _resolve_path(app_name, path) if path else os.path.realpath(_app_root(app_name))
+        if path and not os.path.exists(root):
+            return f"Not a file or directory: {path}"
+        note = ""
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as error:
+            regex = re.compile(re.escape(pattern), re.IGNORECASE)
+            note = f"[Not a valid regular expression ({error}); searched it as literal text.]\n"
+        mode = (output_mode or ("content" if os.path.isfile(root) else "files")).strip().lower()
+        if mode not in SEARCH_DEFAULT_LIMIT:
+            return "SEARCH_FAILED: output_mode is 'files' or 'content'."
+        limit = max(1, min(int(head_limit or 0) or SEARCH_DEFAULT_LIMIT[mode], SEARCH_MAX_LIMIT))
+        context = max(0, min(int(context or 0), SEARCH_MAX_CONTEXT))
+        within = _glob_matcher(glob) if os.path.isdir(root) else None
 
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in {
-                "__pycache__", "node_modules", ".git", ".eggs"
-            }]
-            for name in filenames:
-                if name.endswith((".py", ".js", ".json", ".html", ".md", ".txt", ".css")):
-                    full = os.path.join(dirpath, name)
-                    try:
-                        with open(full, "r", encoding="utf-8", errors="replace") as f:
-                            lines = f.readlines()
-                    except Exception as e:
-                        log_agent_error(
-                            "Agent Tool: search_code read",
-                            f"path={full}\n{e}\n{frappe.get_traceback()}",
-                        )
-                        continue
+        # found holds (full, relative, matching line indexes) only; rendered files are read again.
+        found, searched, excluded = [], 0, 0
+        for full, relative in _search_files(app_name, root):
+            if within is not None and within(os.path.relpath(full, root).replace(os.sep, "/")) is None:
+                excluded += 1
+                continue
+            searched += 1
+            hits = [i for i, line in enumerate(_read_lines(full) or ()) if regex.search(line)]
+            if hits:
+                found.append((full, relative, hits))
+        if not found:
+            if excluded and not searched:
+                return note + _glob_missed(glob, f"{excluded} searchable files under {path or 'the app'}")
+            return note + f"No matches for: {pattern}"
+        total = sum(len(hits) for _, _, hits in found)
 
-                    rel = os.path.relpath(full, app_root)
-                    for i, line in enumerate(lines):
-                        if regex.search(line):
-                            start = max(0, i - context_lines)
-                            end = min(len(lines), i + context_lines + 1)
-                            context = []
-                            for j in range(start, end):
-                                marker = ">>>" if j == i else "   "
-                                context.append(f"  {marker} {j + 1:4d} | {lines[j].rstrip()}")
-                            results.append(f"{rel}:{i + 1}\n" + "\n".join(context))
+        if mode == "files":
+            ranked = sorted(found, key=lambda item: (-len(item[2]), item[1]))
+            shown = ranked[:limit]
+            body = "\n".join(f"{relative} ({len(hits)})" for _, relative, hits in shown)
+            more = (f"\n… {len(ranked) - len(shown)} more files; narrow path or glob, or raise head_limit "
+                    f"(max {SEARCH_MAX_LIMIT})." if len(ranked) > len(shown) else "")
+            return (note + f"{len(found)} files, {total} matching lines. output_mode='content' shows the lines.\n"
+                    + body + more)
 
-                            if len(results) >= max_results:
-                                results.append(f"\n... (stopped at {max_results} matches)")
-                                return "\n\n".join(results)
-
-        return "\n\n".join(results) if results else f"No matches for: {pattern}"
+        blocks, shown, chars, remaining = [], 0, 0, limit
+        for full, relative, hits in found:
+            if remaining <= 0:
+                break
+            lines = _read_lines(full) or []
+            hits = [index for index in hits[:remaining] if index < len(lines)]
+            remaining -= len(hits)
+            windows = []  # [start, end, matched indexes], overlapping windows merged
+            for index in hits:
+                start, end = max(0, index - context), min(len(lines), index + context + 1)
+                if windows and start <= windows[-1][1]:
+                    windows[-1][1] = max(windows[-1][1], end)
+                    windows[-1][2].add(index)
+                else:
+                    windows.append([start, end, {index}])
+            for start, end, matched in windows:
+                rows = [f"{relative}:{min(matched) + 1}"]
+                for j in range(start, end):
+                    text = lines[j].rstrip()
+                    if len(text) > SEARCH_LINE_CHARS:
+                        text = text[:SEARCH_LINE_CHARS] + "…"
+                    rows.append(f"{'>' if j in matched else ' '}{j + 1:5d} | {text}")
+                block = "\n".join(rows)
+                if chars + len(block) > SEARCH_MAX_CHARS:
+                    if not blocks:  # the first window alone is over the cap: show the rows that fit
+                        fit, size = 1, len(rows[0])
+                        while fit < len(rows) and size + 1 + len(rows[fit]) <= SEARCH_MAX_CHARS:
+                            size, fit = size + 1 + len(rows[fit]), fit + 1
+                        blocks.append("\n".join(rows[:fit]))
+                        shown += len(matched.intersection(range(start, start + fit - 1)))
+                    remaining = 0
+                    break
+                blocks.append(block)
+                chars += len(block) + 2
+                shown += len(matched)
+        more = (f"\n\n… showing {shown} of {total} matching lines in {len(found)} files; narrow path or glob, "
+                "or use output_mode='files' to see where the rest are." if shown < total else "")
+        return note + "\n\n".join(blocks) + more
     except Exception as ex:
         return _tool_error("search_code", ex, f"Error: {ex}")
 
