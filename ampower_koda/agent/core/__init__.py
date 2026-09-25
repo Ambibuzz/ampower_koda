@@ -45,14 +45,7 @@ from .contracts import (
     iter_indexable_chunks,
 )
 from .elide import compact, hot_cold
-from .errors import (
-    CacheError,
-    ConfigError,
-    CoreError,
-    ParseError,
-    RedactedFileError,
-    WorkspaceError,
-)
+from .errors import ConfigError, CoreError, ParseError, WorkspaceError
 from .fold import SessionState, fold_turn
 from .graph import CodeGraph, build_graph, pagerank
 from .ledger import distil_into, record, record_read, rehydrate, render_ledger
@@ -64,14 +57,13 @@ from .tokens import estimate_tokens
 from .tools import TOOL_NAMES
 from .tools.run import NullHost, run_tool
 from .workingset import working_set_for
-from .workspace import LocalWorkspace, MemoryWorkspace, Workspace, text_workspace
+from .workspace import LocalWorkspace, Workspace
 
 __all__ = [
     "BlobRef",
     "Block",
     "Bootstrap",
     "CHARS_PER_TOKEN",
-    "CacheError",
     "CachePlan",
     "ChatModel",
     "Chunk",
@@ -90,7 +82,6 @@ __all__ = [
     "LedgerEntry",
     "LocalWorkspace",
     "MapBuild",
-    "MemoryWorkspace",
     "MirrorSet",
     "ModelRequest",
     "ModelTurn",
@@ -98,7 +89,6 @@ __all__ = [
     "Overlay",
     "ParseError",
     "ROLE_PROMPT",
-    "RedactedFileError",
     "Reference",
     "RepoMap",
     "RepoMemory",
@@ -154,6 +144,5 @@ __all__ = [
     "run_turn",
     "safe_cut_index",
     "search",
-    "text_workspace",
     "working_set_for",
 ]

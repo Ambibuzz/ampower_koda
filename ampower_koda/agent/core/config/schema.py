@@ -126,9 +126,8 @@ class SecurityConfig:
     """What never leaves the machine."""
 
     redact_globs: tuple[str, ...] = DEFAULT_REDACT_GLOBS
-    """Matched before a file is read for parsing. A redacted file is refused,
-    not reported absent — see
-    :class:`~ampower_koda.agent.core.errors.RedactedFileError`."""
+    """Matched before a file is read for parsing. A redacted file is skipped at
+    discovery and reported with reason ``redacted``, not silently absent."""
 
     def validate(self) -> None:
         if any(not glob.strip() for glob in self.redact_globs):
