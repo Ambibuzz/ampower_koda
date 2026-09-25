@@ -588,6 +588,89 @@ def get_plan_feedback_prompt(feedback: str, edited_plan_json: str = "") -> str:
     )
 
 
+APPROVAL_INSTRUCTIONS = (
+    "Implement every task of the approved plan in this conversation. What you read while investigating is "
+    "above and still current unless you change it: read again only what an edit needs. Tools that write "
+    "are available now; submit_plan is not."
+)
+
+#: For a plan executed without the investigation that produced it (one saved on the request).
+UNINVESTIGATED_APPROVAL_INSTRUCTIONS = (
+    "Implement every task of the approved plan in this conversation. The investigation behind this plan "
+    "is not in this conversation: read what each task needs before you edit it. Tools that write are "
+    "available now; submit_plan is not."
+)
+
+
+VERIFICATION_RULES = (
+    "Verify by running: call_method the changed endpoints and helpers against the live site to see real "
+    "results, then cover changed server logic with unittest test*.py under .koda/tests, run against the "
+    "live site with writes rolled back. Tests call the real production code: read existing records or "
+    "insert the ones a case needs inside the test, and patch only external services, never the module "
+    "under test (run_tests fails a test that does). Client JavaScript needs no test; add a Node "
+    "*.test.cjs only for pure data-in/data-out functions, never by stubbing jQuery, frappe or the "
+    "page's own methods. A test that passes is frozen: fix failures by repairing code and add a new test "
+    "for new behavior; do not edit frozen verification configuration or regression tests."
+)
+
+COMPLETION_REPORT_FORMAT = (
+    'Return ONLY a JSON completion report: {"status":"complete","summary":"Actual changes",'
+    '"behavior":["path:symbol, rule and concrete input/output example for what THIS task added or changed"],'
+    '"verification":["Checks actually performed, with outcomes"],"unverified":["Remaining uncertainty"]}. '
+    'Use status "blocked" if scope or missing information prevents completion. '
+    'List all unresolved work; do not claim complete after a forced call-limit summary. '
+    'Verification and unverified may be empty arrays; behavior must describe the completed contract. '
+    'This JSON format overrides any summary-format instructions above.'
+)
+
+
+def get_session_approval_prompt(plan_json: str, criteria: list[str], edited: bool, *,
+                                investigated: bool = True, request_name: str = None) -> str:
+    """Phase 2, appended to the same conversation once the user approves the plan.
+
+    An "Implement Prompt" override replaces the instructions; the plan, criteria and rules still follow.
+    """
+    changed = ("The user edited your plan before approving it; where it differs from what you submitted, "
+               "their version below is authoritative.\n" if edited else "")
+    instructions = get_config_prompt(
+        "implement_prompt", APPROVAL_INSTRUCTIONS if investigated else UNINVESTIGATED_APPROVAL_INSTRUCTIONS,
+        request_name)
+    return (
+        "## PLAN APPROVED — PHASE 2: IMPLEMENT\n" + changed + instructions + "\n\n"
+        "## APPROVED PLAN\n" + plan_json + "\n\n"
+        "## ACCEPTANCE CRITERIA\n" + "\n".join(f"{i}. {c}" for i, c in enumerate(criteria, 1)) + "\n\n"
+        + VERIFICATION_RULES + "\n\n" + COMPLETION_REPORT_FORMAT
+    )
+
+
+def get_session_implemented_plan_prompt(plan_json: str) -> str:
+    """Before a follow-up on a request whose implementation conversation was not kept."""
+    return (
+        "## APPROVED PLAN, ALREADY IMPLEMENTED\nAn earlier run implemented this plan on the current branch; "
+        "its conversation is not available. Read the current source of anything you change. Tools that "
+        "write are available now; submit_plan is not.\n\n" + plan_json + "\n\n"
+        + VERIFICATION_RULES + "\n\n" + COMPLETION_REPORT_FORMAT
+    )
+
+
+FOLLOW_UP_PROMPT = """## FOLLOW-UP FROM THE USER
+{follow_up_message}
+
+The user tested your implementation and asks for this. Change only what it needs: reproduce it
+first where you can (call_method against the live site), make the smallest fix, and run it again.
+Files may have changed since your last turn, so read the current source of anything you edit. End
+with the JSON completion report, describing only this follow-up."""
+
+
+def get_session_follow_up_prompt(follow_up_message: str, request_name: str = None) -> str:
+    """A follow-up is the user's next message in the request's conversation, not a new run.
+
+    A request's "Follow-up Prompt" override replaces it.
+    """
+    template = get_config_prompt("follow_up_prompt", FOLLOW_UP_PROMPT, request_name)
+    return render_prompt_safe(template, {"follow_up_message": follow_up_message}, FOLLOW_UP_PROMPT)
+
+
 EXPLORE_PROMPT = """## QUESTION FROM THE MAIN AGENT
 {question}
 
