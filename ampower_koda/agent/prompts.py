@@ -496,33 +496,24 @@ def get_explore_prompt(question: str, request_name: str = None) -> str:
     return render_prompt_safe(template, {"question": question}, EXPLORE_PROMPT)
 
 
-def get_review_prompt(edits_made: list[dict], user_message: str, request_name: str = None) -> str:
-    """Prompt for the test stage focused on clean code + Frappe standards."""
+def get_review_prompt(edits_made: list[dict], request_name: str = None) -> str:
+    """The reviewer's task; the request itself travels in the shared request context before it."""
     paths = [e.get("path", "") for e in edits_made if e.get("path")]
     paths_list = "\n".join(f"- {p}" for p in paths) if paths else "(no specific paths recorded)"
 
-    default = """## USER REQUEST
-{user_message_short}
-
-## FILES TO REVIEW
+    default = """## FILES TO REVIEW
 {paths_list}
 
-Review the supplied task contract against the actual changes and current source.
-Inspect related definitions, schemas, callers and dependencies when needed to
-verify behavior. Use focused reads and searches. Check business logic, permissions,
-client/server contracts and Frappe conventions. Prioritize concrete defects and
-missing acceptance criteria; avoid stylistic preferences unrelated to the task.
-
-Mechanical checks are provided separately. They do not prove behavioral correctness.
-Do not claim tests were executed unless a test result is supplied. You cannot run a
-browser, server or test suite here: judge runtime and UI criteria from the source
-path that produces the behavior, and state in the evidence that the runtime was not
-exercised, rather than withholding a verdict. The execution contract below specifies
-the required verdict and per-criterion evidence format.
+Review the task contract against the actual changes and current source. Look for
+what would make the request fail for its user: business logic, wrong data, permissions,
+client/server contracts, Frappe conventions. Run the changed code with call_method
+against the live site rather than reasoning about what it would return. Mechanical
+checks and test receipts are provided separately; a green test that mocks the
+behavior under test is not evidence. Never claim an unexecuted behavior was tested.
+CURRENT CHANGE EVIDENCE is a diff of the changes (a small new file appears whole); read the
+current source around a change when a finding depends on it, and the reference files the task
+compares against.
+The review contract below specifies severities and the verdict format.
 """
     template = get_config_prompt("review_prompt", default, request_name)
-    context = {
-        "user_message_short": user_message or "",
-        "paths_list": paths_list,
-    }
-    return render_prompt_safe(template, context, default)
+    return render_prompt_safe(template, {"paths_list": paths_list}, default)

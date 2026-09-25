@@ -15,7 +15,6 @@ from ampower_koda.agent.execution_contract import load_plan
 from ampower_koda.agent.graph import (
     _get_bench_env,
     _message_content_to_str,
-    build_execution_graph,
 )
 from ampower_koda.agent import session as koda_session
 from ampower_koda.agent import verification
@@ -468,7 +467,8 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         repo_root = get_repo_root(app_name)
         worktree_before = worktree_signature(repo_root) if is_follow_up_mode else ""
 
-        graph = build_execution_graph()
+        # The request's session: its investigation, then its implementation and follow-ups.
+        graph = koda_session.build_execution_graph()
         initial = {
             "user_message": doc.user_message or "",
             "request_type": doc.request_type or "Improvement",
@@ -479,7 +479,6 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
             "ai_provider": config["ai_provider"],
             "ai_model": config["ai_model"],
             "github_repo_url": config["github_repo_url"],
-            "github_token": config["github_token"],
             "base_branch": config["base_branch"],
             "branch_prefix": config["branch_prefix"],
             "git_user_name": config["git_user_name"],
@@ -510,7 +509,8 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         # Notes the model leaves behind (IMPLEMENTATION_DONE.md, notes.txt) never
         # belong in a patch. Only untracked .md/.txt files go, and never one the
         # approved plan names, so a reviewed patches.txt or README survives.
-        planned = {path for task in plan_object["tasks"] for path in task["files"]}
+        executed_plan = final_state.get("plan_object") or plan_object
+        planned = {path for task in executed_plan["tasks"] for path in task["files"]}
         stripped = _strip_stray_notes(repo_root, keep=planned)
         if stripped:
             _update_status(request_name, user, "Implementing",

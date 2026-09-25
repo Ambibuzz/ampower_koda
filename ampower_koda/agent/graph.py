@@ -39,12 +39,14 @@ from ampower_koda.agent.plan_contract import (
     MAX_PLAN_TASKS,
     PLAN_JSON_SCHEMA,
     PlanValidationError,
+    complete_rename_file_scope,
     nearest_paths,
     plan_to_markdown,
+    validate_plan,
 )
-from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, run_task_checks, CheckResult, HealthReport
+from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, CheckResult, HealthReport
 from ampower_koda.agent.execution_contract import (
-    load_plan, read_snapshot, change_evidence, review_verdict, review_decision, completion_report, completion_report_problem, revision,
+    load_plan, read_snapshot, change_evidence, review_verdict, review_decision, completion_report, completion_report_problem, revision, renamed_sources,
 )
 from ampower_koda.agent.execution_evidence import source_context, SourceMemory
 from ampower_koda.agent.prompts import (
@@ -56,19 +58,24 @@ from ampower_koda.agent.prompts import (
 
 
 from ampower_koda.agent.history_prune import describe_call, prune_price, prune_rounds
-MAX_TOOL_ROUNDS_EXECUTION = 18
+# Runaway guards, not work units: a turn ends when the model reports, and the
+# request-wide call budget bounds the whole run.
+MAX_TOOL_ROUNDS_EXECUTION = 60
 MAX_TOOL_ROUNDS_REPAIR = 8        # a retry continues from current source with a remaining-work list
 MIN_REPAIR_ROUNDS = 30            # a pass with fewer calls left than this first extends the budget
-MAX_TOOL_ROUNDS_REVIEW = 6
-MAX_TOOL_ROUNDS_REVIEW_RECOVERY = 4  # continues the first pass's history, so these are new reads only
-MAX_REVIEW_ATTEMPTS = 2           # per task and for final integration
+MAX_TOOL_ROUNDS_REVIEW = 12       # includes live call_method checks, not only reads
+MAX_TOOL_ROUNDS_REVIEW_RECOVERY = 6  # continues the first pass's history, so these are new reads only
+# Review repairs stop on *no progress*, not on a magic attempt count. The
+# total call budget remains the safety fence for genuinely novel findings.
+MAX_REVIEW_ATTEMPTS = 2           # failed reviews of a repeated state before strategy changes
 MAX_REPAIR_STRATEGIES = 2         # fresh diagnoses before a repeated failure may stop
-BASE_EXECUTION_CALL_BUDGET = 18
-# A task must be able to afford one full implementation turn and one repair
-# turn, each with its forced final call. The old value of 10 left a one-task
-# plan 11 rounds for the first attempt and none for the retry.
-PER_TASK_CALL_BUDGET = (MAX_TOOL_ROUNDS_EXECUTION + 1) + (MAX_TOOL_ROUNDS_REPAIR + 1)
-FINAL_REVIEW_RESERVE = 16  # review (7), evidence recovery (5), repair/re-review minimum (4)
+# Retain review reads/deltas across repairs, then refresh from current source so
+# an indefinitely recoverable run cannot accumulate an indefinitely large tail.
+REVIEW_HISTORY_RECHECKS = 4
+MAX_REVIEW_RECHECKS = 2           # source changed while being reviewed; take a fresh bounded snapshot
+BASE_EXECUTION_CALL_BUDGET = 56   # includes room for diagnosis and re-testing
+# Each plan task adds room for two full implementation turns, each with its forced final call.
+PER_TASK_CALL_BUDGET = 2 * (MAX_TOOL_ROUNDS_EXECUTION + 1)
 # One repair must leave room for the reviewer's normal pass and its bounded
 # evidence-recovery pass, including each forced conclusion call.
 REPAIR_REVIEW_RESERVE = (MAX_TOOL_ROUNDS_REVIEW + 1) + (MAX_TOOL_ROUNDS_REVIEW_RECOVERY + 1)
@@ -2354,8 +2361,9 @@ def _persist_execution_plan(request_name: str, plan: dict) -> None:
 
 
 def prepare_execution_node(state: dict) -> dict:
-    """Freeze the validated contract once, before any task writes."""
+    """Freeze the validated contract once, before any write: the session implements the whole plan."""
     try:
+        scope_repairs = []
         if state.get("is_follow_up"):
             plan = load_plan(state.get("plan_object"))
             tasks = [{
@@ -2367,30 +2375,51 @@ def prepare_execution_node(state: dict) -> dict:
                 "depends_on": [],
             }]
         else:
-            plan = load_plan(state.get("plan_object"))
+            app_name = state["target_app_name"]
+            exists = lambda p: _app_file_exists(app_name, p)
+            approved = load_plan(state.get("plan_object"))
+            completed = complete_rename_file_scope(approved, exists, app_name=app_name)
+            plan = validate_plan(completed.plan)
+            scope_repairs = list(completed.repairs)
+            if scope_repairs:
+                _persist_execution_plan(state.get("request_name", ""), plan)
+                _publish_agent_log(state.get("request_name", ""), "llm_response", round=0,
+                                   preview="Approved rename scope completed before execution: " + "; ".join(scope_repairs))
             tasks = plan["tasks"]
         return {
-            "plan_object": plan, "execution_tasks": tasks, "task_index": 0,
-            "task_results": [], "task_baseline": {}, "execution_baseline": {},
+            "plan_object": plan, "execution_tasks": tasks,
+            "task_results": [], "execution_baseline": {},
+            "file_moves": list(state.get("prior_file_moves") or []) if state.get("is_follow_up") else [], "plan_amendments": 0,
+            "copied_files": {}, "test_repair_rounds": 0,
+            "plan_scope_repairs": scope_repairs,
             "task_completion": {}, "turn_exhausted": False,
             "review_attempts": 0, "review_notes": "", "review_passed": False,
-            "integration_mode": False, "tool_rounds_used": 0,
+            "review_fingerprint": "", "review_fingerprints_seen": [],
+            "review_failure_fingerprints_seen": [],
+            "repair_strategy_level": 0, "review_format_retries": 0,
+            "verification_contract": _prepare_verification_contract({**state, "execution_tasks": tasks}),
+            "verification_receipts": [],
+            "review_repairable": False, "review_retry_requested": False, "review_rechecks": 0,
+            "review_history": {},
+            "tool_rounds_used": 0,
             "tool_rounds_limit": BASE_EXECUTION_CALL_BUDGET + PER_TASK_CALL_BUDGET * len(tasks),
+            'automatic_repair_budget_enabled': True, 'automatic_repair_budget_grants': 0,
+            'verification_progress': {},
         }
     except Exception as exc:
         return {"error": str(exc)}
 
 
 def _execution_context(state: dict) -> tuple[dict, list[str], list[str] | None]:
+    """The whole plan as one unit, every task's acceptance criteria, and the paths the plan names.
+
+    The paths seed the before/after baseline the reviewer reads; they do not
+    bound what the implementer may write.
+    """
     tasks = state["execution_tasks"]
-    if state.get("integration_mode"):
-        active = {"id": "INTEGRATION", "tasks": tasks}
-        criteria = [f"{t['id']}: {c}" for t in tasks for c in t["acceptance_criteria"]]
-        paths = list(dict.fromkeys(p for t in tasks for p in t["files"]))
-    else:
-        active = tasks[state["task_index"]]
-        criteria = active["acceptance_criteria"]
-        paths = active["files"]
+    active = {"id": "PLAN", "tasks": tasks}
+    criteria = [f"{t['id']}: {c}" for t in tasks for c in t["acceptance_criteria"]]
+    paths = list(dict.fromkeys(p for t in tasks for p in t["files"]))
     return active, criteria, None if state.get("is_follow_up") else paths
 
 
@@ -2513,10 +2542,14 @@ def _read_current(state: dict, path: str):
 def _persist_task_results(state: dict):
     """Persist audit results, not a claim that filesystem writes are replayable."""
     if state.get("request_name"):
-        frappe.db.set_value(DOCTYPE_NAME, state["request_name"], "execution_results", json.dumps({
+        set_request_value(state["request_name"], "execution_results", json.dumps({
             "tasks": state.get("task_results", []),
-            "final_review_passed": bool((state.get("integration_mode") or state.get("is_follow_up")) and state.get("review_passed")),
+            "file_moves": state.get("file_moves", []),
+            "plan_scope_repairs": state.get("plan_scope_repairs", []),
+            "final_review_passed": bool(state.get("review_passed")),
             "review_notes": state.get("review_notes", ""),
+            "verification_receipts": state.get("verification_receipts", []),
+            "repair_strategy_level": state.get("repair_strategy_level", 0),
             "model_calls": state.get("tool_rounds_used", 0),
             "error": state.get("error", ""),
         }, ensure_ascii=True))
@@ -2706,177 +2739,213 @@ def _prepare_verification_contract(state: dict) -> dict:
 
 
 def review_node(state: dict) -> dict:
-    """Gate completed tasks; independently review no-ops and final integration."""
+    """Check the whole implementation, run its tests, then review it in an independent context."""
     if state.get("error"):
         _persist_task_results(state)
         return {"error": state["error"]}
+    if state.get("review_stopped"):
+        return {}  # repair stopped (its call budget ran out); the last review's findings stand
     active, criteria, allowed = _execution_context(state)
-    integration = bool(state.get("integration_mode"))
-    logs = _log_stage(state, "Reviewing", "started", f"Reviewing {active['id']}")
-    baseline = state.get("execution_baseline") if integration else state.get("task_baseline")
-    changes, diff = change_evidence(baseline or {}, lambda p: _read_current(state, p))
-    paths = list(dict.fromkeys((allowed or []) + [e["path"] for e in changes]))
+    logs = _log_stage(state, "Reviewing", "started", "Reviewing the changes")
+    baseline = state.get("execution_baseline") or {}
+    changes, diff = change_evidence(baseline, lambda p: _read_current(state, p))
+    changed_paths = [e["path"] for e in changes]
+    paths = _integration_neighbor_paths(
+        state, list(dict.fromkeys(_review_paths(state, allowed) + changed_paths)), changed_paths)
     reviewed_content = {p: _read_current(state, p) for p in paths}
-    # Task-local checks must not reject temporarily incomplete cross-task wiring.
-    if integration or state.get("is_follow_up"):
-        health = run_health_checks(state["target_app_name"], [{"path": p} for p in paths])
-    else:
-        health = run_task_checks(state["target_app_name"], paths)
+    moved = renamed_sources(state.get("file_moves") or [], lambda p: _read_current(state, p))
+    deletions = _approved_deletions(state)
+    prior_deleted = set(state.get("prior_deleted_paths") or []) if state.get("is_follow_up") else set()
+    # A task's files are a starting point, so a path the plan named but the work
+    # did not need is not a defect — only a path that was actually written, or
+    # that exists, is checked.
+    check_paths = [p for p in paths if p not in moved and p not in deletions
+                   and reviewed_content.get(p) is not None
+                   and not (p in prior_deleted and reviewed_content.get(p) is None)]
+    health = run_health_checks(state["target_app_name"], [{"path": p} for p in check_paths])
     health.results.extend(
-        CheckResult(f"exists:{p}", False, "Approved task file is missing")
-        for p in paths if not _app_file_exists(state["target_app_name"], p)
+        CheckResult(f"exists:{p}", False, "A file this task changed is missing")
+        for p in changed_paths
+        if p not in moved and p not in deletions and p not in prior_deleted
+        and not _app_file_exists(state["target_app_name"], p)
     )
+    health.results.extend(CheckResult(f"deleted:{p}", reviewed_content.get(p) is None,
+                                      "Approved DELETE path must be absent") for p in deletions)
     attempt = state.get("review_attempts", 0) + 1
-    updates = {}
+    updates = {"review_repairable": False, "review_retry_requested": False}
+
+    def halted() -> bool:
+        """Repair stopped: the work goes out with its findings as warnings."""
+        return bool(updates.get("review_stopped"))
+
     completion = completion_report(json.dumps(state.get("task_completion") or {}))
-    gate_only = False
-    if not health.passed:
-        passed, notes = False, health.summary()
-    elif state.get("turn_exhausted"):
-        passed, notes = False, "Implementation reached its call limit without finishing. Inspect current changes and complete the active task."
+    # The implementer's own report, for the reviewer to verify rather than trust.
+    claims = [{"task_id": active["id"], **completion}]
+    if health.passed:
+        contract = state.get("verification_contract")
+        if contract is None:  # no implementation turn prepared one
+            contract = _prepare_verification_contract(state)
+        updates["verification_contract"] = contract
+        required = verification.needs_tests(
+            [*check_paths, *changed_paths, *(state.get("prior_changed_paths") or [])])
+        # The host owns re-testing every coherent repair; a blocked/unfinished
+        # model report must not postpone this until the call budget has run out.
+        test_health, receipts = verification.run_verification(
+            state["target_app_name"], contract, env=_get_bench_env(), required=required,
+        )
+        health.results.extend(test_health.results)
+        for receipt in receipts:
+            receipt["source_revisions"] = {p: revision(content) for p, content in reviewed_content.items()}
+        updates["verification_receipts"] = receipts
+        updates['verification_progress'] = repair_budget.observe(state.get('verification_progress'), test_health, receipts)
+    if state.get("turn_exhausted") and completion.get("status") == "complete":
+        # The turn boundary is not a correctness verdict. A complete report
+        # still goes through the mandatory checks and independent final review.
+        updates["turn_exhausted"] = False
+    test_repairs = int(state.get("test_repair_rounds") or 0)
+    if health.environment_failures:
+        passed, notes = False, (
+            "Review could not access the required source/checker environment; code repair is not the owner: "
+            + health.summary()
+        )
+        updates["review_stopped"] = notes
+    elif state.get("turn_exhausted") and completion.get("status") != "complete":
+        # Unfinished, not failed: the continuation gets what is left and every
+        # check result, and a check it has not reached yet is not a stall.
+        passed, notes = False, "Implementation reached its call limit without finishing. Inspect current changes and complete the plan."
+        updates["review_repairable"] = True
         # A blocked report from the forced final call says what is left; hand
         # it to the retry instead of making it rediscover the state.
         remaining = [completion.get("summary", "")] + list(completion.get("unverified") or [])
         remaining = [item for item in remaining if isinstance(item, str) and item.strip()]
         if completion.get("status") == "blocked" and remaining:
             notes += " Reported remaining work: " + " | ".join(remaining)[:1500]
-    elif (not integration or state.get("review_attempts", 0) > 0) and completion.get("status") != "complete":
+        notes += "\nChecks already executed against the current files:\n" + health.summary()
+    elif any(result.name.startswith('tests:') for result in health.failures):
+        # An older completion report may claim testing was blocked. Freshly
+        # executed failing cases are stronger evidence: repair those cases,
+        # rather than sending a now-stale testing blocker back to the planner.
+        passed, notes = False, health.summary()
+        updates["review_repairable"] = True
+        updates["test_repair_rounds"] = test_repairs + 1
+    elif completion.get("status") == "blocked":  # an exhausted turn took the branch above
+        passed = False
+        notes = f"Implementation blocked: {completion['summary']}"
+        updates["review_repairable"] = True
+        if not health.passed:
+            notes += " Current checks: " + health.summary()
+    elif not health.passed:
+        passed, notes = False, health.summary()
+        updates["review_repairable"] = True
+    elif (state.get("review_attempts", 0) > 0
+          and not state.get("review_retry_requested")
+          and completion.get("status") != "complete"):
         passed, notes = False, "Implementation did not return a valid complete JSON report. Finish the task and report its behavior and verification."
-        if completion.get("status") == "blocked":
-            notes = "Implementation blocked: " + completion["summary"]
-            updates["error"] = notes
-    elif not integration and not state.get("is_follow_up") and changes:
-        # Completion + mechanical checks gate dependency progress. Semantic
-        # correctness is deliberately deferred, never recorded as reviewed.
-        gate_only = True
-        passed, notes = True, "Task completion and static checks passed; semantic review pending final integration."
+        updates["review_repairable"] = True
     else:
-        prompt = get_review_prompt(
-            [{"path": p} for p in paths], state.get("follow_up_message") or state.get("user_message", ""),
-            request_name=state.get("request_name"),
-        )
+        # _run_agent_turn sends the shared request context as its own message.
+        prompt = get_review_prompt([{"path": p} for p in paths], request_name=state.get("request_name"))
         prompt += "\n\n## REVIEW CONTRACT (authoritative)\n" + json.dumps({
-            "phase": "final integration" if integration else "task review (including no-op verification)",
-            "active_task": active,
+            "phase": "final review of the whole plan",
             "criteria": [{"criterion": i, "requirement": c} for i, c in enumerate(criteria, 1)],
-            "implementation_claims": state.get("task_results", []) if integration else [completion],
-            "remaining_tasks": [] if integration else [
-                {key: task[key] for key in ("id", "goal", "files", "acceptance_criteria", "depends_on")}
-                for task in state["execution_tasks"][state["task_index"] + 1:]
-            ],
+            "implementation_claims": _compact_execution_results(claims),
         }, ensure_ascii=True)
-        prompt += "\n\n## ACTUAL CHANGES\n" + diff
-        prompt += "\n\n## CURRENT SOURCE EVIDENCE\n" + source_context(paths, reviewed_content.get, baseline)
-        prompt += "\n\n## STATIC CHECKS\n" + health.summary()
-        prompt += (
-            "\nInspect current source and relevant dependencies to assess every criterion. "
-            "A task review covers this task's obligations; wiring assigned to a remaining task "
-            "is checked at integration. Final integration must inspect interactions and recheck "
-            "earlier criteria against final source. Trace connected behavior through callers, "
-            "document lifecycle/persistence, queries and consumers where relevant; isolated function "
-            "checks do not establish the connected result. Compare shared algorithms and concrete "
-            "input/output examples across languages. Do not invent requirements outside the approved scope. "
-            "Static checks do not prove runtime behavior. Evidence must cite current paths/symbols "
-            "and distinguish source inspection from executed tests. Implementation claims are not proof. "
-            "Truncated excerpts or missing context are requests to use your read-only tools, not code defects. "
-            "You cannot run a browser, a server or a test suite here. Criteria about runtime, UI or "
-            "interaction behavior are judged by tracing the source path that produces that behavior: "
-            'mark them "satisfied" or "unmet" from that trace and say in the evidence text that the runtime '
-            "was not exercised. Never fail a criterion only because no live test or screenshot was supplied. "
-            'Return ONLY JSON: {"review_passed":true,"issues":[],"evidence":'
-            '[{"criterion":1,"status":"satisfied","evidence":"path:symbol and concrete evidence"}]}. '
-            'Include exactly one entry per numbered criterion. Use status "unmet" with actionable issues '
-            'for an observed defect. Use "unverified" only for current source your read-only tools can '
-            "still fetch and you have not read yet; it is never the answer for behavior that cannot be "
-            "executed in this environment. Either requires review_passed false. First fetch missing "
-            "source with tools. Do not ask implementation to change code merely because you lack evidence."
-        )
-        decision, notes = "invalid", ""
-        prior_unmet = set()
-        # The recovery pass continues the first pass's retained tool rounds, so
-        # its smaller round budget is spent on reads that have not happened yet.
-        history: dict = {}
-        for recovery in range(2):
-            updates = _run_agent_turn(
-                {**state, **updates}, "Reviewing", prompt, read_only_tools=True,
-                max_rounds=MAX_TOOL_ROUNDS_REVIEW if recovery == 0 else MAX_TOOL_ROUNDS_REVIEW_RECOVERY,
-                history=history,
+        # Changed paths go in only as their diff; hashes bind every reviewed path,
+        # and omitted source stays reachable through the read tools.
+        prompt += "\n\n## CURRENT CHANGE EVIDENCE\n" + diff
+        unchanged_paths = [path for path in paths if path not in set(changed_paths)]
+        if unchanged_paths:
+            # No-op/follow-up review still needs actual source, while changed
+            # paths must not be duplicated beside their diff.
+            prompt += "\n\n## UNCHANGED SOURCE EVIDENCE\n" + source_context(
+                unchanged_paths, reviewed_content.get, baseline, limit=8000
             )
-            updates.pop("_write_baseline", None)
-            updates.pop("_tool_edited_paths", None)
-            steps = updates.get("intermediate_steps") or []
-            output = steps[-1].get("output", "") if steps else ""
-            payload = _extract_review_json(output)
-            decision, notes = review_decision(payload, criteria)
-            if prior_unmet and decision != "invalid":
-                now_satisfied = {e["criterion"] for e in payload["evidence"] if e["status"] == "satisfied"}
-                resolved = payload.get("resolved_findings", [])
-                valid_resolutions = isinstance(resolved, list) and all(
-                    isinstance(item, dict) and type(item.get("criterion")) is int
-                    and isinstance(item.get("explanation"), str) and item["explanation"].strip()
-                    for item in resolved
-                )
-                resolved_ids = {item["criterion"] for item in resolved} if valid_resolutions else set()
-                if (prior_unmet & now_satisfied) - resolved_ids:
-                    decision, notes = "invalid", "Invalid review result: earlier concrete findings need explicit resolution evidence."
-            if updates.get("turn_exhausted") and not updates.get("error") and decision in {"pass", "repair"}:
-                # The forced no-tools final call still produced a complete,
-                # well-formed verdict. Reaching the round cap is not a reason
-                # to discard it; only an incomplete or invalid verdict is.
-                updates["turn_exhausted"] = False
-                _publish_agent_log(state.get("request_name", ""), "review_verdict_after_cap",
-                                   decision=decision, recovery=recovery)
-            if updates.get("error") or updates.get("turn_exhausted"):
-                notes = updates.get("error") or "Reviewer exhausted its call limit; verification is incomplete."
-                updates["error"] = notes
-                decision = "needs_evidence"
-                break
-            if decision not in {"invalid", "needs_evidence"}:
-                break
-            if recovery == 0:
-                entries = payload.get("evidence", []) if isinstance(payload, dict) else []
-                # A malformed envelope may still contain a valid concrete finding.
-                prior_unmet = {e["criterion"] for e in entries if isinstance(e, dict)
-                    and type(e.get("criterion")) is int and 1 <= e["criterion"] <= len(criteria)
-                    and e.get("status") == "unmet"} if isinstance(entries, list) else set()
-                prompt += (
-                    "\n\n## REVIEWER RECOVERY\n"
-                    "Your previous verdict needs evidence or format correction. The tool results from "
-                    "your first pass are retained in this conversation; do not re-read them. Use read-only "
-                    "tools only for current source you have not fetched yet, preserve all concrete findings, "
-                    "then return the complete verdict. Runtime, UI or interaction criteria are judged from "
-                    "the source trace, never left unverified for lack of a live test. "
-                    "Do not send missing evidence to implementation. "
-                    'If any earlier unmet criterion becomes satisfied, include resolved_findings '
-                    '[{"criterion":1,"explanation":"Current source evidence resolving the earlier finding"}]. '
-                    "Every concrete finding must remain or be explicitly resolved.\n"
-                    + output
-                )
-        passed = decision == "pass" and not updates.get("error")
-        if decision in {"invalid", "needs_evidence"} and not updates.get("error"):
-            updates["error"] = "Reviewer could not resolve " + (
-                "missing evidence" if decision == "needs_evidence" else "invalid verdict format"
-            ) + " after a read-only recovery attempt."
-    if passed and any(_read_current(state, p) != content for p, content in reviewed_content.items()):
-        passed, notes = False, "Files changed during review. Verify current source again before accepting this task."
-        updates["error"] = notes
+        prompt += "\n\n## SOURCE REVISION MANIFEST\n" + json.dumps({
+            path: revision(reviewed_content.get(path)) for path in paths
+        }, ensure_ascii=True)
+        prompt += "\n\n## STATIC CHECKS\n" + health.summary()
+        prompt += "\n\n## EXECUTED BEHAVIORAL CHECKS\n" + json.dumps(
+            updates.get("verification_receipts", []), ensure_ascii=True)
+        prompt += (
+            "\nAssess every criterion against current source. Behavior is proven by running it: use "
+            "call_method to run the changed endpoints and helpers against the live site (database writes are "
+            "rolled back), and read the executed test receipts and their source. Python tests run against the live "
+            "site; a test that mocks the behavior under test proves nothing. Implementation claims are not "
+            "proof. Do not invent requirements outside the approved scope. For a copy or adaptation, the "
+            "reference is part of the specification: before marking a criterion unmet, check what the reference "
+            "does. Behavior the plan does not name as a change or a fix is correct when the change does what the "
+            "reference does, even where a criterion's wording seems stricter; record that conflict as P2, never "
+            "P0/P1. Missing or truncated context is a reason to use your tools, not a defect.\n"
+            "Rank each issue: P0 the request does not work (crash, wrong data, broken page); P1 a criterion "
+            "is not met in real use or a regression; P2 an edge case, missing test for working behavior, "
+            "or a better design; P3 style. Only P0/P1 send the task back; P2/P3 are recorded and pass. "
+            "Client/UI behavior is verified by reading its source and wiring; never require a Node test for "
+            "it. Name a test file in an issue only when that test itself is wrong. "
+            'Return ONLY JSON: {"review_passed":true,"issues":[{"criterion":1,"severity":"P1",'
+            '"issue":"what fails, the concrete input and the observed vs expected result"}],"evidence":'
+            '[{"criterion":1,"status":"satisfied","evidence":"path:symbol and what you ran or read"}]}. '
+            'Include exactly one evidence entry per numbered criterion. "unmet" needs a P0/P1 issue; mark a '
+            'criterion with only P2/P3 issues "satisfied". Use "unverified" only for evidence your tools can '
+            "still fetch; get it first. review_passed is false exactly when a P0/P1 issue or an unverified "
+            "criterion remains."
+        )
+        history = {"task_prompt": prompt}
+        turn_updates = _run_agent_turn(
+            {**state, **updates}, "Reviewing", prompt, read_only_tools=True,
+            max_rounds=MAX_TOOL_ROUNDS_REVIEW, history=history,
+        )
+        updates.update(turn_updates)
+        updates.pop("_write_baseline", None)
+        updates.pop("_tool_edited_paths", None)
+        updates.pop("_file_moves", None)
+        turn_error = updates.pop("error", None)
+        steps = updates.get("intermediate_steps") or []
+        output = steps[-1].get("output", "") if steps else ""
+        decision, notes = review_decision(_extract_review_json(output), criteria)
+        if updates.get("review_stopped"):
+            notes = str(state.get("review_notes") or "")  # the last findings go out with the warning
+        elif turn_error or updates.get("turn_exhausted"):
+            notes = turn_error or "Reviewer exhausted its call limit; verification is incomplete."
+            updates["turn_exhausted"] = False
+            decision = "needs_evidence"
+        passed = decision == "pass" and not halted()
+        if decision == "repair" and not halted():
+            updates["review_repairable"] = True
+            # A test the reviewer calls wrong must be correctable; every other
+            # green test stays frozen.
+            contract = dict(updates.get("verification_contract") or state.get("verification_contract") or {})
+            contract["frozen_tests"] = dict(contract.get("frozen_tests") or {})
+            if verification.release_frozen(contract, notes):
+                updates["verification_contract"] = contract
+        if decision in {"invalid", "needs_evidence"} and not halted():
+            retries = int(state.get("review_format_retries", 0) or 0)
+            if retries < MAX_REVIEW_RECHECKS:
+                updates.update(review_retry_requested=True, review_format_retries=retries + 1,
+                               review_history={})
+                attempt = int(state.get("review_attempts", 0) or 0)
+                notes = "Reviewer evidence/format recovery needed: " + notes
+            else:
+                updates["review_stopped"] = "The independent review could not reach a verdict (" + (
+                    "missing evidence" if decision == "needs_evidence" else "invalid verdict format"
+                ) + ") after recovery and two fresh review attempts: " + notes[:1500]
+        elif decision in {"pass", "repair"}:
+            updates["review_format_retries"] = 0
     updates.update({"review_passed": passed, "review_notes": notes, "review_attempts": attempt})
-    if not passed and attempt >= MAX_REVIEW_ATTEMPTS and not updates.get("error"):
-        updates["error"] = f"{active['id']} failed review after {attempt} attempts: {notes[:1000]}"
     results = list(state.get("task_results") or [])
     result = {
-        "task_id": active["id"], "status": ("implemented" if gate_only else "passed") if passed else "failed",
+        "task_id": active["id"], "status": "passed" if passed else "failed",
         "attempts": attempt, "summary": state.get("task_summary", ""),
         "behavior": completion.get("behavior", []),
         "verification": completion.get("verification", []),
-        "unverified": completion.get("unverified", []),
+        "unverified": list(completion.get("unverified", [])),
         "changes": changes, "review": notes,
+        "executed_checks": updates.get("verification_receipts", []),
     }
     results = [r for r in results if r["task_id"] != active["id"]] + [result]
     updates["task_results"] = results
-    updates["change_summary"] = "\n\n".join(f"{r['task_id']}: {r['summary']}" for r in results if r.get("summary"))
+    updates["change_summary"] = "\n\n".join(r["summary"] for r in results if r.get("summary"))
     updates["stage_log"] = _log_stage({**state, "stage_log": logs}, "Reviewing", "completed",
-                                       f"{active['id']}: {'implemented; final review pending' if gate_only else ('passed' if passed else 'failed')}")
+                                       "Review passed" if passed else "Review failed")
     _persist_task_results({**state, **updates})
     return updates
 
@@ -2923,18 +2992,14 @@ def _get_bench_env() -> dict:
 # ---------------------------------------------------------------------------
 
 def should_retry_implement(state: dict) -> str:
-    if state.get("error"):
+    if state.get("error") or state.get("review_stopped"):
         return "done"
+    if state.get("review_retry_requested"):
+        return "review"
     if not state.get("review_passed"):
         return "implement"
-    if state.get("integration_mode") or state.get("is_follow_up"):
-        return "done"
-    return "advance"
+    return "done"
 
-
-# ---------------------------------------------------------------------------
-# Graph builders
-# ---------------------------------------------------------------------------
 
 def build_execution_graph():
     """Sequential implementation/gates, bounded repair, final semantic review."""
