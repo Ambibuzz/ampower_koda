@@ -62,6 +62,8 @@ MAX_TOOL_ROUNDS_REVIEW_RECOVERY = 6  # continues the first pass's history, so th
 # total call budget remains the safety fence for genuinely novel findings.
 MAX_REVIEW_ATTEMPTS = 2           # failed reviews of a repeated state before strategy changes
 MAX_REPAIR_STRATEGIES = 2         # fresh diagnoses before a repeated failure may stop
+# Novel findings produce cost telemetry; stalled findings first change strategy.
+REVIEW_COST_PRESSURE_ATTEMPT = 4
 # Retain review reads/deltas across repairs, then refresh from current source so
 # an indefinitely recoverable run cannot accumulate an indefinitely large tail.
 REVIEW_HISTORY_RECHECKS = 4
@@ -468,6 +470,12 @@ SUBMIT_PLAN_SCHEMA = {
     },
     "required": ["plan", "findings"],
 }
+
+#: Repair rounds a failing test may trigger before it is reported instead of gating.
+MAX_TEST_REPAIRS = 2
+#: Checks that the verification suite was not weakened or broken; they always gate.
+TEST_INTEGRITY_CHECKS = ("tests:configuration", "tests:contract:", "tests:frozen:", "tests:mocked:",
+                         "tests:changed-during-run", "tests:environment")
 
 #: Open-keyed object parameters travel as JSON text, since strict tool schemas cannot express them.
 #: An object sent anyway is serialized before the tool runs; null becomes empty text.
@@ -2677,7 +2685,21 @@ def review_node(state: dict) -> dict:
         # The turn boundary is not a correctness verdict. A complete report
         # still goes through the mandatory checks and independent final review.
         updates["turn_exhausted"] = False
+    # Tests still failing after MAX_TEST_REPAIRS rounds are reported, not gated;
+    # suite-integrity checks and environment failures keep gating.
     test_repairs = int(state.get("test_repair_rounds") or 0)
+    test_warnings, demoted = "", []
+    if test_repairs >= MAX_TEST_REPAIRS:
+        demoted = [r for r in health.failures if r.name.startswith("tests:")
+                   and not r.name.startswith(TEST_INTEGRITY_CHECKS) and getattr(r, "owner", "") != "environment"]
+        if demoted:
+            test_warnings = "\n".join(f"- {r.name}: {str(r.detail)[:400]}" for r in demoted)
+            health.results = [r for r in health.results if r not in demoted]
+            updates["tests_unresolved"] = test_warnings
+            _publish_agent_log(state.get("request_name", ""), "tests_reported_as_warnings",
+                               tests=[r.name for r in demoted], repairs=test_repairs)
+    plan_recovery_attempted = False
+    unfinished_at_cap = False
     if health.environment_failures:
         passed, notes = False, (
             "Review could not access the required source/checker environment; code repair is not the owner: "
@@ -2689,6 +2711,7 @@ def review_node(state: dict) -> dict:
         # check result, and a check it has not reached yet is not a stall.
         passed, notes = False, "Implementation reached its call limit without finishing. Inspect current changes and complete the plan."
         updates["review_repairable"] = True
+        unfinished_at_cap = True
         # A blocked report from the forced final call says what is left; hand
         # it to the retry instead of making it rediscover the state.
         remaining = [completion.get("summary", "")] + list(completion.get("unverified") or [])
@@ -2935,14 +2958,74 @@ def review_node(state: dict) -> dict:
             )
     elif passed or updates.get("review_repairable"):
         updates["review_rechecks"] = 0
+    if test_warnings:
+        notes = f"{notes}\nTests still failing after {test_repairs} repair rounds (reported, not blocking):\n{test_warnings}"
     updates.update({"review_passed": passed, "review_notes": notes, "review_attempts": attempt})
+    # Repeated evidence stops repair, not an attempt count. An unfinished turn
+    # words its remaining work differently each time, so its progress is the
+    # files and check results moving, not the notes.
+    failure_fingerprint = _health_failure_fingerprint(health)
+    fingerprint = ("unfinished\x00" + _review_fingerprint(changes) + "\x00" + failure_fingerprint
+                   if unfinished_at_cap else _review_outcome_fingerprint(changes, notes))
+    # An amended plan reset the histories above; read them from there.
+    history_source = updates if "review_fingerprints_seen" in updates else state
+    prior_fingerprints = list(history_source.get("review_fingerprints_seen") or [])
+    if not prior_fingerprints and history_source.get("review_fingerprint"):
+        prior_fingerprints.append(history_source["review_fingerprint"])
+    track_failure_progress = not passed and not halted() and not updates.get("review_retry_requested")
+    cycled, seen = (_record_review_fingerprint(fingerprint, prior_fingerprints)
+                     if track_failure_progress else (False, prior_fingerprints))
+    prior_failure_fingerprints = list(history_source.get("review_failure_fingerprints_seen") or [])
+    # An unfinished turn stalls only when its files and checks both stand still (``cycled``).
+    repeated_failure = bool(track_failure_progress and failure_fingerprint and not unfinished_at_cap
+                            and failure_fingerprint in prior_failure_fingerprints)
+    if track_failure_progress and failure_fingerprint and not repeated_failure:
+        prior_failure_fingerprints.append(failure_fingerprint)
+    stalled_plan_recovery = (plan_recovery_attempted
+                             and "execution_tasks" not in updates)
+    updates["review_fingerprint"] = fingerprint
+    updates["review_fingerprints_seen"] = seen
+    updates["review_failure_fingerprints_seen"] = prior_failure_fingerprints
+    if repeated_failure and completion.get("status") == "blocked":
+        # Blocked and the same check failed again: deliver with the failure as a warning.
+        # (An exhausted turn's "blocked" means unfinished; repeated_failure excludes it.)
+        updates["review_stopped"] = ("The work is blocked and the same "
+                                     f"deterministic check failed again: {completion.get('summary', '')[:1000]}\n"
+                                     f"{notes[:2000]}")
+    elif (track_failure_progress and attempt >= MAX_REVIEW_ATTEMPTS
+            and (repeated_failure or cycled or stalled_plan_recovery)):
+        why = ("after the same deterministic check failed again" if repeated_failure else
+               "after plan recovery produced no executable contract change" if stalled_plan_recovery else
+               "after returning to a changed-file state already reviewed")
+        strategy = int(state.get("repair_strategy_level", 0) or 0)
+        if strategy < MAX_REPAIR_STRATEGIES:
+            updates.update(repair_strategy_level=strategy + 1, review_repairable=True,
+                           review_notes=notes + f"\nPrevious repair was ineffective {why}.")
+            _publish_agent_log(state.get("request_name", ""), "repair_strategy_changed",
+                               task_id=active["id"], strategy=strategy + 1, preview=notes[:1000])
+        else:
+            updates["review_stopped"] = (f"The work did not pass review after "
+                                         f"{attempt} attempts and {strategy} changed repair strategies {why}: "
+                                         f"{notes[:2000]}")
+    elif (not passed and not halted()
+          and updates.get("review_repairable")
+          and attempt % REVIEW_COST_PRESSURE_ATTEMPT == 0):
+        # Telemetry only: many serial reviews never stop the run.
+        _publish_agent_log(
+            state.get("request_name", ""),
+            "review_cost_pressure",
+            task_id=active["id"],
+            attempts=attempt,
+            action="continue repair with compact evidence",
+        )
     results = list(state.get("task_results") or [])
     result = {
         "task_id": active["id"], "status": "passed" if passed else "failed",
         "attempts": attempt, "summary": state.get("task_summary", ""),
         "behavior": completion.get("behavior", []),
         "verification": completion.get("verification", []),
-        "unverified": list(completion.get("unverified", [])),
+        "unverified": list(completion.get("unverified", []))
+        + [f"Failing test (after {test_repairs} repairs): {r.name}" for r in demoted],
         "changes": changes, "review": notes,
         "executed_checks": updates.get("verification_receipts", []),
     }
