@@ -204,8 +204,149 @@ def _copying(function):
         return result
     return call
 
-"""
+# event: (position of a path it changes, position of that path's dir_fd), ...
+_CHANGES = {'open': ((0, None),), 'os.mkdir': ((0, 2),), 'os.remove': ((0, 1),), 'os.rmdir': ((0, 1),),
+            'shutil.rmtree': ((0, 1),), 'os.rename': ((0, 2), (1, 3)), 'os.link': ((1, 3),),
+            'os.symlink': ((1, 2),), 'os.chmod': ((0, 2),), 'os.chown': ((0, 3),), 'os.utime': ((0, 3),),
+            'os.truncate': ((0, None),), 'os.chflags': ((0, None),), 'os.setxattr': ((0, None),),
+            'os.removexattr': ((0, None),), '_winapi.CopyFile2': ((1, None),)}
+_VERBS = {'open': 'write', '_winapi.CopyFile2': 'write', 'os.mkdir': 'create', 'os.link': 'create',
+          'os.symlink': 'create', 'os.remove': 'delete', 'os.rmdir': 'delete', 'shutil.rmtree': 'delete',
+          'os.rename': 'move'}
+_REMOVALS = ('os.remove', 'os.rmdir', 'shutil.rmtree', 'os.rename')
 
+def _at(fd, value):
+    # a path relative to a directory descriptor; None where the descriptor cannot be traced
+    try:
+        return os.path.join(os.readlink('/proc/self/fd/' + str(fd)), os.fsdecode(os.fspath(value)))
+    except (OSError, TypeError, ValueError):
+        return None
+
+def _guard(event, args):
+    # refuse a change outside the scratch dir that did not go through the overlay
+    changes = _CHANGES.get(event) if _active else None
+    if changes is None or event == 'open' and not (args[2] & _WRITE_FLAGS or isinstance(args[1], str)
+                                                   and any(flag in args[1] for flag in 'wax+')):
+        return
+    paths = []
+    for index, fd in changes:
+        value, fd = args[index], None if fd is None else args[fd]
+        if isinstance(value, int):
+            continue  # an open descriptor
+        if isinstance(fd, int) and fd >= 0:
+            value = _at(fd, value)
+            if value is None:
+                return  # untraceable where there is no /proc
+        paths.append(value)
+    if event in _REMOVALS and paths and not _there(paths[0]):
+        return  # nothing to remove: the call raises FileNotFoundError itself
+    for value in paths:
+        if _outside(_key(value)):
+            raise PermissionError(errno.EACCES, 'call_method runs contained and cannot ' + _VERBS.get(event, 'change')
+                                  + ' files outside its scratch directory', os.fsdecode(os.fspath(value)))
+
+def _describe(method):
+    if isinstance(method, str):
+        return method
+    return '.'.join(str(part) for part in (getattr(method, '__module__', None),
+                                           getattr(method, '__qualname__', None)) if part) or repr(method)
+
+def _held(original, describe):
+    def enqueue(*args, **kwargs):
+        if kwargs.get('now') or kwargs.get('is_async') is False:
+            return original(*args, **{**kwargs, 'now': True})  # runs here, inside the containment
+        _jobs.append(describe(*args, **kwargs))
+        return None
+    return enqueue
+
+def _job(method=None, *args, **kwargs):
+    return _describe(method)
+
+def _document_job(doctype=None, name=None, method=None, *args, **kwargs):
+    return '%s %s: %s' % (doctype, name, _describe(method))
+
+def _mail(original):
+    def sendmail(*args, **kwargs):
+        subject = kwargs.get('subject', args[2] if len(args) > 2 else None)
+        _mails.append('%s to %s' % (subject or '(no subject)', kwargs.get('recipients', args[0] if args else None)))
+        # queued instead, in the database, which rolls back
+        kwargs.update({key: value for key, value in (('now', False), ('delayed', True)) if key in kwargs})
+        return original(*args, **kwargs)
+    return sendmail
+
+def _smtp_sendmail(self, from_addr, to_addrs, *args, **kwargs):
+    _mails.append('SMTP message to %s' % (to_addrs,))
+    return {}
+
+def _smtp_send_message(self, msg, from_addr=None, to_addrs=None, *args, **kwargs):
+    _mails.append('%s to %s' % (msg.get('Subject') or 'SMTP message', to_addrs or msg.get('To')))
+    return {}
+
+def _swap(owner, name, value):
+    _undo.append((owner, name, getattr(owner, name)))
+    setattr(owner, name, value)
+
+def contain():
+    global _active, _SCRATCH, _OVERLAY, _DEVNULL
+    sys.dont_write_bytecode = True
+    _SCRATCH = os.path.normcase(os.path.realpath(os.environ['KODA_CALL_SCRATCH']))
+    _OVERLAY, _DEVNULL = os.path.join(_SCRATCH, 'files'), _key(os.devnull)
+    _swap(builtins, 'open', _open)
+    _swap(io, 'open', _open)
+    _swap(os, 'open', _os_open)
+    _swap(os, 'mkdir', _mkdir)
+    for name in ('remove', 'unlink', 'rmdir'):
+        _swap(os, name, _deleting(_real[name]))
+    for name in ('rename', 'replace'):
+        _swap(os, name, _renaming(_real[name]))
+    for name in ('stat', 'lstat', 'access', 'listdir', 'scandir', 'chmod', 'utime', 'truncate'):
+        if name in _real:
+            _swap(os, name, _routed(_real[name]))
+    for name in ('exists', 'lexists', 'isfile', 'isdir'):
+        _swap(os.path, name, _routed(getattr(os.path, name)))
+    # Python 3.10's pathlib calls the os functions it bound on import
+    accessor = getattr(pathlib, '_NormalAccessor', None)
+    for name in ('open', 'stat', 'listdir', 'scandir', 'chmod', 'mkdir', 'unlink', 'rmdir', 'rename', 'replace'):
+        if name in vars(accessor or object):
+            _swap(accessor, name, staticmethod(io.open if name == 'open' else getattr(os, name)))
+    _swap(shutil, 'rmtree', _rmtree)
+    windows = sys.modules.get('_winapi')
+    if callable(getattr(windows, 'CopyFile2', None)):
+        _swap(windows, 'CopyFile2', _copying(windows.CopyFile2))
+    _swap(smtplib.SMTP, 'sendmail', _smtp_sendmail)
+    _swap(smtplib.SMTP, 'send_message', _smtp_send_message)
+    owners = [frappe]
+    try:
+        owners.append(importlib.import_module('frappe.utils.background_jobs'))
+    except Exception:
+        pass  # no job queue to hold
+    for owner in owners:
+        for name, describe in (('enqueue', _job), ('enqueue_doc', _document_job)):
+            if callable(getattr(owner, name, None)):
+                _swap(owner, name, _held(getattr(owner, name), describe))
+    if callable(getattr(frappe, 'sendmail', None)):
+        _swap(frappe, 'sendmail', _mail(frappe.sendmail))
+    try:
+        queue = importlib.import_module('frappe.email.queue')
+    except Exception:
+        queue = None
+    if callable(getattr(queue, 'flush', None)):
+        _swap(queue, 'flush', lambda *args, **kwargs: _mails.append('email queue flush (not run)'))
+    sys.addaudithook(_guard)
+    _active = True
+
+def release():
+    global _active
+    _active = False
+    while _undo:
+        owner, name, value = _undo.pop()
+        setattr(owner, name, value)
+
+def contained():
+    shown = (list(_written.values())[:5] + ['job: ' + str(job) for job in _jobs[:5]]
+             + ['email: ' + str(mail) for mail in _mails[:5]])
+    return {'files': len(_written), 'jobs': len(_jobs), 'emails': len(_mails), 'shown': [item[:200] for item in shown]}
+"""
 
 def test_summary(output: str) -> dict | None:
     """Read a checked runner summary; it never overrides a failing exit code."""
