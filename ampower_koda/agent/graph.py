@@ -846,7 +846,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                            state: dict = None, provider: str = "OpenAI",
                            require_writes: bool = False, progress: dict | None = None,
                            history: dict | None = None,
-                           shared_context: str = "",
+                           validate_final=None, shared_context: str = "",
                            cache_phase: str = "") -> tuple[str, list[str], int, int, bool]:
     """
     Run a tool-calling loop, publishing every tool call and LLM response via realtime.
@@ -872,6 +872,12 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     If max_rounds is reached without the LLM stopping, one final llm.invoke() is
     fired with the same tool definitions and tool_choice="none".
 
+    Output caps grow on their own: a reply cut off by ``max_tokens`` is resent
+    with more room until it fits or the context window has no more to give
+    (``recovery.invoke_growing``). ``validate_final(text)`` returns why the
+    turn's last reply is not the report the phase needs, or ""; when it is
+    given, an unusable report is re-asked in place with that exact reason
+    instead of being handed to a whole new implementation attempt.
     """
     tool_map = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
@@ -924,6 +930,17 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         "needed for a correct edit, then apply and validate a focused change. "
         "If the task is blocked or already satisfied, explain the evidence instead "
         "of making an unnecessary edit. Do not guess anchors or field names."
+    )
+    overthought = 0
+    OVERTHINK_NUDGES = 2
+    OVERTHINK_TEXT = (
+        "Your last reply spent its whole output budget on reasoning and produced no tool call. "
+        "Stop deliberating. Make the next concrete tool call now: "
+        + ("write or edit the first file the task needs, in pieces if it is large. Settle an open design "
+           "question with the most reasonable choice and record it in your final report's unverified list "
+           "instead of resolving it in thought." if require_writes else
+           "read or run the one thing your next conclusion needs, or give your answer with what you "
+           "already know.")
     )
 
     def build_messages():
@@ -1002,7 +1019,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
 
     def maybe_trim(extra=(), with_tools=True, output_tokens=None):
         nonlocal evidence_chars
-        limit = input_limit(context_window, output_tokens or round_tokens, input_ceiling)
+        limit = input_limit(context_window, output_tokens or round_cap.value, input_ceiling)
 
         def current():
             return [*build_messages(), *extra]
@@ -1082,7 +1099,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 context_chars=context_chars,
                 context_input_tokens=context_input,
                 context_estimated_tokens=estimated_tokens,
-                input_budget_tokens=input_limit(context_window, round_tokens, input_ceiling),
+                input_budget_tokens=input_limit(context_window, round_cap.value, input_ceiling),
                 upstream_provider=(getattr(response, "response_metadata", None) or {}).get("upstream_provider"),
             )
             _persist_token_usage(
@@ -1106,8 +1123,14 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         if progress is not None:
             progress["tokens"] = total_tokens
 
+    # Grown caps are carried as plain ints so a retained history stays a
+    # plain dict; the ceiling is the room the window leaves after the prompt.
+    output_room = recovery.output_ceiling(context_window, input_ceiling)
     round_tokens = _output_share(context_window, MODEL_ROUND_OUTPUT_TOKENS)
     final_tokens = _output_share(context_window, MODEL_FINAL_OUTPUT_TOKENS)
+    round_cap = recovery.OutputCap(history.get("round_cap_tokens", round_tokens), max(round_tokens, output_room))
+    final_cap = recovery.OutputCap(history.get("final_cap_tokens", final_tokens), max(final_tokens, output_room))
+    last_truncated = False
     cache_request_kind = "initial"
     # A new turn on retained history: the previous turn's edits made many of
     # its reads stale, and every one of them would ride along all turn long.
@@ -1115,42 +1138,89 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     # when the saving over a typical turn repays that; context pressure still forces it.
     prune("turn_start", force=False, calls_made=max_rounds // 2)
 
-    def invoke_growing(model, messages, max_tokens, label, estimated, context_chars):
-        """One model call on the cached conversation, charged to the request."""
-        nonlocal cache_request_kind, evidence_chars
+    def invoke_growing(model, messages, cap, label, estimated, context_chars):
+        """One model call that resends itself with more output room when cut off."""
+        nonlocal last_truncated, cache_request_kind
         cache_request_kind = ("forced_final" if model is llm_final else
                               "continuation" if history.get("cache_calls", 0) else "initial")
         messages = rolling_messages(messages, history,
             enabled=ENABLE_PROMPT_CACHE and _uses_explicit_prompt_cache(provider, model_id))
         messages = native_cache_messages(messages, provider)
-        check_active(reserve=MODEL_TIME_RESERVE)
-        pressure = _request_spend_pressure(state or {}, request_name)
-        if pressure and not history.get("request_spend_pressure_logged"):
-            history["request_spend_pressure_logged"] = True
-            evidence_chars = min(evidence_chars, 4_000)
-            history["evidence_chars"] = evidence_chars
-            _publish_agent_log(
-                request_name,
-                "request_spend_pressure",
-                detail=pressure,
-                action="continue with compact retained evidence; do not terminate the workflow",
-            )
-        history["cache_calls"] = history.get("cache_calls", 0) + 1
-        reply = _invoke_limited(model, messages, max_tokens)
-        account_tokens(reply, label, context_chars, estimated)
-        return reply
+
+        def note(previous, grown, reasoning):
+            _publish_agent_log(request_name, "output_cap_grown", round=label,
+                               previous_cap=previous, cap=grown, reasoning_tokens=reasoning)
+
+        def call_once(max_tokens):
+            # Every wire request, retries and re-asks included, checks the
+            # deadline and the request's spend first.
+            nonlocal evidence_chars
+            check_active(reserve=MODEL_TIME_RESERVE)
+            pressure = _request_spend_pressure(state or {}, request_name)
+            if pressure and not history.get("request_spend_pressure_logged"):
+                history["request_spend_pressure_logged"] = True
+                evidence_chars = min(evidence_chars, 4_000)
+                history["evidence_chars"] = evidence_chars
+                _publish_agent_log(
+                    request_name,
+                    "request_spend_pressure",
+                    detail=pressure,
+                    action="continue with compact retained evidence; do not terminate the workflow",
+                )
+            history["cache_calls"] = history.get("cache_calls", 0) + 1
+            return _invoke_limited(model, messages, max_tokens)
+
+        outcome = recovery.invoke_growing(call_once, cap, on_retry=note)
+        for wasted in outcome.wasted:
+            account_tokens(wasted, label, context_chars, estimated)
+        account_tokens(outcome.reply, label, context_chars, estimated)
+        history["round_cap_tokens"] = round_cap.value
+        history["final_cap_tokens"] = final_cap.value
+        last_truncated = outcome.truncated
+        if outcome.truncated:
+            _publish_agent_log(request_name, "output_cap_exhausted", round=label, cap=cap.value,
+                               reasoning_tokens=outcome.reasoning_tokens)
+        return outcome.reply
+
+    def finish(text, extra, label):
+        """Re-ask in place while the final reply is not the report the phase needs.
+
+        The rejected reply goes back as the assistant turn it was, followed by
+        the exact rule it broke, on the same conversation: the retained rounds
+        and the prompt cache are kept. A reply cut off at the model's own
+        limit is not re-asked; more asking cannot make more room.
+        """
+        if validate_final is None or last_truncated:
+            return text
+
+        def resend(previous, problem):
+            reask = HumanMessage(content=(
+                "REPORT REJECTED: " + problem + " Tools are not available. "
+                "Reply with only the required JSON report and nothing else."))
+            messages = maybe_trim(extra=(*extra, AIMessage(content=previous or "(no output)"), reask),
+                                  with_tools=final_tools_bound, output_tokens=final_cap.value)
+            reply = invoke_growing(llm_final, messages, final_cap, label,
+                                   estimate_messages(messages, schemas if final_tools_bound else ()),
+                                   sum(message_chars(m) for m in messages))
+            return _llm_response_text(reply)
+
+        fixed, problem, reasks = recovery.repair_output(text, validate_final, resend)
+        if reasks:
+            _publish_agent_log(request_name, "report_repaired" if not problem else "report_unrepaired",
+                               round=label, reasks=reasks, problem=problem[:300])
+        return fixed
 
     for round_num in range(max_rounds):
         check_active(reserve=MODEL_TIME_RESERVE)
         label = round_base + round_num + 1
-        messages = maybe_trim(output_tokens=round_tokens)
+        messages = maybe_trim(output_tokens=round_cap.value)
         context_chars = sum(message_chars(m) for m in messages)
         if progress is not None:
             progress["calls"] = round_num + 1
         # One save per round, before the call, so a run resumed after a crash still counts it.
         checkpoint.update(tool_rounds_used=(state or {}).get("tool_rounds_used", 0) + round_num + 1,
                           tokens_used=total_tokens)
-        response = invoke_growing(llm_with_tools, messages, round_tokens, label,
+        response = invoke_growing(llm_with_tools, messages, round_cap, label,
                                   estimate_messages(messages, schemas), context_chars)
 
         response_text = _llm_response_text(response)
@@ -1160,10 +1230,43 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 round=label,
             )
 
+        invalid_calls = getattr(response, "invalid_tool_calls", None) or []
+        if invalid_calls and not getattr(response, "tool_calls", None):
+            # Arguments that did not parse. Truncation is already handled by the
+            # growing cap, so this is a malformed call: say so and let the model
+            # send it again, instead of reading "no tool calls" as "finished".
+            names = ", ".join(str(c.get("name") or "?") for c in invalid_calls)
+            _publish_agent_log(request_name, "invalid_tool_call", round=label, tools=names)
+            _queue_followup(
+                history, f"Invalid tool call emitted for: {names}",
+                f"Your last tool call ({names}) could not be parsed and was not executed. Send it again as a "
+                "valid tool call, with every string argument properly escaped JSON.",
+            )
+            continue
+        if (not getattr(response, "tool_calls", None) and last_truncated and not response_text.strip()
+                and round_num + 1 < max_rounds and overthought < OVERTHINK_NUDGES):
+            # The whole output went to reasoning: nothing to execute, nothing to report.
+            # Asking for the next concrete step keeps the pass and its cache.
+            overthought += 1
+            _publish_agent_log(request_name, "reasoning_exhausted", round=label, attempt=overthought)
+            _queue_directive(history, OVERTHINK_TEXT)
+            continue
         if not getattr(response, "tool_calls", None):
             # No-op claims are assessed by review; never force an unnecessary edit.
+            problem = validate_final(response_text) if (validate_final and not last_truncated) else ""
+            if problem and round_num + 1 < max_rounds:
+                # Prose instead of the report while calls remain: the turn is not
+                # over. Say what is missing and keep the tools available, rather
+                # than ending the turn and re-asking with the tools gone.
+                _publish_agent_log(request_name, "report_rejected", round=label, problem=problem[:300])
+                _queue_followup(
+                    history, response_text,
+                    "REPORT REJECTED: " + problem + " If the task is unfinished, continue with tools; "
+                    "otherwise reply with only the JSON report.",
+                )
+                continue
             history["rounds_done"] = label
-            return response_text, edited_paths, total_tokens, round_num + 1, False
+            return finish(response_text, (), label), edited_paths, total_tokens, round_num + 1, False
 
         round_entry = {"number": label, "ai": response, "tools": [], "summary": []}
         round_had_write = False
@@ -1312,16 +1415,16 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         'If work remains, use status "blocked" and list exactly what is unfinished and '
         "which edits were already applied, so the next attempt can continue from current source."
     ))
-    final_messages = maybe_trim(extra=(final_notice,), with_tools=final_tools_bound, output_tokens=final_tokens)
+    final_messages = maybe_trim(extra=(final_notice,), with_tools=final_tools_bound, output_tokens=final_cap.value)
     final_context_chars = sum(message_chars(m) for m in final_messages)
     if progress is not None:
         progress["calls"] = max_rounds + 1
     checkpoint.update(tool_rounds_used=(state or {}).get("tool_rounds_used", 0) + max_rounds + 1)
     final_label = round_base + max_rounds + 1
-    final = invoke_growing(llm_final, final_messages, final_tokens, final_label,
+    final = invoke_growing(llm_final, final_messages, final_cap, final_label,
                            estimate_messages(final_messages, schemas if final_tools_bound else ()), final_context_chars)
     history["rounds_done"] = final_label
-    text = _llm_response_text(final)
+    text = finish(_llm_response_text(final), (final_notice,), final_label)
     return text, edited_paths, total_tokens, max_rounds + 1, True
 
 
