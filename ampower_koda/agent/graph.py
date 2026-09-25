@@ -13,17 +13,21 @@ import frappe
 from langchain_core.tools import tool
 from langgraph.graph import END, StateGraph
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from ampower_koda.agent.prompt_caching import mark_message, openai_breakpoints
+from ampower_koda.agent.prompt_caching import mark_message, native_cache_messages, openai_breakpoints, rolling_messages, terminal_model
 from langchain_openai import ChatOpenAI
 
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
-from ampower_koda.agent.cache_usage import persist_usage
+from ampower_koda.agent.cache_usage import persist_usage, provider_cost
 from ampower_koda.agent import koda_core
+from ampower_koda.agent import checkpoint
 from ampower_koda.agent import recovery
 from ampower_koda.agent.run_control import (
     check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES, MODEL_TIME_RESERVE,
 )
+from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
+from ampower_koda.agent.core.budget.request import cleanup_target, estimate_messages, input_limit
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.plan_contract import (
     MAX_PLAN_TASKS,
@@ -48,6 +52,7 @@ from ampower_koda.agent.prompts import (
 )
 
 
+from ampower_koda.agent.history_prune import prune_price, prune_rounds
 MAX_TOOL_ROUNDS_EXECUTION = 18
 MAX_TOOL_ROUNDS_REPAIR = 8        # a retry continues from current source with a remaining-work list
 MAX_TOOL_ROUNDS_REVIEW = 6
@@ -84,13 +89,9 @@ TOOL_FAILURE_PREFIXES = (
 # (phase outputs are LLM summaries and are naturally well under this in practice).
 MAX_PHASE_OUTPUT_CHARS = 60000
 
-# History trimming: keep recent tool rounds verbatim, compact older ones to text.
-# A "round" is one assistant tool-call message plus all of its tool results.
-KEEP_TOOL_ROUNDS = 4          # recent rounds retained in full
 # Full-input pressure is the only trigger for rewriting retained tool history.
 # A "round" is one assistant tool-call message plus all of its tool results.
 MIN_KEEP_ROUNDS = 1           # latest call/result pair must survive into the next request
-TRIM_CHAR_BUDGET = 48000      # includes tool-call arguments, not only result text
 COMPACT_RESULT_PREVIEW = 140  # chars of each tool result kept in the compact summary
 MAX_COMPACTED_HISTORY_CHARS = 12000
 MAX_TASK_PROMPT_CHARS = 60000
@@ -844,9 +845,12 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                            request_name: str = "", max_rounds: int = 20,
                            state: dict = None, provider: str = "OpenAI",
                            require_writes: bool = False, progress: dict | None = None,
-                           history: dict | None = None) -> tuple[str, list[str], int, int, bool]:
+                           history: dict | None = None,
+                           shared_context: str = "",
+                           cache_phase: str = "") -> tuple[str, list[str], int, int, bool]:
     """
     Run a tool-calling loop, publishing every tool call and LLM response via realtime.
+
     Returns (text, edited_paths, tokens, model_calls, exhausted).
 
     ``history`` is an optional mutable dict that carries the retained rounds,
@@ -854,41 +858,50 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     loop into the next. A reviewer recovery pass continues from what the first
     pass already read instead of re-fetching it; round numbers keep counting.
 
-    Context control (token savings without quality loss):
+    Context control:
       - The stable system prompt is a separate, cache-friendly message.
-      - Older tool rounds are compacted to a short text summary while the most
-        recent rounds are kept verbatim, so the model keeps working context but
-        we stop re-sending large, already-consumed tool outputs every round.
+      - Stale results are pruned only when the saving repays the cache rewrite.
+        At the full-input limit, older rounds are summarized in one batch.
 
     A "round" is one assistant tool-call message plus all of its tool results;
     rounds are trimmed atomically so no tool_call_id is ever left dangling.
 
-    Implementation receives one focus reminder after a long read-only streak.
+    Implementation gets one focus reminder per turn after a long read-only streak.
     No-op completion claims are left to the independent reviewer to assess.
 
     If max_rounds is reached without the LLM stopping, one final llm.invoke() is
-    fired WITHOUT tools bound to force a plain-text conclusion.
+    fired with the same tool definitions and tool_choice="none".
+
     """
     tool_map = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
+    # Final calls and re-asks keep the tool schemas (part of the cached prefix) and
+    # forbid calling them instead of unbinding them.
+    final_tools_bound = bool(tools)
+    llm_final = terminal_model(llm, tools, llm_with_tools, provider=provider)
+    schemas = [convert_to_openai_tool(tool) for tool in tools]
+    context_window, input_ceiling = koda_core.request_limits(
+        (state or {}).get("target_app_name", ""), koda_core._model_id(llm))
+    calibrator = history.get("calibrator", TokenCalibrator()) if history else TokenCalibrator()
+    evidence_chars = history.get("evidence_chars", 12_000) if history else 12_000
 
     model_id = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
-    original_task_chars = len(task_prompt or "")
-    task_prompt = _bounded_text(task_prompt, MAX_TASK_PROMPT_CHARS)
-    if len(task_prompt) < original_task_chars:
-        _publish_agent_log(
-            request_name, "prompt_trim",
-            original_chars=original_task_chars,
-            kept_chars=len(task_prompt),
-        )
+    # The task prompt is not capped here; the serialized input budget governs it.
+    task_prompt = task_prompt or ""
     system_msg = _build_system_message(provider, system_prompt, model_id)
-    task_msg = _build_task_message(provider, task_prompt, model_id)
+    # Keep two fixed boundaries, leaving room for previous/current rolling ones.
+    shared_msg = _build_task_message(provider, shared_context, model_id) if shared_context else None
+    # OpenAI has no rolling boundaries, so the task (identical across repair
+    # passes) gets its own.
+    task_msg = (HumanMessage(content=task_prompt)
+                if shared_msg is not None and not openai_breakpoints(provider, model_id)
+                else _build_task_message(provider, task_prompt, model_id))
 
     if history is None:
         history = {}
     rounds: list[dict] = history.setdefault("rounds", [])      # each: {"number", "ai", "tools", "summary"}
     compacted: list[str] = history.setdefault("compacted", [])  # summary lines for dropped (older) rounds
-    injected: list = []          # directive nudges appended after the latest round
+    followups: list[dict] = history.setdefault("followups", [])  # see _queue_followup
     edited_paths: list[str] = []
     if state and state.get("execution_tasks"):
         source_memory = history.get("source_memory") or SourceMemory(lambda path: _read_current(state, path))
@@ -897,29 +910,24 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         source_memory = None
     seen_calls: dict[str, int] = history.setdefault("seen_calls", {})
     seen_results: dict[str, int] = history.setdefault("seen_results", {})
+    failed_calls: dict[str, dict] = history.setdefault("failed_calls", {})
+    progress_generation = int(history.get("tool_progress_generation", 0))
     round_base = int(history.get("rounds_done", 0))  # rounds already numbered by earlier loops
     total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
     usage_missing_logged = False  # warn once per loop, not once per round
 
-    wrote_anything = False
     read_only_streak = 0
     write_nudges = 0
-    MAX_WRITE_NUDGES = 1
     READ_STREAK_LIMIT = 5
     NUDGE_TEXT = (
-        "Work toward the active task's acceptance criteria. Read any missing context "
+        "Work toward the plan's acceptance criteria. Read any missing context "
         "needed for a correct edit, then apply and validate a focused change. "
         "If the task is blocked or already satisfied, explain the evidence instead "
         "of making an unnecessary edit. Do not guess anchors or field names."
     )
 
-    def inject_nudge(text: str) -> None:
-        # The latest directive supersedes an earlier identical one. Accumulating
-        # three copies makes every later request larger without adding a rule.
-        injected[:] = [HumanMessage(content=text)]
-
     def build_messages():
-        msgs = [system_msg, task_msg]
+        msgs = [system_msg, *([shared_msg] if shared_msg is not None else []), task_msg]
         if compacted:
             msgs.append(HumanMessage(content=(
                 "## Earlier tool activity (older rounds, summarized to save context)\n"
@@ -927,13 +935,21 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 + "\n".join(compacted)
             )))
         if source_memory:
-            evidence = source_memory.render({r["number"] for r in rounds})
+            evidence = source_memory.render({r["number"] for r in rounds}, max_chars=evidence_chars)
             if evidence:
                 msgs.append(HumanMessage(content="## Retained source evidence (current revision)\n" + evidence))
+        present = {r["number"] for r in rounds}
+        # A follow-up whose round was trimmed away still has to precede every
+        # later round, so it goes right after the summaries instead.
+        for f in followups:
+            if f["after"] not in present:
+                msgs.extend(f["messages"])
         for r in rounds:
             msgs.append(r["ai"])
             msgs.extend(r["tools"])
-        msgs.extend(injected)
+            for f in followups:
+                if f["after"] == r["number"]:
+                    msgs.extend(f["messages"])
         return msgs
 
     def message_chars(message) -> int:
@@ -950,32 +966,105 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         while compacted and sum(len(line) + 1 for line in compacted) > MAX_COMPACTED_HISTORY_CHARS:
             compacted.pop(0)
 
-    def maybe_trim():
-        trimmed = False
-        while len(rounds) > KEEP_TOOL_ROUNDS:
-            compacted.extend(_compact_round_summary(rounds.pop(0)))
-            trimmed = True
-        while len(rounds) > MIN_KEEP_ROUNDS and estimate_chars() > TRIM_CHAR_BUDGET:
-            compacted.extend(_compact_round_summary(rounds.pop(0)))
-            trimmed = True
-        if trimmed:
-            cap_compacted()
-            _publish_agent_log(request_name, "history_trim",
-                kept_rounds=len(rounds),
-                compacted_lines=len(compacted),
-                retained_chars=estimate_chars(),
-            )
+    def prune(reason: str, *, force: bool, calls_made: int = 0) -> None:
+        """Retire stale results, applied write bodies and old reasoning in one rewrite.
 
-    def account_tokens(response, round_label, context_chars: int = 0):
-        nonlocal total_tokens, usage_missing_logged
+        Any change to a retained message costs one uncached pass over what
+        follows it, so mid-turn this rewrites only near the end of the history
+        (``PRUNE_TAIL_CHARS``) unless the whole history holds a bulk saving
+        (``PRUNE_BULK_CHARS``), and only when the expected saving repays re-caching
+        at this model's prices. A full context forces it.
+        Old reasoning waits for a forced prune: it is cheap in tokens and
+        stripping it mid-turn rewrote the cache for almost nothing.
+        """
+        if not rounds:
+            return
+        scope = None
+        if not force:
+            calls_left = min(calls_made, max_rounds - calls_made)
+            if calls_left <= 0:
+                return  # no call left to repay a rewrite
+            read_price = _cache_read_price(provider, model_id)
+            bulk, bulk_rewrite = prune_price(rounds, WRITE_TOOLS, reasoning=False, followups=followups)
+            if bulk >= PRUNE_BULK_CHARS and _prune_pays(bulk, bulk_rewrite, calls_left, read_price):
+                scope = "all"
+            else:
+                tail, tail_rewrite = prune_price(rounds, WRITE_TOOLS, reasoning=False,
+                                                 tail_chars=PRUNE_TAIL_CHARS, followups=followups)
+                if not (tail >= PRUNE_TAIL_MIN_CHARS and _prune_pays(tail, tail_rewrite, calls_left, read_price)):
+                    return
+                scope = "tail"
+        freed = prune_rounds(rounds, WRITE_TOOLS, reasoning=force,
+                             tail_chars=PRUNE_TAIL_CHARS if scope == "tail" else None)
+        if freed:
+            _publish_agent_log(request_name, "history_pruned", reason=reason,
+                               freed_chars=freed, kept_rounds=len(rounds))
+
+    def maybe_trim(extra=(), with_tools=True, output_tokens=None):
+        nonlocal evidence_chars
+        limit = input_limit(context_window, output_tokens or round_tokens, input_ceiling)
+
+        def current():
+            return [*build_messages(), *extra]
+
+        def size():
+            raw = estimate_messages(current(), schemas if with_tools else ())
+            return max(raw, calibrator.estimate(raw))
+
+        before = size()
+        if before <= limit:
+            return current()
+
+        # Stale results go first; they are useless anyway. Only if the live
+        # history alone is still too large are whole rounds summarized, and
+        # then deeply, so the next compaction (a near-total cache miss) is rare.
+        prune("context_limit", force=True)
+        if size() <= cleanup_target(limit):
+            return current()
+        target = min(cleanup_target(limit), limit // 2)
+        cap_compacted()
+        while len(rounds) > MIN_KEEP_ROUNDS and size() > target:
+            compacted.extend(_compact_round_summary(rounds.pop(0)))
+            cap_compacted()
+        while compacted and size() > target:
+            compacted.pop(0)
+        if size() > target and evidence_chars:
+            evidence_chars = max(0, evidence_chars - int((size() - target) * 3.6) - 256)
+            history["evidence_chars"] = evidence_chars
+        after = size()
+        # A result removed from the prompt must be readable again.
+        seen_calls.clear()
+        seen_results.clear()
+        if after > limit:
+            raise ValueError(f"Context budget exceeded: estimated {after:,} input tokens, limit {limit:,}. "
+                             "The task instructions and latest tool exchange cannot be reduced safely.")
+        _publish_agent_log(request_name, "history_trim",
+            kept_rounds=len(rounds),
+            compacted_lines=len(compacted),
+            retained_chars=estimate_chars(),
+            input_before=before,
+            input_after=after,
+            input_limit=limit,
+            input_target=target,
+        )
+        return current()
+
+    def account_tokens(response, round_label, context_chars: int = 0, estimated_tokens: int = 0):
+        nonlocal total_tokens, usage_missing_logged, calibrator
+        total_tokens += _SIDE_TOKENS.pop(request_name, 0)
         usage = getattr(response, "usage_metadata", None)
         if usage:
+            context_input = int(usage.get("input_tokens") or 0)
+            calibrator = calibrator.observe(estimated_tokens, context_input)
+            history["calibrator"] = calibrator
             total_tokens += int(usage.get("total_tokens") or 0)
             details = usage.get("input_token_details") or {}
             cache_read = int(details.get("cache_read") or 0)
             cache_write = int(details.get("cache_creation") or 0)
+            history["previous_context_input_tokens"] = context_input
+            cost = provider_cost(response)
             uncached_input = max(
-                0, int(usage.get("input_tokens") or 0) - cache_read - cache_write
+                0, context_input - cache_read - cache_write
             )
             _publish_agent_log(request_name, "token_usage",
                 round=round_label,
@@ -985,9 +1074,25 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 output_tokens=usage.get("output_tokens", 0),
                 cache_read_tokens=cache_read,
                 cache_write_tokens=cache_write,
+                cache_phase=cache_phase or ("implement" if require_writes else "review"),
+                cache_request_kind=cache_request_kind,
+                cache_read_ratio=round(cache_read / max(1, context_input), 4),
+                cache_new_input_tokens=max(0, context_input - cache_read),
+                provider_cost=cost,
                 context_chars=context_chars,
+                context_input_tokens=context_input,
+                context_estimated_tokens=estimated_tokens,
+                input_budget_tokens=input_limit(context_window, round_tokens, input_ceiling),
+                upstream_provider=(getattr(response, "response_metadata", None) or {}).get("upstream_provider"),
             )
-            _persist_token_usage(request_name, total_tokens)
+            _persist_token_usage(
+                request_name,
+                total_tokens,
+                input_tokens=context_input,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                cost_delta=cost,
+            )
         elif not usage_missing_logged:
             # A provider that omits usage_metadata omits it every round, so this
             # is a property of the provider, not of this round. Report it once;
@@ -1001,15 +1106,52 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         if progress is not None:
             progress["tokens"] = total_tokens
 
+    round_tokens = _output_share(context_window, MODEL_ROUND_OUTPUT_TOKENS)
+    final_tokens = _output_share(context_window, MODEL_FINAL_OUTPUT_TOKENS)
+    cache_request_kind = "initial"
+    # A new turn on retained history: the previous turn's edits made many of
+    # its reads stale, and every one of them would ride along all turn long.
+    # Retiring them rewrites the whole retained history, though, so it runs only
+    # when the saving over a typical turn repays that; context pressure still forces it.
+    prune("turn_start", force=False, calls_made=max_rounds // 2)
+
+    def invoke_growing(model, messages, max_tokens, label, estimated, context_chars):
+        """One model call on the cached conversation, charged to the request."""
+        nonlocal cache_request_kind, evidence_chars
+        cache_request_kind = ("forced_final" if model is llm_final else
+                              "continuation" if history.get("cache_calls", 0) else "initial")
+        messages = rolling_messages(messages, history,
+            enabled=ENABLE_PROMPT_CACHE and _uses_explicit_prompt_cache(provider, model_id))
+        messages = native_cache_messages(messages, provider)
+        check_active(reserve=MODEL_TIME_RESERVE)
+        pressure = _request_spend_pressure(state or {}, request_name)
+        if pressure and not history.get("request_spend_pressure_logged"):
+            history["request_spend_pressure_logged"] = True
+            evidence_chars = min(evidence_chars, 4_000)
+            history["evidence_chars"] = evidence_chars
+            _publish_agent_log(
+                request_name,
+                "request_spend_pressure",
+                detail=pressure,
+                action="continue with compact retained evidence; do not terminate the workflow",
+            )
+        history["cache_calls"] = history.get("cache_calls", 0) + 1
+        reply = _invoke_limited(model, messages, max_tokens)
+        account_tokens(reply, label, context_chars, estimated)
+        return reply
+
     for round_num in range(max_rounds):
+        check_active(reserve=MODEL_TIME_RESERVE)
         label = round_base + round_num + 1
-        maybe_trim()
-        messages = build_messages()
+        messages = maybe_trim(output_tokens=round_tokens)
         context_chars = sum(message_chars(m) for m in messages)
         if progress is not None:
             progress["calls"] = round_num + 1
-        response = _invoke_limited(llm_with_tools, messages, MODEL_ROUND_OUTPUT_TOKENS)
-        account_tokens(response, label, context_chars)
+        # One save per round, before the call, so a run resumed after a crash still counts it.
+        checkpoint.update(tool_rounds_used=(state or {}).get("tool_rounds_used", 0) + round_num + 1,
+                          tokens_used=total_tokens)
+        response = invoke_growing(llm_with_tools, messages, round_tokens, label,
+                                  estimate_messages(messages, schemas), context_chars)
 
         response_text = _llm_response_text(response)
         if response_text:
@@ -1026,6 +1168,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         round_entry = {"number": label, "ai": response, "tools": [], "summary": []}
         round_had_write = False
         for tc in response.tool_calls:
+            check_active(reserve=5)
             _publish_agent_log(request_name, "tool_call",
                 tool_name=tc["name"],
                 tool_args={k: (str(v)[:200] if len(str(v)) > 200 else v) for k, v in tc.get("args", {}).items()},
@@ -1033,14 +1176,34 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             )
 
             name = tc["name"]
-            arguments = tc.get("args", {})
+            arguments = dict(tc.get("args") or {})
             retained_numbers = {entry["number"] for entry in rounds}
             call_key = _tool_call_key(name, arguments)
             prior_round = seen_calls.get(call_key) if name in REPLAYABLE_TOOLS else None
             duplicate_call = prior_round is not None and prior_round in retained_numbers
+            # A call that failed is not re-run unchanged until something else succeeds.
+            prior_failure = failed_calls.get(call_key)
+            unchanged_failed_call = (
+                isinstance(prior_failure, dict)
+                and int(prior_failure.get("generation", -1)) == progress_generation
+            )
 
             fn = tool_map.get(name)
-            if duplicate_call:
+            tool_ok = False
+            tool_invoked = False
+            tool_raised = False
+            if unchanged_failed_call:
+                result = (
+                    f"[same failed call was already attempted in round {prior_failure.get('round')}; "
+                    "it was not executed again because no successful intervening tool action changed the evidence. "
+                    f"Previous result: {prior_failure.get('result', '')} Change the arguments, inspect relevant "
+                    "state, or report the blocker.]"
+                )
+                _publish_agent_log(
+                    request_name, "blind_retry_blocked",
+                    tool_name=name, original_round=prior_failure.get("round"), round=label,
+                )
+            elif duplicate_call:
                 result = (
                     f"[{name} with these exact arguments already returned in round "
                     f"{prior_round}; use that result. Nothing has changed.]"
@@ -1051,8 +1214,10 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 )
             elif fn:
                 try:
+                    tool_invoked = True
                     result = str(fn.invoke(arguments))
-                    if name in REPLAYABLE_TOOLS and len(result) >= 400:
+                    tool_ok = _tool_result_succeeded(result)
+                    if tool_ok and name in REPLAYABLE_TOOLS and len(result) >= 400:
                         result_round = seen_results.get(result)
                         if result_round is not None and result_round in retained_numbers:
                             result = (
@@ -1061,24 +1226,32 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                             )
                         else:
                             seen_results[result] = label
-                    if len(result) > MAX_TOOL_RESULT_CHARS:
-                        result = (
-                            result[:MAX_TOOL_RESULT_CHARS]
-                            + f"\n... (truncated at {MAX_TOOL_RESULT_CHARS} characters; "
-                              "request a narrower path or line range for anything missing)"
-                        )
+                    result = _bounded_tool_result(name, arguments, result)
                 except Exception as e:
                     log_agent_error(
                         f"Agent Graph: tool {tc['name']}",
                         f"request={request_name}\n{e}\n{frappe.get_traceback()}",
                     )
                     result = f"Tool error: {e}"
+                    tool_raised = True
             else:
                 result = f"Unknown tool: {name}"
 
-            if name in REPLAYABLE_TOOLS and not duplicate_call:
+            if name in REPLAYABLE_TOOLS and not duplicate_call and tool_ok:
                 seen_calls[call_key] = label
 
+            if tool_ok and tool_invoked:
+                progress_generation += 1
+                history["tool_progress_generation"] = progress_generation
+            if tool_invoked:
+                if tool_ok:
+                    failed_calls.pop(call_key, None)
+                elif name in WRITE_TOOLS or not tool_raised:  # an exception may be transient
+                    failed_calls[call_key] = {
+                        "round": label,
+                        "generation": progress_generation,
+                        "result": result[:1000],
+                    }
             if source_memory and name == "read_file" and not duplicate_call:
                 source_memory.record(arguments, result, label)
             if name in WRITE_TOOLS:
@@ -1087,12 +1260,18 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 # A failed write can still have partially changed the file.
                 seen_calls.clear()
                 seen_results.clear()
-                if result.startswith(("WRITE_OK:", "EDIT_OK:")):
+                if result.startswith(("WRITE_OK:", "EDIT_OK:", "COPY_OK:", "RENAME_OK:", "DELETE_OK:")):
                     round_had_write = True
-                    wrote_anything = True
-                    path_arg = arguments.get("path", "")
-                    if path_arg and path_arg not in edited_paths:
-                        edited_paths.append(path_arg)
+                    history["write_generation"] = history.get("write_generation", 0) + 1
+                    changed_paths = ([arguments.get("source_path"), arguments.get("destination_path")]
+                                     if name == "rename_file" else
+                                     [arguments.get("destination_path")] if name == "copy_file" else [arguments.get("path")])
+                    for path_arg in changed_paths:
+                        if path_arg and path_arg not in edited_paths:
+                            edited_paths.append(path_arg)
+                active_journal = checkpoint.journal()
+                if active_journal and tool_invoked:
+                    active_journal.finish_write()
 
             _publish_agent_log(request_name, "tool_result",
                 tool_name=name,
@@ -1108,46 +1287,45 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 f"[r{label}] {name}({arg_preview}) -> {result[:COMPACT_RESULT_PREVIEW]}"
             )
 
+        # A written body stays: it is the model's view of that file, and edits by
+        # text anchor build on it. prune_rounds retires it once a newer view exists.
         rounds.append(round_entry)
-
-        # Proactively break analysis-paralysis: if the model keeps only reading
-        # in the implement phase, tell it to start editing.
+        prune("batch", force=False, calls_made=round_num + 1)
+        # A long read-only streak in implementation, even after an edit, gets one
+        # reminder per turn to start editing.
         if round_had_write:
             read_only_streak = 0
         else:
             read_only_streak += 1
-        if (require_writes and not wrote_anything
-                and read_only_streak >= READ_STREAK_LIMIT
-                and write_nudges < MAX_WRITE_NUDGES):
-            write_nudges += 1
+        if require_writes and read_only_streak >= READ_STREAK_LIMIT and not write_nudges:
+            write_nudges = 1
             read_only_streak = 0
-            inject_nudge(NUDGE_TEXT)
+            # Anchored after this round, so the cached prefix stays unchanged.
+            _queue_directive(history, NUDGE_TEXT)
             _publish_agent_log(request_name, "write_nudge",
                 round=label, attempt=write_nudges, trigger="read_streak")
-
-    maybe_trim()
-    final_messages = build_messages()
-    # Tools are unbound for this call. Without saying so, a model that still
-    # wants to work writes its next tool calls as prose, and the turn ends with
-    # garbage instead of a report the retry can act on.
-    final_messages.append(HumanMessage(content=(
+    # Tool calls are forbidden on this call. Without saying so, a model that still
+    # wants to work writes its next tool calls as prose instead of a report.
+    final_notice = HumanMessage(content=(
         "STOP: the call limit for this turn is reached and tools are no longer available. "
         "Do not write any further tool calls. Return the required final report now. "
         'If work remains, use status "blocked" and list exactly what is unfinished and '
         "which edits were already applied, so the next attempt can continue from current source."
-    )))
+    ))
+    final_messages = maybe_trim(extra=(final_notice,), with_tools=final_tools_bound, output_tokens=final_tokens)
     final_context_chars = sum(message_chars(m) for m in final_messages)
     if progress is not None:
         progress["calls"] = max_rounds + 1
-    final = _invoke_limited(llm, final_messages, MODEL_FINAL_OUTPUT_TOKENS)
-    account_tokens(final, round_base + max_rounds + 1, final_context_chars)
-    history["rounds_done"] = round_base + max_rounds + 1
-    return _llm_response_text(final), edited_paths, total_tokens, max_rounds + 1, True
+    checkpoint.update(tool_rounds_used=(state or {}).get("tool_rounds_used", 0) + max_rounds + 1)
+    final_label = round_base + max_rounds + 1
+    final = invoke_growing(llm_final, final_messages, final_tokens, final_label,
+                           estimate_messages(final_messages, schemas if final_tools_bound else ()), final_context_chars)
+    history["rounds_done"] = final_label
+    text = _llm_response_text(final)
+    return text, edited_paths, total_tokens, max_rounds + 1, True
 
 
-# ---------------------------------------------------------------------------
 # Agent turn helper
-# ---------------------------------------------------------------------------
 
 def _queue_followup(history: dict, previous_output: str, feedback: str, *, kind: str = "") -> None:
     """Append the previous answer and new feedback after the retained rounds.
