@@ -136,7 +136,9 @@ PRUNE_BULK_CHARS = 20000 * 3.3
 CACHE_READ_PRICE = {"openai/": 0.1, "anthropic/": 0.1, "deepseek/": 0.1, "google/": 0.25}
 DEFAULT_CACHE_READ_PRICE = 0.3
 CACHE_WRITE_PRICE = 1.25
-MAX_UNDERSTANDING_CONTEXT_CHARS = 8000
+# Room for an adaptation's KEEP/CHANGE reference contract ahead of the change
+# surface; the findings sit in the cached shared context, sent once per pass.
+MAX_UNDERSTANDING_CONTEXT_CHARS = 12000
 # A copy at least this long changes by edits: rewriting it whole drops what the reference does.
 COPY_REWRITE_MIN_LINES = 150
 # Room to write a whole file in one call, with the reasoning that precedes it.
@@ -2549,6 +2551,118 @@ def _execution_context(state: dict) -> tuple[dict, list[str], list[str] | None]:
     return active, criteria, None if state.get("is_follow_up") else paths
 
 
+def _approved_plan_context(state: dict) -> dict:
+    plan = state.get("plan_object") or {}
+    return {key: plan.get(key, [] if key in {"assumptions", "risks"} else {})
+            for key in ("overview", "scope", "assumptions", "risks")}
+
+
+def _compact_execution_results(results) -> list[dict]:
+    """The model's claims without past reviews or receipts, which the review supplies fresh."""
+    compact = []
+    for result in results or []:
+        if not isinstance(result, dict):
+            continue
+        item = {key: result.get(key) for key in ("task_id", "status")
+                if result.get(key) not in (None, "")}
+        summary = str(result.get("summary") or "").strip()
+        if summary:
+            item["summary"] = _bounded_text(summary, 1200)
+        for key in ("behavior", "unverified"):
+            values = result.get(key) or []
+            kept = [_bounded_text(str(value), 1200) for value in values[:8]
+                    if str(value).strip()]
+            if kept:
+                item[key] = kept
+        changes = []
+        for change in (result.get("changes") or [])[:20]:
+            if not isinstance(change, dict):
+                continue
+            changes.append({key: change.get(key) for key in ("path", "summary", "before", "after")
+                            if change.get(key) not in (None, "")})
+        if changes:
+            item["changes"] = changes
+        compact.append(item)
+    return compact
+
+
+def _shared_request_context(state: dict) -> str:
+    """The stable request-level message a review sends before its changing prompt.
+
+    The approved plan context, the request and the investigation's findings form
+    a byte-identical prefix with its own cache boundary, reused by every recheck.
+    """
+    blocks = [
+        "## APPROVED PLAN CONTEXT\n" + json.dumps(_approved_plan_context(state), ensure_ascii=True),
+    ]
+    user_message = str(state.get("follow_up_message") or state.get("user_message") or "").strip()
+    if user_message:
+        blocks.append("## USER REQUEST\n" + user_message)
+    findings = _bounded_text(
+        state.get("implementation_memory") if state.get("is_follow_up")
+        else state.get("understanding_summary", ""),
+        MAX_UNDERSTANDING_CONTEXT_CHARS,
+    ).strip()
+    if findings:
+        blocks.append("## CODEBASE FINDINGS\n" + findings)
+    verification_context = verification.contract_context(state.get('verification_contract') or {})
+    if verification_context:
+        blocks.append(verification_context)
+    return "\n\n".join(blocks) + "\n\n"
+
+
+def _approved_deletions(state: dict) -> set[str]:
+    tasks = state.get("execution_tasks") or []
+    actions = {path: task.get("action") for task in tasks for path in task.get("files", [])}
+    return {path for path, action in actions.items() if action == "DELETE"}
+
+
+def _review_paths(state: dict, task_paths) -> list[str]:
+    # A follow-up names no task paths; its read/check scope is what it changed before.
+    return list(dict.fromkeys(task_paths if task_paths is not None else state.get("prior_changed_paths") or []))
+
+
+def _integration_neighbor_paths(state: dict, paths: list[str], changed_paths: list[str]) -> list[str]:
+    """Add unchanged JS callers of changed Python endpoint modules.
+
+    Plan files are a starting point, so an unchanged caller can legitimately be
+    absent from them.  Final integration must still run deterministic wiring
+    checks on that caller instead of hoping the reviewer happens to search for
+    it.  Both the app-root and nested-package spellings are searched because a
+    missing inner package segment is itself a common Frappe wiring defect.
+    """
+    app_name = state.get("target_app_name", "")
+    prefixes = set()
+    for path in changed_paths:
+        normalized = path.replace("\\", "/")
+        if not normalized.endswith(".py"):
+            continue
+        module = normalized[:-3].replace("/", ".")
+        prefixes.add(f"{app_name}.{module}")
+        if module.startswith(app_name + "."):
+            prefixes.add(module)
+    if not prefixes:
+        return list(dict.fromkeys(paths))
+    root = frappe.get_app_path(app_name)
+    neighbors = []
+    ignored = set(getattr(agent_tools, "IGNORE_DIRS", ()))
+    for directory, dirnames, filenames in os.walk(root):
+        check_active(reserve=10)
+        dirnames[:] = [name for name in dirnames if name not in ignored]
+        for filename in filenames:
+            if not filename.endswith(".js"):
+                continue
+            full = os.path.join(directory, filename)
+            try:
+                with open(full, encoding="utf-8", errors="replace") as source:
+                    content = source.read()
+            except OSError:
+                continue  # an unreadable caller only narrows the extra wiring checks
+            if any(prefix in content for prefix in prefixes):
+                neighbors.append(os.path.relpath(full, root).replace("\\", "/"))
+    return list(dict.fromkeys([*paths, *neighbors]))
+
+
 def _read_current(state: dict, path: str):
     return read_snapshot(agent_tools._resolve_path(state["target_app_name"], path))
 
@@ -2663,6 +2777,42 @@ def implement_node(state: dict) -> dict:
                                 f"{active['id']}: {len(edits)} total changed file(s); review pending"),
     })
     return updates
+
+
+def _implementation_updates(state: dict, updates: dict, logs: list) -> dict:
+    """Fold an implementation turn's writes into the baseline, change evidence and completion report."""
+    before = updates.pop("_write_baseline", {})
+    updates.pop("_tool_edited_paths", None)
+    file_moves = list(state.get("file_moves") or [])
+    for move in updates.pop("_file_moves", []):
+        if move not in file_moves:
+            file_moves.append(move)
+    # The state's baseline already holds the plan's files, so a no-op change is still reviewed.
+    baseline = dict(state.get("execution_baseline") or {})
+    for path, content in before.items():
+        baseline.setdefault(path, content)
+    edits, _ = change_evidence(baseline, lambda p: _read_current(state, p))
+    steps = updates.get("intermediate_steps") or []
+    output = steps[-1].get("output", "") if steps else ""
+    completion = completion_report(output)
+    updates.update({
+        "execution_baseline": baseline,
+        "file_moves": file_moves,
+        "edits_made": edits,
+        "task_completion": completion,
+        "task_summary": completion.get("summary", _bounded_text(output, 4000)),
+        "stage_log": _log_stage({**state, "stage_log": logs}, "Implementing", "completed" if not updates.get("error") else "failed",
+                                f"{len(edits)} changed file(s); review pending"),
+    })
+    return updates
+
+
+def _prepare_verification_contract(state: dict) -> dict:
+    # Explicitly approved test changes may update expectations for changed
+    # requirements. Other pre-existing regressions remain fixed during repair.
+    return verification.prepare_contract(state["target_app_name"], editable_tests=(
+        path for task in state.get("execution_tasks", []) for path in task.get("files", [])
+    ))
 
 
 def review_node(state: dict) -> dict:
