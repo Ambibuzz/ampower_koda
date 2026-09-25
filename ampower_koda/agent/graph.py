@@ -6,17 +6,22 @@
 import json
 import os
 import re as _re
+from copy import deepcopy
 from datetime import datetime
 
 import frappe
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from ampower_koda.agent.prompt_caching import openai_breakpoints
 from langchain_openai import ChatOpenAI
 
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.state import AgentState
 from ampower_koda.agent import koda_core
+from ampower_koda.agent.run_control import (
+    MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES,
+)
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.plan_contract import (
     MAX_PLAN_TASKS,
@@ -75,6 +80,10 @@ MAX_TOOL_RESULT_CHARS = 8000
 MAX_UNDERSTANDING_CONTEXT_CHARS = 8000
 MODEL_ROUND_OUTPUT_TOKENS = 4096
 MODEL_FINAL_OUTPUT_TOKENS = 2048
+# Reasoning budget for ALWAYS_REASONING models: half the smallest per-call cap, so every call keeps room.
+MODEL_REASONING_BUDGET_TOKENS = MODEL_FINAL_OUTPUT_TOKENS // 2
+# OpenRouter families that reason on every call (GLM 4.5+, DeepSeek R1, QwQ, "thinking" variants).
+ALWAYS_REASONING = _re.compile(r"glm-(?:4\.[5-9]|[5-9])|deepseek-r1|qwq|thinking|reasoner", _re.I)
 # Sized for the largest valid plan plus its overview and scope.
 PLAN_OUTPUT_TOKENS_PER_TASK = 450
 MODEL_PLAN_OUTPUT_TOKENS = 1000 + MAX_PLAN_TASKS * PLAN_OUTPUT_TOKENS_PER_TASK
@@ -181,44 +190,192 @@ def _extract_review_json(text: str) -> dict | None:
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
-def _openai_uses_responses_api(model: str) -> bool:
-    """Codex and newer pro models require OpenAI's /v1/responses endpoint."""
-    name = (model or "").lower()
-    return "codex" in name or "gpt-5.2-pro" in name or name.startswith("gpt-5.4")
+class _OpenRouterChat(ChatOpenAI):
+    """ChatOpenAI that keeps OpenRouter's extensions.
+
+    It replays reasoning blocks and tool-result cache markers that ChatOpenAI's
+    serializer drops, and records the serving upstream (``provider``) in the
+    message metadata, ``llm_output`` and the LangSmith run, since the prompt
+    cache lives with that upstream. Routing is left to ``session_id`` stickiness.
+    """
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        # ChatOpenAI's OpenAI serializer drops OpenRouter's provider reasoning
+        # fields. Replay the complete opaque blocks unchanged with their turn.
+        for message, original in zip(payload.get('messages', []), self._convert_input(input_).to_messages()):
+            if isinstance(original, AIMessage):
+                for key in ('reasoning_details', 'reasoning'):
+                    if key in original.additional_kwargs:
+                        message[key] = deepcopy(original.additional_kwargs[key])
+        # ChatOpenAI sanitizes tool-result content to OpenAI's schema, which
+        # removes Anthropic cache_control. OpenRouter accepts that extension.
+        if _uses_explicit_prompt_cache("OpenRouter", self.model_name):
+            marked = {
+                message.tool_call_id: message.content
+                for message in self._convert_input(input_).to_messages()
+                if isinstance(message, ToolMessage) and isinstance(message.content, list)
+            }
+            for message in payload.get("messages", []):
+                original = marked.get(message.get("tool_call_id"))
+                if message.get("role") != "tool" or not original or not isinstance(message.get("content"), list):
+                    continue
+                texts = iter(p for p in original if isinstance(p, dict) and p.get("type") == "text")
+                restored = []
+                for part in message["content"]:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        source = next(texts, {})
+                        if source.get("text") == part.get("text") and "cache_control" in source:
+                            part = dict(part, cache_control=source["cache_control"])
+                    restored.append(part)
+                message["content"] = restored
+        return payload
+
+    def _create_chat_result(self, response, generation_info=None):
+        result = super()._create_chat_result(response, generation_info)
+        try:
+            raw = response if isinstance(response, dict) else response.model_dump(warnings=False)
+            for generation, choice in zip(result.generations, raw.get('choices', [])):
+                message = choice.get('message') or {}
+                if message.get('reasoning_details'):
+                    generation.message.additional_kwargs['reasoning_details'] = deepcopy(message['reasoning_details'])
+                elif message.get('reasoning') or message.get('reasoning_content'):
+                    generation.message.additional_kwargs['reasoning'] = message.get('reasoning') or message['reasoning_content']
+            provider_name = raw.get("provider")
+            if provider_name:
+                result.llm_output = dict(result.llm_output or {}, upstream_provider=provider_name)
+                for generation in result.generations:
+                    generation.message.response_metadata["upstream_provider"] = provider_name
+        except Exception:
+            log_agent_error("Agent LLM: openrouter provider", frappe.get_traceback())
+        return result
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        _tag_llm_run(run_manager, (result.llm_output or {}).get("upstream_provider"))
+        return result
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        result = await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        _tag_llm_run(run_manager, (result.llm_output or {}).get("upstream_provider"))
+        return result
 
 
-def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini"):
-    """Build the chat model for the given provider and model."""
+def _tag_llm_run(run_manager, provider_name) -> None:
+    """Put ``upstream_provider`` on the LangSmith run for this very llm call.
+
+    Found via the run manager (``get_current_run_tree()`` is the parent chain);
+    the run is still open here, so the metadata goes out with its final update.
+    """
+    if not provider_name or run_manager is None:
+        return
+    try:
+        from langchain_core.tracers.langchain import LangChainTracer
+        for handler in getattr(run_manager, "handlers", []):
+            if isinstance(handler, LangChainTracer):
+                run = handler.run_map.get(str(run_manager.run_id))
+                if run is not None:
+                    run.extra.setdefault("metadata", {})["upstream_provider"] = provider_name
+    except Exception:
+        pass
+
+
+def _configured_reasoning_effort(provider: str, model: str) -> str | None:
+    # These OpenAI reasoning families support high effort through either route.
+    # Other models retain their provider defaults; do not send unsupported fields.
+    family = model.rsplit('/', 1)[-1].lower()
+    if provider not in {'OpenAI', 'OpenRouter'} or not _re.match(r'^(gpt-[56](?:[.\-]|$)|o[134](?:[\-]|$))', family):
+        return None
+    try:
+        setting = frappe.db.get_single_value('Agent Settings', 'reasoning_effort')
+    except Exception:
+        setting = None  # installations not yet migrated still use the default
+    setting = str(setting or '')
+    if setting.lower() == 'provider default':
+        return None
+    return str(setting) if setting in {'low', 'medium', 'high'} else 'high'
+
+
+def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: str = "",
+             reasoning_effort: str | None = None):
+    """Build the chat model for the given provider and model.
+
+    ``session_id`` (the request name) pins an OpenRouter conversation to one upstream,
+    where its prompt cache lives; ``provider.order`` is not set because it disables
+    that sticky routing. Other providers ignore it.
+    """
     provider = (provider or "OpenAI").strip()
     model = (model or "gpt-4o-mini").strip()
+    effort = _configured_reasoning_effort(provider, model)
+    if effort and reasoning_effort:
+        effort = reasoning_effort  # only where the model takes an effort at all
     if provider == "Gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(model=model, temperature=0)
+        # Google's retry setting counts attempts, including the initial call.
+        return ChatGoogleGenerativeAI(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS,
+                                      max_retries=MODEL_MAX_RETRIES + 1)
     if provider == "Claude":
         from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model, temperature=0)
+        return ChatAnthropic(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES)
     if provider == "OpenRouter":
         # OpenRouter speaks the OpenAI wire format, so ChatOpenAI drives it — only
         # the base URL and key differ. `usage.include` asks OpenRouter to return the
         # real billed cost of each call in the usage block; without it there is no
         # cost field at all. Never enable the Responses API here: OpenRouter only
         # implements /v1/chat/completions.
-        return ChatOpenAI(
+        extra_body = {"usage": {"include": True}}
+        if openai_breakpoints(provider, model):
+            # A conversation continues minutes later (a review after a repair pass);
+            # under the default in-memory retention its cache would have expired.
+            extra_body["prompt_cache_options"] = {"mode": "implicit", "ttl": "30m"}
+        if effort:
+            extra_body['reasoning'] = {'effort': effort}
+            if openai_breakpoints(provider, model):
+                extra_body['reasoning']['context'] = 'all_turns'
+        elif ALWAYS_REASONING.search(model):
+            # Always-reasoning models need a limit or can spend the whole cap thinking.
+            # Others get no reasoning field: it would switch a hybrid model's thinking on.
+            extra_body['reasoning'] = ({'effort': reasoning_effort} if reasoning_effort
+                                       else {'max_tokens': MODEL_REASONING_BUDGET_TOKENS})
+        if session_id:
+            extra_body["session_id"] = str(session_id)[:256]
+        # Namespaced IDs bypass ChatOpenAI's temperature guard. Let the routed
+        # model use its default: forcing temperature=0 excludes reasoning models
+        # such as Luna when planning requires support for every parameter.
+        return _OpenRouterChat(
+            name="ChatOpenAI",
             model=model,
-            temperature=0,
+            temperature=None,
+            timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES,
             base_url=OPENROUTER_BASE_URL,
             api_key=os.environ.get("OPENROUTER_API_KEY") or "",
-            extra_body={"usage": {"include": True}},
+            extra_body=extra_body,
         )
     if provider not in ("OpenAI", "Gemini", "Claude", "OpenRouter"):
         log_agent_error(
             "Agent LLM Warning",
             f"Unknown AI provider '{provider}', defaulting to OpenAI",
         )
-    openai_kwargs = {"model": model, "temperature": 0}
-    if _openai_uses_responses_api(model):
-        openai_kwargs["use_responses_api"] = True
-    return ChatOpenAI(**openai_kwargs)
+    # Direct OpenAI always goes through /v1/responses; it serves every model
+    # chat-completions serves, so there is nothing to discriminate on and no
+    # per-model allowlist to keep current. OpenRouter returns above precisely
+    # because it is the one route that cannot do this.
+    direct_options = {}
+    if effort:
+        direct_options['reasoning'] = {'effort': effort}
+        if openai_breakpoints('OpenAI', model):
+            direct_options['reasoning']['context'] = 'all_turns'
+    if session_id:
+        # Earlier OpenAI models use this stable key to improve cache routing;
+        # GPT-5.6+ uses it only for per-request cache accounting.
+        direct_options["extra_body"] = {"prompt_cache_key": str(session_id)[:256]}
+    if openai_breakpoints("OpenAI", model):
+        # Keep the rolling message-end boundary alongside our explicit stable
+        # system/shared-context boundaries, with the documented minimum TTL.
+        direct_options["prompt_cache_options"] = {"mode": "implicit", "ttl": "30m"}
+    return ChatOpenAI(model=model, temperature=None if effort else 0, use_responses_api=True,
+                      timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES,
+                      **direct_options)
 
 
 def _uses_explicit_prompt_cache(provider: str, model: str = "") -> bool:
