@@ -11,10 +11,12 @@ import subprocess
 import frappe
 from ampower_koda.agent import koda_core
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.execution_contract import load_plan
+from ampower_koda.agent.execution_contract import load_plan, read_snapshot
 from ampower_koda.agent import session as koda_session
+from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent import verification
-from ampower_koda.agent.run_control import managed_job, check_active, set_request_value
+from ampower_koda.agent.checkpoint import ExecutionJournal, restore_checkpoint, cleanup_temporaries
+from ampower_koda.agent.run_control import managed_job, current_run, check_active, set_request_value
 from ampower_koda.agent.graph import _get_bench_env, _message_content_to_str
 from ampower_koda.agent.git_ops import (
     branch_exists,
@@ -374,8 +376,31 @@ def run_planning_phase(request_name: str, plan_feedback: str = "") -> None:
 # Phase 2: Execution (Implement + Review)
 
 
+def restore_execution_state(doc, plan_object: dict, app_name: str) -> dict:
+    """Validate and restore one request checkpoint without mutating the checkout."""
+    branch_name = (doc.branch_name or "").strip()
+    if not branch_name or get_current_branch(app_name) != branch_name:
+        raise ValueError("Resume requires the request's existing branch to be checked out. No checkout or cleanup was performed.")
+    ok, head = run_git(["rev-parse", "HEAD"], cwd=get_repo_root(app_name))
+    if not ok:
+        raise ValueError("Could not verify HEAD for resume: " + head)
+    restored = restore_checkpoint(
+        doc.get("execution_checkpoint"),
+        plan=plan_object,
+        branch=branch_name,
+        head=head.strip(),
+        read_current=lambda path: read_snapshot(agent_tools._resolve_path(app_name, path)),
+    )
+    if restored.get("target_app_name") != app_name or restored.get("user_message", "") != (doc.user_message or ""):
+        raise ValueError("Request configuration changed since the checkpoint; start a newly approved run.")
+    if restored.get("is_follow_up") and restored.get("follow_up_message", "") != (doc.follow_up_message or "").strip():
+        raise ValueError("Follow-up instructions changed since the checkpoint; submit a new follow-up.")
+    return restored
+
+
 @managed_job
-def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_up: int = 0) -> None:
+def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_up: int = 0,
+                        resume: int = 0) -> None:
     """Create/reuse the working branch, run implement + review, then await bench approval.
 
     When preserve_branch is set, reuse the request's existing branch for a follow-up
@@ -399,12 +424,21 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         app_name = config["target_app_name"]
         keep_same_branch = bool(int(preserve_branch or 0))
         is_follow_up_mode = bool(int(is_follow_up or 0)) or keep_same_branch
+        resume_mode = bool(int(resume or 0))
+        restored = None
 
         # Validate the persisted approval before any checkout/reset or file mutation.
         approved = doc.get("approved_plan_json")
         plan_object = load_plan(approved)
 
-        if keep_same_branch:
+        if resume_mode:
+            branch_name = (doc.branch_name or "").strip()
+            restored = restore_execution_state(doc, plan_object, app_name)
+            check_active(reserve=5)
+            cleanup_temporaries(restored.pop("_checkpoint_temporaries", []), lambda p: agent_tools._resolve_path(app_name, p))
+            is_follow_up_mode = bool(restored.get("is_follow_up"))
+            _update_status(request_name, user, "Implementing", "Resuming saved execution on the existing branch.")
+        elif keep_same_branch:
             branch_name = (doc.branch_name or "").strip()
             if not branch_name:
                 _update_status(request_name, user, "Failed",
@@ -463,6 +497,8 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
 
         repo_root = get_repo_root(app_name)
         worktree_before = worktree_signature(repo_root) if is_follow_up_mode else ""
+        if restored:
+            worktree_before = restored.get("follow_up_worktree_before", worktree_before)
 
         # The request's session: its investigation, then its implementation and follow-ups.
         graph = koda_session.build_execution_graph()
@@ -493,6 +529,17 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
             "prior_deleted_paths": [e["path"] for e in as_json_list(doc.files_changed)
                                      if isinstance(e, dict) and e.get("path") and e.get("summary") == "Deleted"] if is_follow_up_mode else [],
         }
+        if restored:
+            initial = {**initial, **restored,
+                       "ai_provider": config["ai_provider"], "ai_model": config["ai_model"]}
+        ok, checkpoint_head = run_git(["rev-parse", "HEAD"], cwd=repo_root)
+        if not ok:
+            raise ValueError("Could not record execution HEAD: " + checkpoint_head)
+        active_run = current_run()
+        if active_run:
+            active_run.journal = ExecutionJournal(request_name,
+                lambda p: read_snapshot(agent_tools._resolve_path(app_name, p)),
+                branch=branch_name, head=checkpoint_head.strip(), state=initial)
 
         final_state = graph.invoke(initial, config={"recursion_limit": 100})
 

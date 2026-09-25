@@ -16,6 +16,7 @@ from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdo
 from ampower_koda.agent.executor import (
     _generate_patch_diff,
     _update_status,
+    restore_execution_state,
     validate_target_app,
 )
 from ampower_koda.ampower_koda.doctype.agent_settings.agent_settings import (
@@ -1273,3 +1274,25 @@ def cancel_agent_request(request_name: str):
     return {"status": "ok", "message": _("Request cancelled.")}
 
 
+@frappe.whitelist()
+@_whitelist_logged
+def resume_execution(request_name: str):
+    """Continue saved execution without resetting the branch or completed tasks."""
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    _reconcile_if_dead(doc)
+    if doc.status not in ("Failed", "Cancelled") or not doc.get("execution_checkpoint"):
+        frappe.throw(_("Resume requires a stopped execution with a saved checkpoint."))
+    _validate_provider_key(doc)
+    # Run the worker's own admission checks here, so a refused resume is a
+    # message on the button rather than a Failed request a second later.
+    try:
+        plan = load_plan(doc.get("approved_plan_json"))
+        restore_execution_state(doc, plan, validate_target_app(doc.target_app_name))
+    except (ValueError, KeyError, TypeError) as exc:
+        frappe.throw(_("Cannot resume: {0}").format(exc))
+    stop_job(doc.get("rq_job_id") or "")
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {"status": "Implementing", "error_log": ""})
+    frappe.db.commit()
+    enqueue_job("ampower_koda.agent.executor.run_execution_phase", request_name=request_name, resume=1)
+    return {"status": "ok", "message": _("Resuming saved execution on the existing branch.")}
