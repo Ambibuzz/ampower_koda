@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from html.parser import HTMLParser
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import log1p
@@ -10,10 +11,12 @@ from math import log1p
 from ..constants import (
     IDENTIFIER_MAX_SITES,
     ISSUE_QUERY_MIN_CHARS,
+    TYPO_MAX_DISTANCE,
+    TYPO_MIN_LENGTH,
     VIEW_WEIGHTS,
 )
 from .bm25 import LexicalIndex
-from .tokenize import is_code_shaped, tokenize
+from .tokenize import is_code_shaped, split_words, stem, tokenize
 
 Route = str
 
@@ -24,6 +27,30 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{2,}")
 _CODE_MARKERS = ("traceback", "expected output", "expected behavior", "expected behaviour")
 
 MAX_VIEWS = 4
+
+
+def plain_query(query: str) -> str:
+    """Remove a Frappe rich-text wrapper, retaining code in ordinary queries."""
+    if not re.match(r'''\s*<div\b[^>]*\bclass=["'][^"']*\bql-editor\b''', query):
+        return query.strip()
+
+    class Text(HTMLParser):
+        def handle_data(self, data: str) -> None:
+            parts.append(data)
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:
+            if tag in {"p", "div", "br", "li", "pre"}:
+                parts.append("\n")
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in {"p", "div", "li", "pre"}:
+                parts.append("\n")
+
+    parts: list[str] = []
+    parser = Text()
+    parser.feed(query)
+    parser.close()
+    return "\n".join(line.strip() for line in "".join(parts).splitlines() if line.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +92,7 @@ def plan_query(
     known_symbols: Mapping[str, int] | None = None,
 ) -> QueryPlan:
     """Decide how to ask ``query``."""
-    cleaned = query.strip()
+    cleaned = corrected_query(plain_query(query), index.document_frequency)
     symbols = known_symbols if known_symbols is not None else _symbol_sites(index)
 
     exact = _exact_symbol(cleaned, symbols)
@@ -82,6 +109,99 @@ def plan_query(
         identifiers=identifiers,
         exact_symbol=exact,
     )
+
+
+_PROSE_WORD = re.compile(r"(?<![\w./-])[a-z]+(?![\w./-])")
+
+
+def corrected_query(query: str, vocabulary: Mapping[str, int]) -> str:
+    """Replace misspelled prose words with the repository term they nearly spell.
+
+    Only unknown lowercase prose words are touched; identifiers, paths and
+    dotted names are left alone.
+    """
+    if not vocabulary:
+        return query
+
+    def fix(match: re.Match) -> str:
+        word = match.group(0)
+        if len(word) < TYPO_MIN_LENGTH or word in vocabulary or stem(word) in vocabulary:
+            return word
+        return _nearest_term(word, vocabulary) or word
+
+    return _PROSE_WORD.sub(fix, query)
+
+
+_TypoIndex = tuple[Mapping[str, int], dict[tuple[str, int], list[tuple[str, int, int]]], dict[str, str]]
+_TYPO_INDEXES: dict[int, _TypoIndex] = {}
+
+
+def _letters(word: str) -> int:
+    mask = 0
+    for char in word:
+        mask |= 1 << (ord(char) - 97)
+    return mask
+
+
+def _typo_index(vocabulary: Mapping[str, int]) -> _TypoIndex:
+    """Candidate terms by (first letter, length) with a letter-set mask, built once per index.
+
+    The vocabulary itself is kept so a reused ``id`` never matches another index.
+    """
+    cached = _TYPO_INDEXES.get(id(vocabulary))
+    if cached is not None and cached[0] is vocabulary:
+        return cached
+    buckets: dict[tuple[str, int], list[tuple[str, int, int]]] = {}
+    for term, frequency in vocabulary.items():
+        if len(term) >= TYPO_MIN_LENGTH and term.isascii() and term.isalpha():
+            buckets.setdefault((term[0], len(term)), []).append((term, frequency, _letters(term)))
+    if len(_TYPO_INDEXES) >= 4:
+        _TYPO_INDEXES.clear()
+    built = (vocabulary, buckets, {})
+    _TYPO_INDEXES[id(vocabulary)] = built
+    return built
+
+
+def _nearest_term(word: str, vocabulary: Mapping[str, int]) -> str:
+    if not word.isascii():
+        return ""
+    _, buckets, memo = _typo_index(vocabulary)
+    if word in memo:
+        return memo[word]
+    mask = _letters(word)
+    best, best_key = "", None
+    for size in range(len(word) - TYPO_MAX_DISTANCE, len(word) + TYPO_MAX_DISTANCE + 1):
+        for term, frequency, letters in buckets.get((word[0], size), ()):
+            # Each edit adds or removes at most one letter from the set, so two
+            # edits cannot change more than four: a cheap exact pre-filter.
+            if (mask ^ letters).bit_count() > 2 * TYPO_MAX_DISTANCE:
+                continue
+            distance = _edit_distance(word, term, TYPO_MAX_DISTANCE)
+            if distance > TYPO_MAX_DISTANCE:
+                continue
+            key = (distance, -frequency, term)
+            if best_key is None or key < best_key:
+                best, best_key = term, key
+    memo[word] = best
+    return best
+
+
+def _edit_distance(left: str, right: str, bound: int) -> int:
+    """Levenshtein distance with adjacent transposition, abandoned past ``bound``."""
+    previous_previous: list[int] = []
+    previous = list(range(len(right) + 1))
+    for i, a in enumerate(left, 1):
+        current = [i]
+        for j, b in enumerate(right, 1):
+            cost = 0 if a == b else 1
+            value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+            if i > 1 and j > 1 and a == right[j - 2] and left[i - 2] == b:
+                value = min(value, previous_previous[j - 2] + 1)
+            current.append(value)
+        if min(current) > bound:
+            return bound + 1
+        previous_previous, previous = previous, current
+    return previous[-1]
 
 
 def _exact_symbol(query: str, symbols: Mapping[str, int]) -> str:
@@ -162,6 +282,10 @@ def _identifiers(query: str, symbols: Mapping[str, int]) -> tuple[str, ...]:
         sites = symbols.get(word) or symbols.get(word.rsplit(".", 1)[-1])
         if not sites or sites > IDENTIFIER_MAX_SITES:
             continue
+        # Ordinary prose such as "files" or "ranking" is not a named anchor
+        # just because a field elsewhere happens to have that name.
+        if word not in quoted and word not in in_code and not is_code_shaped(word):
+            continue
 
         score = 1.0 / (1.0 + log1p(sites))
         if word in quoted:
@@ -211,3 +335,19 @@ def merged_weight(weight: float, rank: int, decay: float) -> float:
 def query_terms(query: str) -> tuple[str, ...]:
     """The query's tokens as the scorer sees them. Shared with the reranker."""
     return tokenize(query, is_query=True)
+def named_paths(query: str, paths: Sequence[str]) -> tuple[str, ...]:
+    """Normalize a potentially long request once for all candidate filenames."""
+    query = query.replace("\\", "/")
+    explicit = {match.group(0).lower() for match in _PATH_LIKE.finditer(query)}
+    partial_paths = tuple(candidate for candidate in explicit if "/" in candidate)
+    words = " " + " ".join(split_words(query)) + " "
+    matched = []
+    for path in paths:
+        normalized_path = path.lower()
+        basename = path.rsplit("/", 1)[-1]
+        exact = (normalized_path in explicit or basename.lower() in explicit
+                 or any(normalized_path.endswith("/" + candidate) for candidate in partial_paths))
+        phrase = " ".join(split_words(basename.rsplit(".", 1)[0]))
+        if exact or (len(phrase) >= 6 and " " + phrase + " " in words):
+            matched.append(path)
+    return tuple(matched)

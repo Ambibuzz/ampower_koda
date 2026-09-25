@@ -270,6 +270,12 @@ AMORTISATION_RATIO: Final[int] = CACHE_WRITE_TO_READ
 
 HOTCOLD_HARD_PRESSURE: Final[int] = 2
 
+TYPO_MIN_LENGTH: Final[int] = 6
+"""Only longer prose words are corrected; short words are too often real."""
+
+TYPO_MAX_DISTANCE: Final[int] = 2
+
+
 ROADMAP_MAX_COORDINATES: Final[int] = 24
 
 KEEP_RAW_TURNS: Final[int] = 3

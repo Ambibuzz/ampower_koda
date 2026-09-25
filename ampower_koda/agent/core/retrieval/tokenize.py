@@ -31,8 +31,8 @@ DISCOURSE_WORDS: frozenset[str] = frozenset(
         "see", "seeing", "know", "think", "about", "into", "onto", "over", "under",
         "between", "during", "through", "above", "below", "again", "further", "here",
         "there", "all", "both", "few", "other", "some", "own", "too", "very", "just", "now",
-        "also", "like", "trying", "try", "tried", "working", "work", "works", "issue",
-        "problem", "bug", "error", "something", "anything", "everything", "nothing",
+        "also", "like", "trying", "try", "tried",
+        "something", "anything", "everything", "nothing",
         "someone", "anyone", "everyone",
     )
 )
