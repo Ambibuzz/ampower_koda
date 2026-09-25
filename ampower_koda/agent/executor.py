@@ -766,25 +766,21 @@ def run_bench_and_commit(request_name: str) -> None:
                     f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
                 )
 
-        if deferred_cmds:
+        if deferred_cmds and not failed_cmds:
             for cmd in deferred_cmds:
                 bench_output_parts.append(f"$ {cmd}\n(deferred — runs after status update)\n")
 
         bench_log = "\n".join(bench_output_parts)
 
-        # `ok` was computed per command, written into the log text, published to
-        # the form — and then dropped. A failing `bench migrate` still arrived
-        # here as "Bench commands done", so the status said the build succeeded
-        # and only the log said otherwise. The pause for human testing is kept
-        # either way: a failed command is exactly when someone should look before
-        # pushing, and marking the request Failed would take that choice away.
-        extra = {"bench_log": bench_log[:50000]}
+        # Failed builds cannot be promoted to push approval. A later successful
+        # retry must also clear the old failure, not leave a stale error behind.
+        extra = {"bench_log": bench_log[:50000], "error_log": ""}
         if failed_cmds:
             message = (
                 f"{len(failed_cmds)} of {len(immediate_cmds)} bench command(s) FAILED on "
                 f"branch '{branch_name}': {', '.join(failed_cmds[:3])}"
                 f"{'…' if len(failed_cmds) > 3 else ''}. "
-                "Check the bench log before approving push."
+                "Repair the failing command and rerun bench verification before push."
             )
             extra["error_log"] = "\n".join(failed_cmds)
         else:
@@ -794,12 +790,13 @@ def run_bench_and_commit(request_name: str) -> None:
             )
 
         _update_status(
-            request_name, user, "Awaiting Push Approval", message, **extra
+            request_name, user, "Awaiting Bench Approval" if failed_cmds else "Awaiting Push Approval", message, **extra
         )
 
         frappe.db.commit()
 
-        for cmd in deferred_cmds:
+        for cmd in (() if failed_cmds else deferred_cmds):
+            check_active(reserve=5)
             try:
                 subprocess.Popen(
                     cmd.split(),
@@ -820,9 +817,7 @@ def run_bench_and_commit(request_name: str) -> None:
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
-# ---------------------------------------------------------------------------
 # Phase 3: Deployment (Push + Pull Request)
-# ---------------------------------------------------------------------------
 
 @managed_job
 def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True) -> None:
