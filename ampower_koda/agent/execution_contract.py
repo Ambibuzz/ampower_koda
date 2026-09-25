@@ -123,14 +123,60 @@ def completion_report(text: str) -> dict:
     return _parse_completion_report(text)[0]
 
 
+def _canonical_review_issues(value) -> list[str] | None:
+    """Issue objects (``criterion``, ``severity``, ``issue``) or plain strings as text lines.
+
+    None when an entry would have to be invented or dropped.
+    """
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        return None
+    issues = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            issues.append(item.strip())
+            continue
+        if isinstance(item, dict) and isinstance(item.get("issue"), str) and item["issue"].strip():
+            criterion = item.get("criterion")
+            severity = str(item.get("severity") or "").upper()
+            prefix = (f"[{severity}] " if severity in BLOCKING_SEVERITIES + ADVISORY_SEVERITIES else "") + (
+                f"Criterion {criterion}: " if type(criterion) is int else "")
+            issues.append(prefix + item["issue"].strip())
+            continue
+        return None
+    return issues
+
+
+BLOCKING_SEVERITIES = ("P0", "P1")
+ADVISORY_SEVERITIES = ("P2", "P3")
+
+
+def _advisory_only(value) -> bool:
+    """Whether every finding is explicitly marked P2/P3; one without a severity still blocks."""
+    if not isinstance(value, list) or not value:
+        return False
+    return all(isinstance(item, dict) and str(item.get("severity", "")).upper() in ADVISORY_SEVERITIES
+               for item in value)
+
+
 def review_decision(payload, criteria: list[str]) -> tuple[str, str]:
-    """Separate code defects from missing evidence; both remain fail-closed."""
-    invalid = "Invalid review result: return boolean review_passed, string issues, and evidence for every criterion."
+    """Separate code defects from missing evidence; both remain fail-closed.
+
+    Findings are ranked P0-P3. Only P0/P1 (the request does not work, data is
+    wrong, a regression) send the task back; P2/P3 pass with the notes attached.
+    """
+    invalid = (
+        "Invalid review result: return boolean review_passed, issues as an array of "
+        '{"criterion", "severity", "issue"} objects, and evidence for every criterion.'
+    )
     if not isinstance(payload, dict) or not isinstance(payload.get("review_passed"), bool):
         return "invalid", invalid
-    issues = payload.get("issues")
-    if not isinstance(issues, list) or any(not isinstance(i, str) or not i.strip() for i in issues):
+    raw_issues = payload.get("issues")
+    issues = _canonical_review_issues(raw_issues)
+    if issues is None:
         return "invalid", invalid
+    payload = {**payload, "issues": issues}
     evidence = payload.get("evidence")
     if not isinstance(evidence, list) or len(evidence) != len(criteria):
         return "invalid", invalid
@@ -148,13 +194,18 @@ def review_decision(payload, criteria: list[str]) -> tuple[str, str]:
             return "invalid", invalid
         seen.add(index)
         statuses.add(status)
+    advisory = _advisory_only(raw_issues)
     if payload["review_passed"]:
-        if issues or statuses - {"satisfied"}:
+        if (issues and not advisory) or statuses - {"satisfied"}:
             return "invalid", "Invalid review result: pass contradicts unresolved issues or criteria."
         return "pass", json.dumps(payload, ensure_ascii=True)
     # Resolve unknowns before sending a complete set of concrete defects to repair.
     if "unverified" in statuses:
         return "needs_evidence", json.dumps(payload, ensure_ascii=True)
+    if advisory:
+        return "pass", json.dumps({**payload, "review_passed": True,
+                                   "advisory": "Only P2/P3 findings remain; recorded, not blocking."},
+                                  ensure_ascii=True)
     if "unmet" in statuses and issues:
         return "repair", json.dumps(payload, ensure_ascii=True)
     return "invalid", invalid
