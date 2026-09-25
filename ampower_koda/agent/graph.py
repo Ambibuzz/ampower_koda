@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# LangGraph workflows: Planning (Understand -> Plan) and Execution (Implement -> Review).
-# Completion checks gate dependency progress; final integration reviews the full plan
-# before bench and deploy run in executor.py.
+# The agent's machinery: model access, the tool catalogue and tool-calling loop,
+# execution setup and the independent review. session.py runs a request through
+# them as one conversation; bench and deploy run in executor.py.
 
 import html
 import json

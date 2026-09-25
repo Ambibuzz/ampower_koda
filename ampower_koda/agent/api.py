@@ -33,7 +33,6 @@ from ampower_koda.agent.git_ops import (
 )
 from ampower_koda.agent.graph import _app_file_exists, _get_bench_env
 from ampower_koda.agent import tools as agent_tools
-
 from ampower_koda.agent.run_control import enqueue_job, stop_job
 
 DOCTYPE_NAME = "Agent Request"
@@ -111,14 +110,7 @@ def _whitelist_logged(fn):
 
 
 def _validate_provider_key(doc):
-    """Ensure the AI provider is enabled and its API key is configured in settings.
-
-    The mapping is imported rather than restated. Three copies of it used to
-    exist — here, in the executor, and in the settings controller — and a
-    provider added to the Select but missed in one of them fails as *"OpenAI API
-    key is not set"*, naming a provider the user never chose and sending them to
-    fill in a key they do not need.
-    """
+    """Ensure the AI provider is enabled and its API key is configured in settings."""
     settings = frappe.get_single("Agent Settings")
     if not settings.enable_ai_agent:
         frappe.throw(_("AI Coding Agent is disabled in Agent Settings."))
@@ -399,7 +391,7 @@ def reject_plan(request_name: str):
 @_whitelist_logged
 def suggest_task_context(request_name: str, query: str):
     """Rank code spans for a task the user is drafting, with the retriever the
-    planner used and no model call.
+    planner used, including its configured dedicated reranker.
 
     Indexing a large app takes tens of seconds, so the work runs as a job and the
     result arrives on the ``agent_task_suggestions`` realtime event carrying the

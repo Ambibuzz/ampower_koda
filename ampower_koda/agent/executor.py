@@ -1,11 +1,9 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
-# Executor phases: planning (understand + plan), execution (implement + review),
-# bench + commit, and deploy (push + PR). Enqueued as background jobs from api.py.
+# Background jobs enqueued from api.py: planning, execution, bench + commit, deploy.
 
 import datetime
 import json
 import os
-import re
 import subprocess
 
 import frappe
@@ -179,14 +177,8 @@ def _apply_langsmith(settings) -> None:
 def validate_target_app(app_name: str) -> str:
     """Fail on an app that is not on this bench, before anything touches git.
 
-    Without this the first thing to notice is ``get_repo_root``, three frames
-    inside the revert step, and what surfaces is ``ModuleNotFoundError: No
-    module named 'ampower_visualize'`` — which reads like a broken install
-    rather than a typo in a form field, and names nothing the user can act on.
-
-    Checked against ``apps.txt`` rather than the site's *installed* list: an app
-    can be present on the bench and legitimately not installed on this site, and
-    the agent only ever reads and edits files.
+    Checked against the bench's apps, not the site's installed list: the agent
+    only reads and edits files.
     """
     app_name = (app_name or "").strip()
     if not app_name:
@@ -264,9 +256,7 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
     frappe.publish_realtime("agent_progress", payload, user=user)
 
 
-# ---------------------------------------------------------------------------
-# Phase 1: Planning (Understand + Plan)
-# ---------------------------------------------------------------------------
+# Phase 1: Planning (investigate + plan, or revise the plan from the user's feedback)
 
 @managed_job
 def run_planning_phase(request_name: str, plan_feedback: str = "") -> None:
@@ -688,7 +678,7 @@ def _save_implementation_snapshot(request_name: str, doc, final_state: dict, is_
 
 
 def run_context_suggestion(request_name: str, query: str, token: str, user: str) -> None:
-    """Rank code spans for a task the user is adding to the plan. No model call.
+    """Rank code spans for a task with the shared retrieval/reranking pipeline.
 
     Runs as a job because indexing a large app takes longer than a web request
     should; the form matches the reply to its dialog by ``token``.
