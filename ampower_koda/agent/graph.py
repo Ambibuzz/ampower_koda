@@ -22,6 +22,7 @@ from ampower_koda.agent.cache_usage import persist_usage, provider_cost
 from ampower_koda.agent import koda_core
 from ampower_koda.agent import checkpoint
 from ampower_koda.agent import recovery
+from ampower_koda.agent.advisor import directive as advisor_directive
 from ampower_koda.agent.run_control import (
     check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES, MODEL_TIME_RESERVE,
 )
@@ -52,7 +53,7 @@ from ampower_koda.agent.prompts import (
 )
 
 
-from ampower_koda.agent.history_prune import prune_price, prune_rounds
+from ampower_koda.agent.history_prune import describe_call, prune_price, prune_rounds
 MAX_TOOL_ROUNDS_EXECUTION = 18
 MAX_TOOL_ROUNDS_REPAIR = 8        # a retry continues from current source with a remaining-work list
 MAX_TOOL_ROUNDS_REVIEW = 6
@@ -85,6 +86,9 @@ TOOL_FAILURE_PREFIXES = (
     "VALIDATION_UNAVAILABLE", "CALL_FAILED", "RUNTIME_UNAVAILABLE",
     "FIND_FAILED", "SEARCH_FAILED", "SUBMIT_FAILED", "EXPLORE_FAILED", "EXPLORE_UNAVAILABLE",
 )
+#: Tools whose failures say what to fix in the arguments, not a cause in the code.
+CAUSE_GUARD_EXEMPT = {"submit_plan", "explore"}
+
 # Per-phase output stored in conversation_log. High so full phase text is retained
 # (phase outputs are LLM summaries and are naturally well under this in practice).
 MAX_PHASE_OUTPUT_CHARS = 60000
@@ -101,6 +105,19 @@ MAX_READ_RESULT_CHARS = 80000
 # Searches and outlines bound themselves and say what they left out; the generic
 # cap would cut them without saying so.
 SELF_BOUNDED_TOOLS = {"read_file", "search_code", "get_file_outline"}
+# A result fetched with a purpose is read by a bare model call and the conversation
+# gets only its answer, so the full result is not re-sent with every later request.
+READER_TOOLS = frozenset({"read_file", "search_code", "get_file_outline", "call_method"})
+READER_MIN_CHARS = 1500  # shorter results cost less than the call that would read them
+READER_INPUT_CHARS = MAX_READ_RESULT_CHARS  # what the helper reads of one result, a whole read at most
+READER_OUTPUT_TOKENS = 4000  # the answer plus low-effort reasoning
+READER_SYSTEM = (
+    "You read one tool result for a coding agent that will not see it, and give it what it needs. "
+    "Answer the agent's purpose from this text alone. Cite each finding as path:line or path:start-end, "
+    "and copy identifiers exactly: function and method names, parameters, response keys, field names, "
+    "CSS classes, routes and messages. Quote code only where a line or two is itself the answer. Say what "
+    "the text covers of the purpose and what it does not. If nothing in it bears on the purpose, reply in "
+    "one line: \"UNRELATED: <what this text is>\". Never guess beyond the text. At most 25 lines.")
 # Mid-turn, a stale message is retired only where the rewrite is cheap: the
 # rewrite uncaches everything after it, so only messages with at most ~8k
 # tokens after them qualify, once ~1k tokens are free; further back, only a ~20k bulk saving.
@@ -415,6 +432,45 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
                       **direct_options)
 
 
+#: Open-keyed object parameters travel as JSON text, since strict tool schemas cannot express them.
+#: An object sent anyway is serialized before the tool runs; null becomes empty text.
+JSON_TEXT_ARGUMENTS = frozenset({"arguments", "replacements"})
+
+
+#: Failures of one tool on one target with one cause, since the last write, before
+#: another call is refused; catches arguments varied around an unfixable cause.
+FAILURE_CAUSE_LIMIT = 2
+
+#: Consecutive one-edit responses before the model is told what they cost.
+SINGLE_EDIT_STREAK = 3
+MAX_BATCH_NUDGES = 2
+BATCH_EDITS_TEXT = (
+    "Your last {rounds} responses each made one edit. Every response re-sends this whole conversation"
+    "{context}, so one edit per response pays that once per edit. Send every edit you already know, to "
+    "this file and any other, together in your next response; read first only what those edits need."
+)
+
+
+def _failure_target(name: str, arguments: dict) -> str:
+    """What a call acts on: its method or path, so varied arguments count together."""
+    return f"{name}:{arguments.get('method') or arguments.get('path') or ''}"
+
+
+#: Parts of an error line that vary between two runs of the same failure.
+_VOLATILE = _re.compile(r"\bline \d+|0x[0-9a-fA-F]+|\d{4}-\d\d-\d\d[ T][\d:.]+|\b\d+(?:\.\d+)?\s*(?:ms|s|seconds)\b")
+
+
+def _failure_cause(result: str) -> str:
+    """A failure's cause: the exception line of a traceback, else its first line.
+
+    Line numbers, addresses, timestamps and timings are masked; other numbers stay.
+    """
+    lines = [line.strip() for line in str(result or "").splitlines() if line.strip()]
+    errors = [line for line in lines if _re.match(r"^[A-Za-z_.]*(Error|Exception)\b.*:", line)]
+    line = (errors[-1] if errors else lines[0] if lines else "")[:200]
+    return _VOLATILE.sub("N", line)
+
+
 def _cache_read_price(provider: str, model: str) -> float:
     """A cached input token's price as a fraction of an uncached one."""
     if provider in ("OpenAI", "Claude"):
@@ -548,6 +604,12 @@ def _extract_file_paths(text: str) -> list[str]:
     return sorted(paths)
 
 
+def tool_reader(provider: str, model: str, request_name: str = ""):
+    """The bare call that reads a purpose read for the model: low effort, no tools, no conversation."""
+    llm = _get_llm(provider=provider, model=model, session_id=request_name, reasoning_effort="low")
+    return lambda messages: _invoke_limited(llm, messages, READER_OUTPUT_TOKENS)
+
+
 #: Tokens that calls outside a running tool loop (explore, the plan check) charged to a
 #: request. The loop adds them to its own total, so its next write does not undercount.
 _SIDE_TOKENS: dict[str, int] = {}
@@ -562,6 +624,14 @@ def _output_share(window: int, wanted: int) -> int:
     """An output cap that leaves the window room for a working prompt: at most a quarter of it."""
     return max(recovery.MIN_OUTPUT_TOKENS, min(int(wanted), int(window) // 4))
 
+
+def _reader_replaces(purpose: str, reader, result: str) -> bool:
+    """Whether a tool result goes to the reader and the model gets only its answer."""
+    return (bool(str(purpose or "").strip()) and reader is not None and _tool_result_succeeded(result)
+            and len(result) >= READER_MIN_CHARS)
+
+
+# Helpers
 
 def _app_file_exists(app_name: str, rel_path: str) -> bool:
     """True if rel_path resolves to a real file inside the app (best-effort)."""
@@ -847,10 +917,14 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                            require_writes: bool = False, progress: dict | None = None,
                            history: dict | None = None,
                            validate_final=None, shared_context: str = "",
-                           cache_phase: str = "") -> tuple[str, list[str], int, int, bool]:
+                           cache_phase: str = "", advisor=None,
+                           stop_when=None, reader=None, after_round=None) -> tuple[str, list[str], int, int, bool]:
     """
     Run a tool-calling loop, publishing every tool call and LLM response via realtime.
 
+    ``stop_when()``, checked after each tool round, ends the turn without another model call.
+    ``reader(messages)`` answers a call's ``purpose`` in place of its result; without it, results come whole.
+    ``after_round()`` runs after each complete tool round.
     Returns (text, edited_paths, tokens, model_calls, exhausted).
 
     ``history`` is an optional mutable dict that carries the retained rounds,
@@ -917,6 +991,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     seen_calls: dict[str, int] = history.setdefault("seen_calls", {})
     seen_results: dict[str, int] = history.setdefault("seen_results", {})
     failed_calls: dict[str, dict] = history.setdefault("failed_calls", {})
+    failure_causes: dict[str, dict] = history.setdefault("failure_causes", {})  # see _failure_cause
     progress_generation = int(history.get("tool_progress_generation", 0))
     round_base = int(history.get("rounds_done", 0))  # rounds already numbered by earlier loops
     total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
@@ -925,6 +1000,9 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     read_only_streak = 0
     write_nudges = 0
     READ_STREAK_LIMIT = 5
+    # One edit per response re-sends the whole conversation per edit. Twice per turn at most.
+    single_edit_streak = 0
+    batch_nudges = 0
     NUDGE_TEXT = (
         "Work toward the plan's acceptance criteria. Read any missing context "
         "needed for a correct edit, then apply and validate a focused change. "
@@ -1016,6 +1094,41 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         if freed:
             _publish_agent_log(request_name, "history_pruned", reason=reason,
                                freed_chars=freed, kept_rounds=len(rounds))
+
+    def charge(reply) -> int:
+        """Charge a helper call's reply (reader, advisor) to the request: tokens, cache and cost."""
+        nonlocal total_tokens
+        usage = getattr(reply, "usage_metadata", None) or {}
+        if not usage:
+            return 0
+        tokens = int(usage.get("total_tokens") or 0)
+        total_tokens += tokens + _SIDE_TOKENS.pop(request_name, 0)
+        details = usage.get("input_token_details") or {}
+        _persist_token_usage(request_name, total_tokens, input_tokens=int(usage.get("input_tokens") or 0),
+                             cache_read_tokens=int(details.get("cache_read") or 0),
+                             cache_write_tokens=int(details.get("cache_creation") or 0),
+                             cost_delta=provider_cost(reply))
+        if progress is not None:
+            progress["tokens"] = total_tokens
+        return tokens
+
+    def read_for(purpose: str, name: str, arguments: dict, raw: str, label) -> str:
+        """The bare call's answer to ``purpose`` in place of ``raw``; ``raw`` itself if it cannot answer."""
+        what = f"{name}({describe_call(name, arguments)})"
+        try:
+            reply = reader([SystemMessage(content=READER_SYSTEM),
+                            HumanMessage(content=f"Purpose: {purpose}\n\nResult of {what}:\n{raw}")])
+        except Exception:
+            log_agent_error("Agent Graph: tool reader", f"request={request_name}\n{frappe.get_traceback()}")
+            return raw
+        tokens = charge(reply)
+        answer = _llm_response_text(reply).strip()
+        _publish_agent_log(request_name, "tool_reader", round=label, tool_name=name, purpose=purpose[:200],
+                           result_chars=len(raw), answer_chars=len(answer), tokens=tokens)
+        if not answer:
+            return raw
+        return (f"[{what}, read for: {purpose[:200]}]\n{answer}\n"
+                f"[A helper read {len(raw):,} characters for this answer; call without purpose for the exact text.]")
 
     def maybe_trim(extra=(), with_tools=True, output_tokens=None):
         nonlocal evidence_chars
@@ -1279,7 +1392,9 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             )
 
             name = tc["name"]
-            arguments = dict(tc.get("args") or {})
+            arguments = {key: (value if key not in JSON_TEXT_ARGUMENTS or isinstance(value, str)
+                               else "" if value is None else json.dumps(value))
+                         for key, value in (tc.get("args") or {}).items()}
             retained_numbers = {entry["number"] for entry in rounds}
             call_key = _tool_call_key(name, arguments)
             prior_round = seen_calls.get(call_key) if name in REPLAYABLE_TOOLS else None
@@ -1295,7 +1410,22 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             tool_ok = False
             tool_invoked = False
             tool_raised = False
-            if unchanged_failed_call:
+            read_by_helper = False  # the model gets the reader's answer, not the source text
+            target = _failure_target(name, arguments)
+            cause_guarded = name not in WRITE_TOOLS and name not in CAUSE_GUARD_EXEMPT
+            known_cause = failure_causes.get(target) if cause_guarded else None
+            repeated_cause = (isinstance(known_cause, dict) and known_cause.get("count", 0) >= FAILURE_CAUSE_LIMIT
+                              and known_cause.get("writes") == history.get("write_generation", 0))
+            if repeated_cause:
+                result = (
+                    f"[{name} on {target.split(':', 1)[1] or 'this target'} failed {known_cause['count']} times with "
+                    f"the same cause since the last change: {known_cause['cause']} It was not run again: other "
+                    "arguments to the same call fail the same way. Read the code at the failure site and change "
+                    "it, or report the blocker.]"
+                )
+                _publish_agent_log(request_name, "repeated_failure_blocked", tool_name=name, round=label,
+                                   cause=known_cause["cause"][:200])
+            elif unchanged_failed_call:
                 result = (
                     f"[same failed call was already attempted in round {prior_failure.get('round')}; "
                     "it was not executed again because no successful intervening tool action changed the evidence. "
@@ -1329,7 +1459,18 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                             )
                         else:
                             seen_results[result] = label
+                    raw = result
                     result = _bounded_tool_result(name, arguments, result)
+                    purpose = str(arguments.get("purpose") or "").strip() if name in READER_TOOLS else ""
+                    if _reader_replaces(purpose, reader, result):
+                        # The helper reads the unbounded text; the conversation keeps only its answer.
+                        text = raw[:READER_INPUT_CHARS]
+                        answer = read_for(purpose, name, arguments, text, label)
+                        read_by_helper = answer is not text
+                        if read_by_helper:
+                            result = answer
+                            if seen_results.get(raw) == label:
+                                del seen_results[raw]  # the model never saw these bytes; an exact read must run
                 except Exception as e:
                     log_agent_error(
                         f"Agent Graph: tool {tc['name']}",
@@ -1355,7 +1496,20 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                         "generation": progress_generation,
                         "result": result[:1000],
                     }
-            if source_memory and name == "read_file" and not duplicate_call:
+            if tool_invoked and cause_guarded:
+                if tool_ok:
+                    failure_causes.pop(target, None)
+                elif not tool_raised:
+                    cause, writes = _failure_cause(result), history.get("write_generation", 0)
+                    entry = failure_causes.get(target)
+                    same = isinstance(entry, dict) and entry.get("cause") == cause and entry.get("writes") == writes
+                    count = entry["count"] + 1 if same else 1
+                    failure_causes[target] = {"cause": cause, "count": count, "writes": writes}
+                    if count == FAILURE_CAUSE_LIMIT:
+                        result += ("\n[Second failure with this same cause since the last change; varying the "
+                                   "arguments will not fix it. Read the code at the failure site, or report the blocker.]")
+
+            if source_memory and name == "read_file" and not duplicate_call and not read_by_helper:
                 source_memory.record(arguments, result, label)
             if name in WRITE_TOOLS:
                 if source_memory:
@@ -1394,6 +1548,25 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         # text anchor build on it. prune_rounds retires it once a newer view exists.
         rounds.append(round_entry)
         prune("batch", force=False, calls_made=round_num + 1)
+        if after_round is not None:
+            after_round()
+
+        if advisor is not None and round_had_write:
+            try:
+                notes, reply = advisor.advise(round_entry)
+            except Exception:
+                log_agent_error("Agent Graph: advisor", frappe.get_traceback())
+                notes, reply = [], None
+            _publish_agent_log(request_name, "advisor", round=label, tokens=charge(reply), notes=notes)
+            if notes:
+                # After this round's results, like any directive: nothing already sent changes.
+                _queue_directive(history, advisor_directive(notes))
+
+        if stop_when is not None and stop_when():
+            history["rounds_done"] = label
+            total_tokens += _SIDE_TOKENS.pop(request_name, 0)  # e.g. the check of the plan just submitted
+            return response_text, edited_paths, total_tokens, round_num + 1, False
+
         # A long read-only streak in implementation, even after an edit, gets one
         # reminder per turn to start editing.
         if round_had_write:
@@ -1407,6 +1580,23 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             _queue_directive(history, NUDGE_TEXT)
             _publish_agent_log(request_name, "write_nudge",
                 round=label, attempt=write_nudges, trigger="read_streak")
+        single_edit = round_had_write and len(response.tool_calls) == 1
+        single_edit_streak = single_edit_streak + 1 if single_edit else 0
+        if single_edit_streak >= SINGLE_EDIT_STREAK and batch_nudges < MAX_BATCH_NUDGES:
+            batch_nudges += 1
+            single_edit_streak = 0
+            context = int(history.get("previous_context_input_tokens") or 0)
+            _queue_directive(history, BATCH_EDITS_TEXT.format(
+                rounds=SINGLE_EDIT_STREAK, context=f" (about {context // 1000}k tokens)" if context else ""))
+            _publish_agent_log(request_name, "batch_nudge", round=label, attempt=batch_nudges, context_tokens=context)
+
+    if stop_when is not None:
+        # A turn that ends on a tool call (investigation's submit_plan) has no report to ask
+        # for: its caller decides what the time-up message says.
+        history["rounds_done"] = round_base + max_rounds
+        total_tokens += _SIDE_TOKENS.pop(request_name, 0)
+        return "", edited_paths, total_tokens, max_rounds, True
+
     # Tool calls are forbidden on this call. Without saying so, a model that still
     # wants to work writes its next tool calls as prose instead of a report.
     final_notice = HumanMessage(content=(
