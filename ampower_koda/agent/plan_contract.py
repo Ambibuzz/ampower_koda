@@ -7,6 +7,9 @@ import difflib
 import posixpath
 import re
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+
+
 MAX_PLAN_TASKS = 12
 MAX_TASK_CONTEXT_REFS = 6
 VALID_ACTIONS = {"MODIFY", "CREATE", "DELETE"}
@@ -73,6 +76,49 @@ PLAN_JSON_SCHEMA = {
         },
     },
     "required": ["overview", "scope", "assumptions", "risks", "tasks"],
+}
+
+
+PLAN_PATCH_OPS = ("set_action", "add_file", "add_context_ref", "remove_context_ref")
+
+PLAN_PATCH_SCHEMA = {
+    "title": "PlanPatch",
+    "description": (
+        "Edits that repair a rejected plan in place. Every edit names the op and "
+        "only the fields that op reads; leave the rest empty (\"\", [], 0)."
+    ),
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "edits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": list(PLAN_PATCH_OPS),
+                        "description": (
+                            "set_action(task_id, value MODIFY|CREATE|DELETE). "
+                            "add_file(task_id, path). "
+                            "add_context_ref(task_id, path, start, end, symbol, why). "
+                            "remove_context_ref(task_id, path)."
+                        ),
+                    },
+                    "task_id": {"type": "string", "description": "TODO N."},
+                    "path": {"type": "string"},
+                    "value": {"type": "string"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                    "symbol": {"type": "string"},
+                    "why": {"type": "string"},
+                },
+                "required": ["op", "task_id", "path", "value", "start", "end", "symbol", "why"],
+            },
+        },
+    },
+    "required": ["edits"],
 }
 
 
@@ -366,6 +412,19 @@ def plan_to_markdown(plan: dict) -> str:
     if plan.get("risks"):
         lines.append("## Risks\n" + "\n".join(f"- {item}" for item in plan["risks"]))
     return "\n\n".join(lines).strip()
+
+
+# Repair: patch a rejected plan instead of regenerating it
+
+@dataclass(frozen=True, slots=True)
+class PatchResult:
+    """The patched plan plus what did not apply, for the next repair round."""
+
+    plan: dict
+    applied: int = 0
+    rejected: tuple[str, ...] = field(default_factory=tuple)
+
+
 def _canonicalize_task_paths(tasks: list[dict], path_exists: Callable[[str], bool], *,
                              prefix: str, start: int = 0,
                              task_id: str = "") -> list[tuple[str, dict[str, str]]]:
@@ -451,6 +510,86 @@ def ground_plan_references(plan: dict, path_exists: Callable[[str], bool], *, ap
     return validate_plan(result)
 
 
+def apply_plan_patch(plan: dict, patch: dict) -> PatchResult:
+    """Apply plan-domain edits to the raw plan the model produced.
+
+    Works on the *unvalidated* dict so ``validate_plan`` runs again in full
+    afterwards; this function checks only what it needs to locate the target.
+    An edit that cannot be applied is reported, not raised: the loop feeds the
+    reports back with the remaining validation issues, and the model gets one
+    combined list rather than a crash on its first slip.
+    """
+    result = copy.deepcopy(plan) if isinstance(plan, dict) else {}
+    tasks = result.get("tasks")
+    if not isinstance(tasks, list):
+        return PatchResult(plan=result, rejected=("patch: plan.tasks is not a list; cannot patch",))
+    edits = patch.get("edits") if isinstance(patch, dict) else None
+    if not isinstance(edits, list):
+        return PatchResult(plan=result, rejected=("patch: no edits array returned",))
+
+    applied = 0
+    rejected: list[str] = []
+    for number, edit in enumerate(edits, start=1):
+        try:
+            _apply_edit(result, edit if isinstance(edit, dict) else {})
+            applied += 1
+        except (_EditError, ValueError, TypeError) as exc:
+            op = edit.get("op", "?") if isinstance(edit, dict) else "?"
+            rejected.append(f"patch edit {number} ({op}): {exc}")
+    return PatchResult(plan=result, applied=applied, rejected=tuple(rejected))
+
+
+class _EditError(ValueError):
+    pass
+
+
+def _find_task(tasks: list, task_id: str) -> dict:
+    wanted = (task_id or "").strip().casefold()
+    for task in tasks:
+        if isinstance(task, dict) and str(task.get("id", "")).strip().casefold() == wanted:
+            return task
+    raise _EditError(f"unknown task {task_id!r}")
+
+
+def _as_list(task: dict, key: str) -> list:
+    value = task.get(key)
+    if not isinstance(value, list):
+        value = []
+        task[key] = value
+    return value
+
+
+def _apply_edit(plan: dict, edit: dict) -> None:
+    op = str(edit.get("op") or "")
+    if op not in PLAN_PATCH_OPS:
+        raise _EditError(f"unknown op {op!r}")
+    task = _find_task(plan["tasks"], str(edit.get("task_id") or ""))
+    if op == "set_action":
+        task["action"] = str(edit.get("value") or "").strip().upper()
+        return
+    path = str(edit.get("path") or "").strip()
+    if not path:
+        raise _EditError(f"{op} needs path")
+    if op == "add_file":
+        files = _as_list(task, "files")
+        if path not in files:
+            files.append(path)
+    elif op == "add_context_ref":
+        _as_list(task, "context_refs").append({
+            "path": path,
+            "start": int(edit.get("start") or 0),
+            "end": int(edit.get("end") or 0),
+            "symbol": str(edit.get("symbol") or ""),
+            "why": str(edit.get("why") or ""),
+        })
+    else:
+        refs = _as_list(task, "context_refs")
+        kept = [r for r in refs if not (isinstance(r, dict) and r.get("path") == path)]
+        if len(kept) == len(refs):
+            raise _EditError(f"{path!r} not in context_refs")
+        task["context_refs"] = kept
+
+
 def _path_key(path: str) -> str:
     return re.sub(r"[\s_\-]+", "", path.replace("\\", "/").casefold())
 
@@ -485,3 +624,19 @@ def nearest_paths(path: str, candidates: Iterable[str], *, limit: int = 3) -> li
     return [candidate for _, candidate in scored[:limit]]
 
 
+def repair_feedback(issues: Iterable[str]) -> str:
+    """The message that asks the planner to fix a rejected plan: every validation issue, verbatim."""
+    lines = ["Validation rejected the plan. Issues:"]
+    lines.extend(f"- {issue}" for issue in issues)
+    lines.append("")
+    lines.append(
+        "Use paths exactly as they exist on disk, character for character. If the "
+        "mismatch between a planned path and the real file is itself the defect "
+        "being fixed, keep the task and plan the rename or CREATE explicitly "
+        "instead of pointing the task at the wrong file."
+    )
+    lines.append(
+        "Return only the edits that resolve these issues, as PlanPatch edits. "
+        "Do not restate or rewrite tasks that are not affected."
+    )
+    return "\n".join(lines)
