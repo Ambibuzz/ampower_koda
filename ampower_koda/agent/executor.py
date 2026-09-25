@@ -851,6 +851,16 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                     error_log=f"checkout failed: {out}")
                 return
 
+        # A follow-up after the PR was opened only pushes: the open PR picks up the new
+        # commits, and asking GitHub for a second one fails with "already exists".
+        existing_pr = (doc.pr_url or "").strip()
+        if existing_pr:
+            do_pr = False
+            if not do_push:
+                _update_status(request_name, user, "Awaiting Push Approval",
+                    f"A PR is already open ({existing_pr}); approve Push branch to update it.")
+                return
+
         _update_status(request_name, user, "Pushing", "Committing changes...")
         user_msg = (doc.user_message or "")[:200]
         commit_msg = f"[AI Agent] {doc.request_type or 'Improvement'}: {request_name}\n\n{user_msg}"
@@ -913,6 +923,8 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
             summary_parts.append(f"Branch '{branch_name}' pushed")
         if do_pr and pr_number:
             summary_parts.append(f"PR #{pr_number} created")
+        elif existing_pr and do_push:
+            summary_parts.append(f"existing PR updated ({existing_pr})")
 
         extra = {"branch_name": branch_name}
         if pr_url:
@@ -932,9 +944,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: str) -> bool:
     """True if `branch_name` has commits that `base_branch` does not (local only)."""
