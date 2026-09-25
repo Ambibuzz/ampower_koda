@@ -62,6 +62,7 @@ MIN_REPAIR_ROUNDS = 30            # a pass with fewer calls left than this first
 MAX_TOOL_ROUNDS_REVIEW = 6
 MAX_TOOL_ROUNDS_REVIEW_RECOVERY = 4  # continues the first pass's history, so these are new reads only
 MAX_REVIEW_ATTEMPTS = 2           # per task and for final integration
+MAX_REPAIR_STRATEGIES = 2         # fresh diagnoses before a repeated failure may stop
 BASE_EXECUTION_CALL_BUDGET = 18
 # A task must be able to afford one full implementation turn and one repair
 # turn, each with its forced final call. The old value of 10 left a one-task

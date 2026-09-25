@@ -13,12 +13,15 @@ import frappe
 from langchain_core.messages import messages_from_dict, messages_to_dict
 from langgraph.graph import END, StateGraph
 
-from ampower_koda.agent import graph, koda_core, verification
+from ampower_koda.agent import checkpoint, graph, koda_core, verification
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.plan_contract import PlanValidationError, ground_plan_references, plan_to_markdown, validate_plan
 from ampower_koda.agent.prompts import (
     get_explore_prompt,
     get_plan_feedback_prompt,
+    get_session_approval_prompt,
+    get_session_follow_up_prompt,
+    get_session_implemented_plan_prompt,
     get_session_request_prompt,
     get_explore_system_prompt,
 )
@@ -234,6 +237,128 @@ def plan_node(state: dict) -> dict:
         return {"error": str(error), "stage_log": logs}
 
 
+#: After a repair that did not work, the next one starts from the evidence, not the last patch.
+STRATEGY_CHANGE = (
+    "\n\n## CHANGE OF REPAIR STRATEGY {level}/{limit}\nThe previous patch did not resolve the failure. "
+    "Reproduce it with run_tests, read the exact failing path and its caller/consumer, and identify why the "
+    "prior patch was ineffective. Use a concrete input and expected output to choose a different, minimal "
+    "correction. Do not churn unrelated files, repeat the previous patch, or suppress the check. Run the "
+    "regression and connected tests again before reporting complete."
+)
+#: The static import check's hint that names the module a broken import should use.
+IMPORT_HINT = "; import it as '"
+IMPORT_RECOVERY = (
+    "\n\n## IMPORT RECOVERY PROCEDURE\nThe static checker has already searched the app and included exact "
+    "path:line import references and the existing canonical module in the finding. Edit those current "
+    "references now. Also use search_code for the missing dotted prefix to catch other live references. Do "
+    "not create a guessed package or __init__.py at the missing path, and do not report complete until "
+    "validate_code succeeds for every edited Python file."
+)
+
+
+def _repair_directive(state: dict, history: dict) -> str:
+    """The review's findings as the implementer's next message in the session."""
+    notes = state["review_notes"]
+    text = "## FINDINGS TO REPAIR\n" + notes
+    level = int(state.get("repair_strategy_level") or 0)
+    if level > int(history.get("strategy_level_sent") or 0):
+        # Once per new level: the conversation already holds the earlier ones.
+        text += STRATEGY_CHANGE.format(level=level, limit=graph.MAX_REPAIR_STRATEGIES)
+        history["strategy_level_sent"] = level
+    if IMPORT_HINT in notes:
+        text += IMPORT_RECOVERY
+    return (text + "\n\nFix these in the current files, run the affected checks again, then return the JSON "
+                   "completion report.")
+
+
+def _conversation(state: dict) -> dict:
+    """The history this pass continues: the investigation when fresh, else the implementation.
+
+    A plan without a saved investigation is implemented from the plan alone.
+    """
+    request_name = state.get("request_name", "")
+    # Calls or reviews already made mean a pass saved its conversation.
+    fresh = not (state.get("tool_rounds_used") or state.get("review_attempts")
+                 or state.get("is_follow_up") or state.get("resuming"))
+    history = load(request_name, PLANNING) if fresh else (load(request_name) or load(request_name, PLANNING))
+    if history.get("task_prompt"):
+        return history
+    return {"investigated": False, "task_prompt": get_session_request_prompt(
+        state.get("user_message", ""), state.get("request_type", "Improvement"),
+        verification.contract_context(state.get("verification_contract") or {}), request_name=request_name)}
+
+
+def implement_node(state: dict) -> dict:
+    """Phase 2, and every repair or follow-up: continue the session with writes enabled."""
+    if state.get("error"):
+        return {"error": state["error"]}
+    request_name = state.get("request_name", "")
+    history = _conversation(state)
+    _, criteria, allowed = graph._execution_context(state)
+    logs = graph._log_stage(state, "Implementing", "started", f"session attempt {state.get('review_attempts', 0) + 1}")
+    # The plan's files enter the baseline before any write, so a no-op is still reviewed.
+    baseline = dict(state.get("execution_baseline") or {})
+    for path in graph._review_paths(state, allowed):
+        if path not in baseline:
+            baseline[path] = graph._read_current(state, path)
+    state = {**state, "execution_baseline": baseline}
+    checkpoint.update(execution_baseline=baseline)
+
+    plan = state["plan_object"]
+    plan_json = json.dumps(plan, ensure_ascii=False, indent=1)
+    follow_up = (state.get("follow_up_message") or "").strip() if state.get("is_follow_up") else ""
+    # The worktree at the follow-up's start tells a repeated message apart from a resumed run.
+    follow_up_key = f"{state.get('follow_up_worktree_before', '')}\n{follow_up}"
+    if follow_up and history.get("follow_up") != follow_up_key:
+        if not history.get("approved"):
+            graph._queue_directive(history, get_session_implemented_plan_prompt(plan_json))
+            history["approved"] = True
+        # The user's next message, after the last run's own report, in the same conversation.
+        graph._queue_followup(history, state.get("implementation_memory") or "",
+                              get_session_follow_up_prompt(follow_up, request_name=request_name), kind="follow_up")
+        history["follow_up"] = follow_up_key
+    elif not history.get("approved"):
+        graph._queue_directive(history, get_session_approval_prompt(
+            plan_json, criteria, edited=history.get("proposed_plan") not in (None, plan),
+            investigated=history.get("investigated", True), request_name=request_name))
+        history["approved"] = True
+    elif state.get("review_notes"):
+        graph._queue_followup(history, json.dumps(state.get("task_completion") or {}, ensure_ascii=False),
+                              _repair_directive(state, history), kind="repair")
+    if state.get("resuming"):
+        # The interrupted pass may have written more than its saved conversation shows.
+        _, applied = graph.change_evidence(baseline, lambda p: graph._read_current(state, p), limit=12000)
+        graph._queue_directive(history, "## RESUMED AFTER AN INTERRUPTION\nThese changes are on disk now; "
+                                        "continue from them:\n" + (applied or "(no changes yet)"))
+
+    provider = state.get("ai_provider", "OpenAI")
+    model = state.get("ai_model", "gpt-4o-mini")
+    llm = graph._get_llm(provider=provider, model=model, session_id=request_name)
+    # Saved at start, after every round and on interrupt, so a resume never continues an older one.
+    work = _path(request_name)
+    prior = work.read_bytes() if work.is_file() else None
+    session = {"plan_sink": None, "explorer": _explorer(state, llm, provider, request_name),
+               "after_round": lambda: save(request_name, history)}
+    save(request_name, history)
+    try:
+        updates = graph._run_agent_turn(state, "Implementing", history["task_prompt"], read_only_tools=False,
+                                        max_rounds=graph.MAX_TOOL_ROUNDS_EXECUTION, history=history, session=session)
+    except BaseException:
+        save(request_name, history)
+        raise
+    if updates.get("review_stopped"):
+        # Roll back the conversation so a follow-up does not inherit an unanswered repair.
+        if prior is None:
+            work.unlink(missing_ok=True)
+        else:
+            work.write_bytes(prior)
+        return {"review_stopped": updates["review_stopped"],
+                "stage_log": graph._log_stage({**state, "stage_log": logs}, "Implementing", "stopped",
+                                              updates["review_stopped"][:200])}
+    save(request_name, history)
+    return {**graph._implementation_updates(state, updates, logs), "resuming": False}
+
+
 def build_planning_graph():
     workflow = StateGraph(AgentState)
     workflow.add_node("plan", plan_node)
@@ -241,3 +366,19 @@ def build_planning_graph():
     workflow.add_edge("plan", END)
     return workflow.compile()
 
+
+def build_execution_graph():
+    """Implement the whole plan in the session, review it, repair in the session."""
+    workflow = StateGraph(AgentState)
+    workflow.add_node("prepare", graph._checkpointed_node("prepare", graph.prepare_execution_node))
+    workflow.add_node("implement", graph._checkpointed_node("implement", implement_node))
+    workflow.add_node("review", graph._checkpointed_node("review", graph.review_node))
+    workflow.set_conditional_entry_point(lambda s: s.get("resume_node") or "prepare", {
+        "prepare": "prepare", "implement": "implement", "review": "review", "done": END,
+    })
+    workflow.add_edge("prepare", "implement")
+    workflow.add_edge("implement", "review")
+    workflow.add_conditional_edges("review", graph.should_retry_implement, {
+        "review": "review", "implement": "implement", "done": END,
+    })
+    return workflow.compile()
