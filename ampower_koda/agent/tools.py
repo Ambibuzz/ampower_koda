@@ -2,6 +2,7 @@
 # Agent tools for reading/writing and searching the target app codebase
 
 import difflib
+import hashlib
 import os
 import re
 import site
@@ -453,6 +454,119 @@ def write_file(app_name: str, path: str, content: str) -> str:
         return _tool_error("write_file", ex, f"WRITE_FAILED: Error: {ex}")
 
 
+def copy_file(app_name: str, source_path: str, destination_path: str, *,
+              replacements: dict[str, str] | None = None, expected_sha256: str = "") -> str:
+    """Copy a reference without regenerating it or overwriting an unrelated file."""
+    try:
+        check_active(reserve=5)
+        source = _resolve_path(app_name, source_path)
+        destination = _resolve_path(app_name, destination_path)
+        if source == destination:
+            return "COPY_FAILED: Source and destination are the same file."
+        content = read_bytes(source)
+        if content is None:
+            return f"COPY_FAILED: Source does not exist: {source_path}"
+        if expected_sha256 and hashlib.sha256(content).hexdigest() != expected_sha256:
+            return f"COPY_FAILED: Source changed since it was read: {source_path}. Read it again."
+        substitutions = replacements or {}
+        if not isinstance(substitutions, dict) or len(substitutions) > 12:
+            return "COPY_FAILED: Supply at most twelve literal identity replacements."
+        # One identity map is usually sent for a page's .json, .py and .js; a
+        # name one of them lacks is skipped and reported, not a failed copy.
+        absent = []
+        if substitutions:
+            text = content.decode('utf-8')
+            for old, new in substitutions.items():
+                if not isinstance(old, str) or not old or not isinstance(new, str):
+                    return "COPY_FAILED: Replacement keys must be nonempty strings and values must be strings."
+                if old not in text:
+                    absent.append(old)
+                    continue
+                text = text.replace(old, new)
+            content = text.encode('utf-8')
+        existing = read_bytes(destination)
+        if existing is not None:
+            if existing == content:
+                return f"COPY_OK: {destination_path} already has the requested copied content."
+            return f"COPY_FAILED: {destination_path} already exists with different content; edit that file instead."
+        _write_source(app_name, destination, content, None, exclusive=True)
+        skipped = f" Not in the source, so not applied: {', '.join(map(repr, absent))}." if absent else ""
+        return (f"COPY_OK: Copied {source_path} to {destination_path}; applied "
+                f"{len(substitutions) - len(absent)} literal identity replacement(s).{skipped}")
+    except Exception as ex:
+        return _tool_error("copy_file", ex, f"COPY_FAILED: {ex}")
+
+
+def delete_file(app_name: str, path: str, *, expected_sha256: str) -> str:
+    """Delete one explicitly approved file; reconcile retries and lost acknowledgements."""
+    try:
+        full = _resolve_path(app_name, path)
+        current = read_bytes(full)
+        if current is None:
+            return f"DELETE_OK: {path} is already absent."
+        if not expected_sha256 or hashlib.sha256(current).hexdigest() != expected_sha256:
+            return f"DELETE_FAILED: {path} changed since it was read; read it again."
+        check_active(reserve=5)
+        canonical = os.path.relpath(full, os.path.realpath(_app_root(app_name))).replace("\\", "/")
+        checkpoint.write_intent({canonical: current.decode("utf-8", errors="surrogateescape")}, {canonical: None})
+        try:
+            os.unlink(full)
+        except OSError:
+            if os.path.lexists(full):
+                raise
+        return f"DELETE_OK: Removed {path}."
+    except Exception as ex:
+        return _tool_error("delete_file", ex, f"DELETE_FAILED: {ex}")
+
+
+def rename_file(app_name: str, source_path: str, destination_path: str, *, expected_sha256: str = "") -> str:
+    """Move one file without overwriting another; interrupted moves can resume.
+
+    Linking the destination is exclusive on both POSIX and Windows. If removing
+    the source fails, both names point to the same file and the next call can
+    finish the move. A successful retry with an absent source requires a known
+    content digest, rather than assuming any existing destination is ours.
+    """
+    try:
+        source = _resolve_path(app_name, source_path)
+        destination = _resolve_path(app_name, destination_path)
+        if os.path.normcase(source) == os.path.normcase(destination):
+            return "RENAME_FAILED: Source and destination must be different file paths."
+
+        def digest(path):
+            with open(path, "rb") as stream:
+                return hashlib.sha256(stream.read()).hexdigest()
+
+        if not os.path.isfile(source):
+            if (not os.path.lexists(source) and expected_sha256 and os.path.isfile(destination)
+                    and digest(destination) == expected_sha256):
+                return f"RENAME_OK: Already moved {source_path} to {destination_path}; content verified."
+            return f"RENAME_FAILED: Source is missing or not a file: {source_path}. Inspect the current paths."
+        expected = expected_sha256 or digest(source)
+        if digest(source) != expected:
+            return f"RENAME_FAILED: Source changed since it was read: {source_path}. Read it again."
+        if os.path.lexists(destination):
+            if not os.path.samefile(source, destination) or os.stat(source).st_nlink < 2:
+                return f"RENAME_FAILED: Destination already exists: {destination_path}. No file overwritten."
+        else:
+            check_active(reserve=5)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            os.link(source, destination)  # Fails if another writer creates the destination first.
+        if not os.path.samefile(source, destination) or digest(destination) != expected:
+            return "RENAME_FAILED: Source changed during the move. Both paths were preserved; inspect them."
+        try:
+            check_active(reserve=5)
+            os.unlink(source)
+        except OSError:
+            # An acknowledgement can fail after the filesystem change, or a
+            # concurrent retry can remove the same source first. Verify reality.
+            if os.path.lexists(source) or not os.path.isfile(destination) or digest(destination) != expected:
+                raise
+        return f"RENAME_OK: Renamed {source_path} to {destination_path}; content preserved."
+    except Exception as ex:
+        return _tool_error("rename_file", ex, f"RENAME_FAILED: {ex}. Inspect both paths before retrying.")
+
+
 def edit_file(app_name: str, path: str, old_string: str, new_string: str, expected_occurrences: int = 1) -> str:
     """Replace exact text, requiring an explicit count for a deliberate repeated rename.
 
@@ -765,7 +879,7 @@ def get_file_outline(app_name: str, path: str) -> str:
 
 
 def read_doctype_schema(app_name: str, doctype_name: str) -> str:
-    """Read the JSON schema file for a Frappe DocType."""
+    """Read app source, or the installed schema of a dependency DocType."""
     try:
         app_root = _app_root(app_name)
         name_lower = doctype_name.replace(" ", "_").lower()
@@ -775,6 +889,19 @@ def read_doctype_schema(app_name: str, doctype_name: str) -> str:
                 full = os.path.join(dirpath, target_file)
                 with open(full, "r", encoding="utf-8", errors="replace") as f:
                     return f.read()
+        # A DocType of another installed app (ERPNext, Frappe) is read from the
+        # site's installed metadata, the schema that actually applies.
+        if callable(getattr(frappe, "get_meta", None)):
+            import json
+            meta = frappe.get_meta(doctype_name)
+            try:
+                columns = frappe.db.get_table_columns(doctype_name) if hasattr(frappe.db, "get_table_columns") else []
+            except Exception:
+                columns = []  # Single and virtual DocTypes have no table; their fields still apply
+            return json.dumps({"source": "installed site metadata", "name": meta.name,
+                "module": meta.module, "database_columns": columns,
+                "fields": [{key: field.get(key) for key in ("fieldname", "fieldtype", "options", "reqd")}
+                           for field in meta.fields if field.get("fieldname")]}, ensure_ascii=True)
         return f"DocType schema not found: {doctype_name}"
     except Exception as ex:
         return _tool_error("read_doctype_schema", ex, f"Error: {ex}")
