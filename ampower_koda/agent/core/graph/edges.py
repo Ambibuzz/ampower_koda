@@ -10,6 +10,7 @@ from types import MappingProxyType
 from ..constants import EDGE_WEIGHTS
 from ..contracts.repository import RepositoryIndex
 from ..contracts.source import Span
+from .relations import framework_relations
 
 EdgeKind = str
 
@@ -109,6 +110,10 @@ def build_graph(index: RepositoryIndex) -> CodeGraph:
                 )
 
     edges.extend(_containment_edges(index, definitions))
+    for relation in framework_relations(index):
+        edges.append(Edge(source=relation.source, target=relation.target,
+                          symbol=relation.symbol, kind=relation.kind,
+                          weight=0.6 if relation.kind == "test" else 0.9))
     return CodeGraph(
         edges=tuple(edges),
         outgoing=_group(edges, key=lambda edge: edge.source),
