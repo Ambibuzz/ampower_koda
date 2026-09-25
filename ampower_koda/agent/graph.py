@@ -42,7 +42,7 @@ from ampower_koda.agent.plan_contract import (
     plan_to_markdown,
     validate_plan,
 )
-from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, run_task_checks, CheckResult
+from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, run_task_checks, CheckResult, HealthReport
 from ampower_koda.agent.execution_contract import (
     load_plan, read_snapshot, change_evidence, review_verdict, review_decision, completion_report, revision,
 )
@@ -220,26 +220,37 @@ def _parse_review_verdict(text: str, criteria: list[str] | None = None) -> tuple
     return review_verdict(_extract_review_json(text or ""), criteria or [])
 
 
+def _review_recovery_reason(decision: str, notes: str, payload, criteria: list[str]) -> str:
+    """Say exactly what was wrong with the verdict, the way the plan repair does.
+
+    ``review_decision`` already knows — a contradictory pass, a missing
+    criterion, an unverified status — and a recovery prompt that only says
+    "needs correction" makes the model guess at which rule it broke.
+    """
+    if decision == "needs_evidence" and isinstance(payload, dict):
+        pending = [
+            f"criterion {e.get('criterion')}: {str(e.get('evidence') or '').strip()[:200]}"
+            for e in (payload.get("evidence") or []) if isinstance(e, dict) and e.get("status") == "unverified"
+        ]
+        return "Your verdict left these criteria unverified; fetch the source and decide each:\n- " + "\n- ".join(pending)
+    if payload is None:
+        return ("Your previous reply contained no JSON object with review_passed. Return the verdict as "
+                f"JSON only, with exactly {len(criteria)} evidence entries, one per numbered criterion.")
+    return "Your verdict was rejected: " + (notes or "invalid format") + (
+        f" Expected exactly {len(criteria)} evidence entries, criteria numbered 1..{len(criteria)}."
+    )
+
+
 def _extract_review_json(text: str) -> dict | None:
     """Pull a {"review_passed": ...} object out of the model's response.
 
     Tries, in order: the whole response as JSON, a ```json fenced block,
-    then the last {...} object found anywhere in the text — models
-    sometimes add a sentence of prose before or after the JSON despite
-    being asked not to.
+    then the last such object embedded in prose (nested objects included).
     """
-    candidates = []
-
-    stripped = text.strip()
-    candidates.append(stripped)
-
+    candidates = [text.strip()]
     fence_match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
     if fence_match:
         candidates.append(fence_match.group(1))
-
-    brace_match = _re.search(r"\{[^{}]*\"review_passed\"[^{}]*\}", text, _re.DOTALL)
-    if brace_match:
-        candidates.append(brace_match.group(0))
 
     for candidate in candidates:
         try:
@@ -248,12 +259,19 @@ def _extract_review_json(text: str) -> dict | None:
             continue
         if isinstance(parsed, dict) and "review_passed" in parsed:
             return parsed
-    return None
-    
 
-# ---------------------------------------------------------------------------
+    decoder, found = json.JSONDecoder(), None
+    for match in _re.finditer(r"\{", text):
+        try:
+            parsed, _ = decoder.raw_decode(text, match.start())
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and "review_passed" in parsed:
+            found = parsed
+    return found
+
+
 # LLM factory — supports OpenAI, OpenRouter, Gemini and Claude
-# ---------------------------------------------------------------------------
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -2807,6 +2825,53 @@ def _implementation_updates(state: dict, updates: dict, logs: list) -> dict:
     return updates
 
 
+def _review_fingerprint(changes: list) -> str:
+    """The changed-file state a failed review saw; equal to the last one means no progress."""
+    import hashlib
+    entries = sorted(f"{c.get('path')}\x00{c.get('after')}" for c in changes if isinstance(c, dict))
+    return hashlib.sha1("\x01".join(entries).encode("utf-8")).hexdigest() if entries else "none"
+
+
+def _review_outcome_fingerprint(changes: list, notes: str) -> str:
+    """Identify a failed state by both bytes and the finding to act on.
+
+    Returning to old bytes is only a repair cycle when the same evidence is
+    asking for the same correction. A new finding on those bytes is new
+    information and must get one implementation attempt.
+    """
+    import hashlib
+    source = _review_fingerprint(changes)
+    finding = " ".join(str(notes or "").split())
+    return hashlib.sha1(f"{source}\x00{finding}".encode("utf-8")).hexdigest()
+
+
+def _record_review_fingerprint(fingerprint: str, prior: list[str] | None) -> tuple[bool, list[str]]:
+    """Return whether this file state was already reviewed and the updated history."""
+    seen = list(prior or [])
+    cycled = fingerprint in seen
+    if not cycled:
+        seen.append(fingerprint)
+    return cycled, seen
+
+
+def _health_failure_fingerprint(health: HealthReport) -> str:
+    """Identity of deterministic checker failures, independent of file churn."""
+    def stable(detail):
+        detail = '\n'.join(line for line in detail.splitlines() if not line.startswith(
+            ('LIVE_ACCEPTANCE ', 'BROWSER DIAGNOSTICS ', 'KODA_TEST_SUMMARY ')))
+        detail = _re.sub(r"Ran (\d+) tests? in [\d.]+s", r"Ran \1 tests", detail)
+        return _re.sub(r"(duration_ms:|# duration_ms)\s*[\d.]+", r"\1 <elapsed>", detail)
+    failures = sorted(
+        (result.name, stable(result.detail), result.owner)
+        for result in health.failures
+        if result.owner == "implementation"
+    )
+    if not failures:
+        return ""
+    import hashlib
+    return hashlib.sha1(json.dumps(failures, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
 def _prepare_verification_contract(state: dict) -> dict:
     # Explicitly approved test changes may update expectations for changed
     # requirements. Other pre-existing regressions remain fixed during repair.
@@ -3079,3 +3144,27 @@ def build_execution_graph():
         "review": "review", "implement": "implement",
     })
     return workflow.compile()
+def _checkpoint_next_node(name: str, merged: dict, updates: dict) -> str:
+    """Persist the node that can make progress, not merely the node that failed."""
+    if updates.get("error"):
+        if name == "review" and merged.get("review_repairable"):
+            return "implement"
+        return name
+    if name == "review":
+        return should_retry_implement(merged)
+    return {"prepare": "implement", "implement": "review"}[name]
+
+
+def _checkpointed_node(name, fn):
+    def run(state):
+        check_active(reserve=5)
+        active = checkpoint.journal()
+        if active:
+            active.begin(state, name)
+        updates = fn(state)
+        if active:
+            merged = {**state, **updates}
+            next_node = _checkpoint_next_node(name, merged, updates)
+            active.begin(merged, next_node)
+        return updates
+    return run
