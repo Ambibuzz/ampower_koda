@@ -203,7 +203,8 @@ function render_status_dashboard(frm) {
             + '<strong>Review the plan todos</strong>'
             + '<p style="margin:6px 0 0;font-size:12px;color:var(--text-muted);">'
             + 'The plan describes <b>what</b> to build — not source code. '
-            + 'Edit todos if needed, then click <b>Approve Plan</b> to start implementation.</p>'
+            + 'Edit todos if needed, or use <b>Revise Plan</b> to answer its question in your own words; '
+            + 'then click <b>Approve Plan</b> to start implementation.</p>'
             + '</div>';
     }
 
@@ -536,6 +537,10 @@ function setup_action_buttons(frm) {
             approve_plan(frm);
         }, __('Actions'));
 
+        frm.add_custom_button(__('Revise Plan'), function () {
+            revise_plan(frm);
+        }, __('Actions'));
+
         frm.add_custom_button(__('Execute Existing Plan'), function () {
             execute_existing_plan(frm);
         }, __('Actions'));
@@ -675,7 +680,7 @@ function start_agent(frm) {
         });
     }
 
-    if (frm.dirty()) {
+    if (frm.is_dirty()) {
         frm.save().then(do_start);
     } else {
         do_start();
@@ -703,7 +708,7 @@ function execute_existing_plan(frm) {
                     }
                 });
             }
-            if (frm.dirty()) {
+            if (frm.is_dirty()) {
                 frm.save().then(do_execute);
             } else {
                 do_execute();
@@ -714,29 +719,81 @@ function execute_existing_plan(frm) {
 
 function approve_plan(frm) {
     frappe.confirm(
-        __('Approve this plan and start implementation?<br><br>The agent will implement and review each task, then request approval for bench commands.'),
+        __('Approve this plan and start implementation?<br><br>The agent will implement and review the plan, then request approval for bench commands.'),
         function () {
-            var plan_json = frm.doc.plan_json || '';
-            frappe.call({
-                method: 'ampower_koda.agent.api.approve_plan',
-                args: {
-                    request_name: frm.doc.name,
-                    plan_json: plan_json
-                },
-                freeze: true,
-                freeze_message: __('Starting execution...'),
-                callback: function (r) {
-                    if (r.message && r.message.status === 'ok') {
-                        frappe.show_alert({
-                            message: __('Plan approved: execution in progress...'),
-                            indicator: 'green'
-                        });
-                        frm.reload_doc();
+            function do_approve() {
+                var plan_json = frm.doc.plan_json || '';
+                frappe.call({
+                    method: 'ampower_koda.agent.api.approve_plan',
+                    args: {
+                        request_name: frm.doc.name,
+                        plan_json: plan_json
+                    },
+                    freeze: true,
+                    freeze_message: __('Starting execution...'),
+                    callback: function (r) {
+                        if (r.message && r.message.status === 'ok') {
+                            frappe.show_alert({
+                                message: __('Plan approved: execution in progress...'),
+                                indicator: 'green'
+                            });
+                            frm.reload_doc();
+                        }
                     }
-                }
-            });
+                });
+            }
+            // The worker reads the saved row; an unsaved switch (e.g. Browser
+            // Testing) would otherwise be lost by the reload after enqueue.
+            if (frm.is_dirty()) {
+                frm.save().then(do_approve);
+            } else {
+                do_approve();
+            }
         }
     );
+}
+
+function revise_plan(frm) {
+    // The agent continues the investigation that produced the plan instead of starting over.
+    var dialog = new frappe.ui.Dialog({
+        title: __('Revise Plan'),
+        fields: [{
+            fieldname: 'feedback',
+            fieldtype: 'Small Text',
+            label: __('What should the plan change?'),
+            reqd: 1,
+            description: __('Answer the plan\'s question or correct its reading; your edits to the todos are kept.')
+        }],
+        primary_action_label: __('Revise'),
+        primary_action: function (values) {
+            dialog.hide();
+            function send() {
+                frappe.call({
+                    method: 'ampower_koda.agent.api.revise_plan',
+                    args: {
+                        request_name: frm.doc.name,
+                        feedback: values.feedback,
+                        plan_json: frm.doc.plan_json || ''
+                    },
+                    freeze: true,
+                    freeze_message: __('Sending feedback...'),
+                    callback: function (r) {
+                        if (r.message && r.message.status === 'ok') {
+                            frappe.show_alert({ message: __('Revising the plan...'), indicator: 'blue' });
+                            frm.reload_doc();
+                        }
+                    }
+                });
+            }
+            // The revision job reads the saved row (prompt overrides included); the reload would drop edits.
+            if (frm.is_dirty()) {
+                frm.save().then(send);
+            } else {
+                send();
+            }
+        }
+    });
+    dialog.show();
 }
 
 function reject_plan(frm) {
