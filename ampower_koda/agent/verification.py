@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 
+from .checks import CheckResult, HealthReport
 from .run_control import check_active
 from .tools import _app_root, command_environment
 
@@ -705,3 +706,107 @@ def _containment(output: str) -> tuple[str, str, str]:
                   f"{_plural(jobs, 'background job')} and {_plural(emails, 'email')} discarded")
         return "".join(lines), phrase, shown
     return output, UNCOUNTED, ""
+
+
+def run_verification(app_name: str, contract: dict, *, env: dict | None = None,
+                     required: bool = True) -> tuple[HealthReport, list[dict]]:
+    """Nonzero exits are repair findings, never exceptions or model-owned verdicts."""
+    root = Path(_app_root(app_name)).resolve()
+    results, receipts = [], []
+    try:
+        path = _inside(root, CONFIG_PATH)
+        current = path.read_text(encoding="utf-8") if path.is_file() else None
+        if current != contract.get("config"):
+            return HealthReport([CheckResult("tests:configuration", False,
+                "Verification configuration changed during execution. Restore the original configuration; "
+                "the test command cannot be weakened to make a repair pass.")]), []
+        for relative, digest in contract.get("existing_tests", {}).items():
+            path = _inside(root, relative)
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                results.append(CheckResult(f"tests:contract:{relative}", False,
+                    "A pre-existing regression test changed or was removed. Restore it and fix the implementation."))
+        for relative, digest in (contract.get("frozen_tests") or {}).items():
+            path = _inside(root, relative)
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                results.append(CheckResult(f"tests:frozen:{relative}", False,
+                    "This test passed earlier in this run, so it is now part of the contract. Restore it "
+                    "exactly and fix the implementation; add a new test for new behavior."))
+        if results:
+            return HealthReport(results), []
+        files = test_files(root)
+        test_revisions = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+        commands = list(contract.get("commands") or [])
+        python_files = [p for p in files if p.suffix == ".py"]
+        if python_files:
+            commands.append({"name": "unittest", "argv": [sys.executable, "-c", _UNITTEST_RUNNER, *map(str, python_files)],
+                             "cwd": ".", "timeout_seconds": DEFAULT_TIMEOUT, "portable": True, 'python': True})
+        javascript = [p for p in files if p not in python_files]
+        if javascript:
+            commands.append({"name": "node:test", "argv": ["node", "--test", "--test-reporter=tap", *map(str, javascript)],
+                             "cwd": ".", "timeout_seconds": DEFAULT_TIMEOUT, "node": True, "portable": True})
+        if not commands:
+            detail = ("No executable behavioral tests were found. Add unittest test*.py under .koda/tests that "
+                      "import the changed server code and run it against the live site, with the records each "
+                      "case needs read or inserted inside the test (writes are rolled back), then call "
+                      "run_tests." if required else
+                      "No tests found; none are required because no server Python changed.")
+            return HealthReport([CheckResult("tests:missing", not required, detail, verified=False)]), []
+        command_env = _runner_environment(root, env)
+        for command in commands:
+            name, argv = command["name"], command["argv"]
+            runner_env = dict(command_env)
+            if command.get('portable'):
+                # Our portable runners import the outer app package from an
+                # explicit root. Host-configured commands keep Python's normal
+                # script-directory imports; -P would break their own helpers.
+                runner_env['PYTHONSAFEPATH'] = '1'
+            try:
+                if command.get("python"):
+                    # The contained tests' overlay and temporary files live here and go with it.
+                    with tempfile.TemporaryDirectory(prefix="koda-tests-", ignore_cleanup_errors=True) as scratch:
+                        scratch = os.path.realpath(scratch)
+                        temporary = os.path.join(scratch, "tmp")
+                        os.mkdir(temporary)
+                        code, output, timed_out = _execute(argv, _inside(root, command.get("cwd", ".")), {
+                            **runner_env, "KODA_CALL_SCRATCH": scratch,
+                            "TMPDIR": temporary, "TEMP": temporary, "TMP": temporary}, command["timeout_seconds"])
+                    if runner_env.get("KODA_SITE"):
+                        output, contained, discarded = _containment(output)
+                        output += f"\n[containment] {contained}" + ("\n" + discarded if discarded else "")
+                else:
+                    code, output, timed_out = _execute(argv, _inside(root, command.get("cwd", ".")),
+                                                     runner_env, command["timeout_seconds"])
+                passed = code == 0 and not timed_out
+                summary = test_summary(output) or (_flat_node_summary(output) if command.get('node') else None)
+                if command.get('python') and (not summary or not summary['passed'] or summary['failed']):
+                    passed = False
+                    output += '\nThe Python runner must finish and report at least one executed passing test.'
+                if summary and summary['failed']:
+                    passed = False
+                if command.get("node") and not _node_executed_tests(output, javascript, root):
+                    passed = False
+                    output += "\nNode must execute at least one passing test; zero tests or all skipped is not verification."
+                detail = f"exit={code}" + (f"; timeout after {command['timeout_seconds']}s" if timed_out else "")
+                detail += "\n" + output
+                if RUNNER_ERROR in output:
+                    results.append(CheckResult(f"tests:{name}", False, detail + ENVIRONMENT_NOTE, owner="environment"))
+                    continue
+                results.append(CheckResult(f"tests:{name}", passed, detail))
+                receipts.append({"name": name, "argv": argv, "exit_code": code, "passed": passed,
+                                 "timed_out": timed_out, "output": output,
+                                 "test_revisions": test_revisions, 'test_summary': summary,
+                                 'portable': bool(command.get('portable'))})
+            except (OSError, subprocess.SubprocessError) as exc:
+                results.append(CheckResult(f"tests:{name}", False,
+                    f"Test runner could not start: {type(exc).__name__}: {exc}", owner="environment"))
+        after = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in test_files(root)}
+        config_after = _inside(root, CONFIG_PATH)
+        config_text = config_after.read_text(encoding="utf-8") if config_after.is_file() else None
+        if after != test_revisions or config_text != contract.get("config"):
+            results.append(CheckResult("tests:changed-during-run", False,
+                "Test sources or configuration changed while checks ran. Restore the test contract and rerun; "
+                "a test process cannot rewrite its own checks to pass."))
+    except (OSError, ValueError) as exc:
+        results.append(CheckResult("tests:environment", False,
+                                   f"Cannot prepare behavioral verification: {exc}", owner="environment"))
+    return HealthReport(results), receipts
