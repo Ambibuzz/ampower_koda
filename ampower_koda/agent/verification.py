@@ -8,6 +8,7 @@ Commands are frozen before implementation and are never inferred from model pros
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ import time
 
 from .checks import CheckResult, HealthReport
 from .run_control import check_active
-from .tools import _app_root, command_environment
+from .tools import ARCHIVE_DIRECTORY, _app_root, command_environment
 
 CONFIG_PATH = ".koda/verification.json"
 TEST_DIRECTORY = ".koda/tests"
@@ -515,6 +516,45 @@ def test_files(root: Path) -> list[Path]:
 
 
 
+def _tracked_tests(directory: Path) -> set[str]:
+    """Paths under ``directory`` that git tracks, relative to it. Empty when git cannot say."""
+    try:
+        done = subprocess.run(["git", "-C", str(directory), "ls-files", "-z"], capture_output=True,
+                              timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if done.returncode:
+        return set()
+    return {name for name in done.stdout.decode("utf-8", "replace").split("\0") if name}
+
+
+def archive_untracked_tests(app_name: str, *, label: str = "") -> list[str]:
+    """Move tests an earlier agent run left behind (untracked by git) to ``.koda/archive``.
+
+    ``.koda/`` is git-ignored, so a new run would otherwise freeze an old run's tests as
+    pre-existing regression tests. Committed tests stay; the rest are moved, not deleted.
+    """
+    root = Path(_app_root(app_name)).resolve()
+    directory = _inside(root, TEST_DIRECTORY)
+    if not directory.is_dir():
+        return []
+    tracked = _tracked_tests(directory)
+    leftovers = sorted(p for p in directory.rglob("*")
+                       if p.is_file() and p.relative_to(directory).as_posix() not in tracked
+                       and "__pycache__" not in p.relative_to(directory).parts)
+    if not leftovers:
+        return []
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-")[:60]
+    destination = _inside(root, f"{ARCHIVE_DIRECTORY}/{time.strftime('%Y%m%d-%H%M%S')}" + (f"-{name}" if name else ""))
+    moved = []
+    for path in leftovers:
+        target = destination / path.relative_to(directory)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(path, target)
+        moved.append(path.relative_to(root).as_posix())
+    return moved
+
+
 def prepare_contract(app_name: str, *, editable_tests=()) -> dict:
     """Snapshot host configuration and pre-existing regression tests once."""
     root = Path(_app_root(app_name)).resolve()
@@ -583,6 +623,100 @@ def needs_tests(paths) -> bool:
     """
     return any(p.endswith(".py") and not p.startswith(".koda/") and not p.endswith("__init__.py")
                for p in paths)
+
+
+def _is_module(root: Path, dotted: str) -> bool:
+    """Whether ``dotted`` names a module of the app; ``root`` may be the package or its parent."""
+    parts = dotted.split(".")
+    for base in (root.joinpath(*parts[1:]), root.joinpath(*parts)):
+        if base.with_suffix(".py").is_file() or (base / "__init__.py").is_file():
+            return True
+    return False
+
+
+def _is_patch(func) -> bool:
+    return (isinstance(func, ast.Name) and func.id == "patch") or (
+        isinstance(func, ast.Attribute) and func.attr == "patch")
+
+
+def self_mocks(root: Path, path: Path, package: str) -> list[str]:
+    """Where a Python test patches the app module it imports to test.
+
+    Such a test passes whatever the code does. Patching another module (an external service) is allowed.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return []
+    aliases, tested = {}, set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for name in node.names:
+                if name.name.split(".")[0] == package:
+                    tested.add(name.name)
+                    if name.asname:
+                        aliases[name.asname] = name.name
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == package:
+            for name in node.names:
+                dotted = f"{node.module}.{name.name}"
+                if _is_module(root, dotted):
+                    tested.add(dotted)
+                    aliases[name.asname or name.name] = dotted
+                else:
+                    tested.add(node.module)
+
+    def patched(target) -> str:
+        if isinstance(target, ast.Constant) and isinstance(target.value, str):
+            return target.value if any(target.value.startswith(m + ".") for m in tested) else ""
+        if isinstance(target, ast.Name) and target.id in aliases:
+            return aliases[target.id]
+        return ""
+
+    found = []
+    for node in ast.walk(tree):
+        what = ""
+        if isinstance(node, ast.Call) and node.args:
+            func = node.func
+            if _is_patch(func) or (isinstance(func, ast.Name) and func.id == "setattr"):
+                what = patched(node.args[0])
+            elif isinstance(func, ast.Attribute) and func.attr == "object" and _is_patch(func.value):
+                what = patched(node.args[0])
+        elif isinstance(node, (ast.Assign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            what = next((patched(t.value) for t in targets
+                         if isinstance(t, ast.Attribute) and patched(t.value)), "")
+        if what:
+            found.append(f"line {node.lineno}: {what}")
+    return found
+
+
+def freeze_passing(contract: dict, receipts: list[dict], root: Path, mocked=()) -> list[str]:
+    """Make agent tests that have passed part of the contract; return the newly frozen paths.
+
+    A test the agent can still rewrite is not evidence, so once green it changes only when a reviewer names it.
+    """
+    frozen = contract.setdefault("frozen_tests", {})
+    added = []
+    for receipt in receipts:
+        if not receipt.get("passed"):
+            continue
+        argv = set(receipt.get("argv") or [])
+        for relative, digest in (receipt.get("test_revisions") or {}).items():
+            if (relative in frozen or relative in contract.get("existing_tests", {}) or relative in mocked
+                    or str(_inside(root, relative)) not in argv):
+                continue
+            frozen[relative] = digest
+            added.append(relative)
+    return added
+
+
+def release_frozen(contract: dict, text: str) -> list[str]:
+    """Unfreeze the agent tests a review finding names, so the repair may correct them."""
+    frozen = contract.get("frozen_tests") or {}
+    released = [p for p in frozen if p in text or Path(p).name in text]
+    for path in released:
+        del frozen[path]
+    return released
 
 
 def _stop_process(proc) -> None:
@@ -735,6 +869,18 @@ def run_verification(app_name: str, contract: dict, *, env: dict | None = None,
             return HealthReport(results), []
         files = test_files(root)
         test_revisions = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+        mocked = {}
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            if path.suffix == ".py" and relative not in contract.get("existing_tests", {}):
+                found = self_mocks(root, path, app_name)
+                if found:
+                    mocked[relative] = found
+                    results.append(CheckResult(f"tests:mocked:{relative}", False,
+                        "This test patches the app module it tests (" + "; ".join(found[:5]) + "), so it "
+                        "passes whatever that code does. Remove those patches and run the real code against "
+                        "the live site: read existing records, or insert the ones a case needs inside the "
+                        "test (writes are rolled back). Patch only external services such as HTTP or email."))
         commands = list(contract.get("commands") or [])
         python_files = [p for p in files if p.suffix == ".py"]
         if python_files:
@@ -806,6 +952,8 @@ def run_verification(app_name: str, contract: dict, *, env: dict | None = None,
             results.append(CheckResult("tests:changed-during-run", False,
                 "Test sources or configuration changed while checks ran. Restore the test contract and rerun; "
                 "a test process cannot rewrite its own checks to pass."))
+        else:
+            freeze_passing(contract, receipts, root, mocked)
     except (OSError, ValueError) as exc:
         results.append(CheckResult("tests:environment", False,
                                    f"Cannot prepare behavioral verification: {exc}", owner="environment"))
