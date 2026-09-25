@@ -11,6 +11,10 @@ from .schema import CoreConfig, config_defaults
 
 T = TypeVar("T")
 
+RETIRED_GROUPS = frozenset({"escalation"})
+"""Top-level tables that no longer configure anything. An old config file that
+still carries one is accepted and the table ignored, not rejected."""
+
 
 def merge_config(
     *overrides: Mapping[str, Any] | None,
@@ -18,12 +22,9 @@ def merge_config(
 ) -> CoreConfig:
     """Apply sparse ``overrides`` over ``base``, lowest precedence first.
 
-    Returns what ``_apply`` built rather than re-listing the groups. The old
-    rebuild named six of the seven and dropped ``escalation`` on the last line,
-    so a site could set ``escalation.max_rewrites``, have it accepted, validated
-    against its bounds — and then silently receive the default. A hand-written
-    field list here is a second copy of :class:`CoreConfig` that nothing checks,
-    and the next group added would have been dropped the same way.
+    Returns what ``_apply`` built rather than re-listing the groups: a
+    hand-written field list here would be a second copy of :class:`CoreConfig`
+    that nothing checks, and once silently dropped a whole group.
 
     ``_apply`` returns ``replace(node, **updates)``, which is a complete config
     and re-runs ``__post_init__``, so every group is still validated.
@@ -46,6 +47,8 @@ def _apply(node: T, override: Mapping[str, Any], *, prefix: str) -> T:
     for key, value in override.items():
         path = f"{prefix}{key}"
         spec = known.get(key)
+        if spec is None and not prefix and key in RETIRED_GROUPS:
+            continue
         if spec is None:
             raise ConfigError(path, f"unknown key; expected one of {sorted(known)}")
 

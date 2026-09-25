@@ -15,15 +15,7 @@ from .agent import (
 )
 from .analysis import FileAnalysis, SkippedFile, SkipReason
 from .chunks import Chunk, ChunkKind, is_indexable_role
-from .escalation import (
-    Escalation,
-    FanoutAngle,
-    Formulation,
-    Formulator,
-    Rewrite,
-    Rung,
-    SideUsage,
-)
+from .escalation import SideUsage
 from .ledger import (
     LEDGER_KINDS,
     BlobRef,
@@ -86,13 +78,9 @@ __all__ = [
     "Confidence",
     "Definition",
     "DefinitionSite",
-    "Escalation",
-    "FanoutAngle",
     "FileAnalysis",
     "FileRanks",
     "FileStat",
-    "Formulation",
-    "Formulator",
     "Hit",
     "LEDGER_KINDS",
     "LEG_TRUST",
@@ -117,8 +105,6 @@ __all__ = [
     "RepoMap",
     "RepoMemory",
     "RepositoryIndex",
-    "Rewrite",
-    "Rung",
     "SYMBOL_ROLES",
     "SearchResult",
     "Session",

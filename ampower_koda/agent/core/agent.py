@@ -19,7 +19,7 @@ from .contracts.agent import (
     TurnResult,
     TurnUsage,
 )
-from .contracts.escalation import Formulator, SideUsage
+from .contracts.escalation import SideUsage
 from .contracts.ledger import Ledger
 from .contracts.model import UtilityModel
 from .contracts.prompt import PromptBudget
@@ -28,7 +28,6 @@ from .contracts.working_set import WorkingSet
 from .elide.collapse import READ_TOOLS
 from .elide.compact import ThrashGuard, compact
 from .elide.hotcold import hot_cold
-from .escalate.memo import FormulationCache
 from .fold.document import SessionState
 from .fold.run import fold_turn
 from .ledger.distill import distil_into
@@ -89,7 +88,6 @@ def run_turn(
     model: ChatModel,
     host: ToolHost | None = None,
     utility: UtilityModel | None = None,
-    formulator: Formulator | None = None,
     role_prompt: str = ROLE_PROMPT,
     model_id: str = DEFAULT_ARCHITECT_MODEL,
     overrides: dict | None = None,
@@ -128,7 +126,6 @@ def run_turn(
         model=model,
         model_id=model_id,
         host=host or NullHost(),
-        formulator=formulator,
         role_prompt=role_prompt,
         max_output_tokens=max(1, int(max_output_tokens)),
     )
@@ -172,7 +169,7 @@ class _State:
         self.stop_reason = "answered"
 
 
-def _rounds(state, *, working, model, model_id, host, formulator, role_prompt,
+def _rounds(state, *, working, model, model_id, host, role_prompt,
             max_output_tokens):  # noqa: ANN001, PLR0913
     """The loop. One model call per iteration, tools in emission order."""
     forced = False
@@ -243,7 +240,7 @@ def _rounds(state, *, working, model, model_id, host, formulator, role_prompt,
             state.stop_reason = late.reason
             return state
 
-        novel = _dispatch(state, calls, host=host, formulator=formulator)
+        novel = _dispatch(state, calls, host=host)
         state.meters = state.meters.next_round(dry=gates.is_dry(novel, max(novel, 1)))
         _elide(state)
 
@@ -252,7 +249,7 @@ def _rounds(state, *, working, model, model_id, host, formulator, role_prompt,
     return state
 
 
-def _dispatch(state, calls: Sequence[ToolCall], *, host, formulator) -> int:  # noqa: ANN001, ARG001
+def _dispatch(state, calls: Sequence[ToolCall], *, host) -> int:  # noqa: ANN001
     """Run every call in emission order, distilling each result as it lands."""
     novel = 0
     for call in calls:
@@ -484,7 +481,6 @@ def _append(transcript: Transcript, role: str, text: str, **fields: object) -> T
 __all__ = [
     "BUILT_IN",
     "ROLE_PROMPT",
-    "FormulationCache",
     "NullHost",
     "Session",
     "TurnResult",

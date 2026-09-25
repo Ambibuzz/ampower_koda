@@ -13,11 +13,8 @@ from .contracts import (
     Chunk,
     CoChangeMemory,
     Definition,
-    Escalation,
     FileAnalysis,
     FileRanks,
-    Formulation,
-    Formulator,
     Hit,
     Ledger,
     LedgerEntry,
@@ -29,7 +26,6 @@ from .contracts import (
     RepoMap,
     RepoMemory,
     RepositoryIndex,
-    Rewrite,
     SearchResult,
     Session,
     SessionContext,
@@ -57,7 +53,6 @@ from .errors import (
     RedactedFileError,
     WorkspaceError,
 )
-from .escalate import FormulationCache, escalated_search
 from .fold import SessionState, fold_turn
 from .graph import CodeGraph, build_graph, pagerank
 from .ledger import distil_into, record, record_read, rehydrate, render_ledger
@@ -88,12 +83,8 @@ __all__ = [
     "CoreConfig",
     "CoreError",
     "Definition",
-    "Escalation",
     "FileAnalysis",
     "FileRanks",
-    "Formulation",
-    "FormulationCache",
-    "Formulator",
     "Hit",
     "Ledger",
     "LedgerEntry",
@@ -113,7 +104,6 @@ __all__ = [
     "RepoMemory",
     "RepositoryIndex",
     "Retriever",
-    "Rewrite",
     "SearchResult",
     "Session",
     "SessionContext",
@@ -147,7 +137,6 @@ __all__ = [
     "compact",
     "config_defaults",
     "distil_into",
-    "escalated_search",
     "estimate_tokens",
     "fold_turn",
     "hot_cold",

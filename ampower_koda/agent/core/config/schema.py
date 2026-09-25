@@ -14,10 +14,6 @@ from ..constants import (
     DEFAULT_REDACT_GLOBS,
     DEFAULT_SEARCH_LIMIT,
     DEFAULT_WINDOW_TOKENS,
-    ESCALATION_CONFIDENT,
-    ESCALATION_MID_MARGIN,
-    ESCALATION_WEAK,
-    FANOUT_MAX,
     MAP_MAX_TOKENS,
     MAX_INDEX_FILE_BYTES,
     MAX_SEARCH_LIMIT,
@@ -102,39 +98,6 @@ class RetrievalConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class EscalationConfig:
-    """When a weak search may spend a model call on *vocabulary*."""
-
-    enabled: bool = True
-    """The master switch. Off means no escalation and no model call, ever, and
-    the ladder becomes one comparison and an early return."""
-
-    fan_out: bool = False
-    """The ``expand`` rung: up to four rewrites along four angles. See above."""
-
-    confident: float = ESCALATION_CONFIDENT
-    weak: float = ESCALATION_WEAK
-    mid_margin: float = ESCALATION_MID_MARGIN
-
-    max_rewrites: int = FANOUT_MAX
-    """Rewrites per fan-out call, and therefore *extra searches* per fan-out
-    call. Turning it down is supported; turning it up past
-    :data:`~…constants.FANOUT_MAX` is not, because that constant is the measured
-    point where merge cost stops being negligible beside one more search."""
-
-    def validate(self) -> None:
-        if not 0.0 <= self.weak <= self.confident <= 1.0:
-            raise ConfigError(
-                "escalation.weak",
-                "must satisfy 0 ≤ weak ≤ confident ≤ 1 — the bands cannot cross",
-            )
-        if not 0.0 <= self.mid_margin <= 1.0:
-            raise ConfigError("escalation.mid_margin", "must be between 0 and 1")
-        if not 1 <= self.max_rewrites <= FANOUT_MAX:
-            raise ConfigError("escalation.max_rewrites", f"must be between 1 and {FANOUT_MAX}")
-
-
-@dataclass(frozen=True, slots=True)
 class HistoryConfig:
     """How much git history feeds co-change memory."""
 
@@ -178,7 +141,6 @@ class CoreConfig:
 
     indexing: IndexingConfig = field(default_factory=IndexingConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
-    escalation: EscalationConfig = field(default_factory=EscalationConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)

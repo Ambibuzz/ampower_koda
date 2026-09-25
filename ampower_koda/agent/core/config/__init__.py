@@ -6,7 +6,6 @@ from .merge import merge_config, parse_toml
 from .schema import (
     ContextConfig,
     CoreConfig,
-    EscalationConfig,
     HistoryConfig,
     IndexingConfig,
     ModelsConfig,
@@ -19,7 +18,6 @@ from .schema import (
 __all__ = [
     "ContextConfig",
     "CoreConfig",
-    "EscalationConfig",
     "HistoryConfig",
     "IndexingConfig",
     "ModelsConfig",
