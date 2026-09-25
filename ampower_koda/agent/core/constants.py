@@ -181,7 +181,7 @@ BM25_PATH_BONUS: Final[float] = 1.5
 BM25_SYMBOL_BONUS: Final[float] = 4.0
 
 SAME_FILE_DECAY: Final[float] = 0.85
-MAX_HITS_PER_FILE: Final[int] = 6
+MAX_HITS_PER_FILE: Final[int] = 2
 
 PROSE_COMMENT_SHARE: Final[float] = 0.85
 PROSE_RESULT_PENALTY: Final[float] = 0.55
@@ -225,22 +225,6 @@ SOURCE_LIMIT: Final[int] = 40
 UNION_LIMIT: Final[int] = 60
 DEFAULT_SEARCH_LIMIT: Final[int] = 20
 MAX_SEARCH_LIMIT: Final[int] = 50
-
-RERANK_WEIGHTS: Final[dict[str, float]] = {
-    "prior": 5.00,
-    "centrality": 0.75,
-    "leg_trust": 0.50,
-    "term_coverage": 0.45,
-    "symbol_match": 0.40,
-    "leg_agreement": 0.20,
-    "rarity": 0.15,
-    "definitionness": 0.00,
-    "prose_penalty": -0.30,
-    "vendored_copy": -0.30,
-}
-
-DENSE_CONFIDENCE_WEIGHT: Final[float] = 0.4
-AGREEMENT_LIFT: Final[float] = 0.2
 
 
 DISTILL_SCAN_LINES: Final[int] = 60

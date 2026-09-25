@@ -16,7 +16,7 @@ from ..constants import (
     VIEW_WEIGHTS,
 )
 from .bm25 import LexicalIndex
-from .tokenize import is_code_shaped, split_words, stem, tokenize
+from .tokenize import is_code_shaped, split_words, stem
 
 Route = str
 
@@ -78,11 +78,6 @@ class QueryPlan:
     @property
     def is_issue_report(self) -> bool:
         return len(self.views) > 1
-
-    @property
-    def anchored(self) -> bool:
-        """Whether the query names something the repository could contain."""
-        return bool(self.exact_symbol or self.identifiers)
 
 
 def plan_query(
@@ -332,9 +327,6 @@ def merged_weight(weight: float, rank: int, decay: float) -> float:
     return weight / (1.0 + decay * rank)
 
 
-def query_terms(query: str) -> tuple[str, ...]:
-    """The query's tokens as the scorer sees them. Shared with the reranker."""
-    return tokenize(query, is_query=True)
 def named_paths(query: str, paths: Sequence[str]) -> tuple[str, ...]:
     """Normalize a potentially long request once for all candidate filenames."""
     query = query.replace("\\", "/")

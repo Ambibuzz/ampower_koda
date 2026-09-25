@@ -65,7 +65,6 @@ def open_session(
         model_id=model,
         context=context,
         retriever=bootstrap.retriever,
-        ranks=bootstrap.ranking.ranks,
         repo_map=context.repo_map,
         budget=allocate(
             context.config.context.window_tokens,

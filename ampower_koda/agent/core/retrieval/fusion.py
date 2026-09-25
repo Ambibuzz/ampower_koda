@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ..constants import FUSION_RANK_DECAY, SOURCE_LIMIT, UNION_LIMIT
@@ -11,10 +11,9 @@ from ..contracts.retrieval import LEG_TRUST, UNKNOWN_LEG_TRUST, Hit, LegResult
 
 @dataclass(frozen=True, slots=True)
 class FusedHit:
-    """One hit, with the prior that fusion assigned it."""
+    """One hit, scored with the prior that fusion assigned it."""
 
     hit: Hit
-    prior: float
 
 
 def leg_trust(leg: str) -> float:
@@ -42,17 +41,6 @@ def fuse(legs: Sequence[LegResult], *, limit: int = UNION_LIMIT) -> tuple[FusedH
         key=lambda hit: (-priors[hit.chunk.digest], hit.chunk.location),
     )
     return tuple(
-        FusedHit(hit=hit.with_score(priors[hit.chunk.digest]), prior=priors[hit.chunk.digest])
+        FusedHit(hit=hit.with_score(priors[hit.chunk.digest]))
         for hit in ordered[:limit]
     )
-
-
-def normalise(priors: Mapping[str, float]) -> dict[str, float]:
-    """Min-max the priors into ``[0, 1]``."""
-    if not priors:
-        return {}
-    values = list(priors.values())
-    lowest, highest = min(values), max(values)
-    if highest - lowest <= 0:
-        return dict.fromkeys(priors, 1.0)
-    return {digest: (value - lowest) / (highest - lowest) for digest, value in priors.items()}

@@ -5,14 +5,16 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
+
 from ..errors import CoreError
 from .chunks import Chunk
+
 
 LEG_TRUST: Mapping[str, float] = MappingProxyType(
     {
         "lexical": 1.0,
-        "dense": 0.8,
-        "fanout": 0.6,
+        "named": 1.0,
+        "related": 0.85,
         "graph": 0.5,
         "structure": 0.4,
         "history": 0.3,
@@ -30,9 +32,7 @@ class Hit:
     score: float = 0.0
 
     sources: Mapping[str, int] = field(default_factory=dict)
-    """Leg name → the rank that leg gave this hit, 0-based. Empty for a hit that
-    never went through fusion — a plain single-leg lexical result — which is
-    exactly the case the reranker checks for before declining to run."""
+    """Leg name → the rank that leg gave this hit, 0-based."""
 
     note: str = ""
     """A fact about *this hit* that the ranked list would otherwise destroy —
@@ -93,13 +93,7 @@ class SearchResult:
     hits: tuple[Hit, ...] = ()
 
     confidence: float = 0.0
-    """How much of the query's IDF mass the top document carries, lifted by
-    agreement between independent legs. Read by the escalation ladder to decide
-    whether a model call on *vocabulary* is worth making.
-
-    Structure, graph and history deliberately do not vote. They are derived from
-    the lexical hits, so letting them raise confidence would be measuring the
-    thermometer with itself."""
+    """How much of the query's IDF mass the selected top hit carries."""
 
     margin: float = 0.0
     """``(top − third) / top``. The *third* hit, not the second: a definition
@@ -111,6 +105,10 @@ class SearchResult:
     """Which legs actually ran. A query that reached one leg and a query that
     reached five can produce the same number of hits, and the difference is the
     single most useful thing to know when a result looks thin."""
+
+    reranked: bool = False
+    """Dedicated scores and the configured relevance floor were applied.
+    The confidence field remains lexical coverage, not a model probability."""
 
     @property
     def is_empty(self) -> bool:

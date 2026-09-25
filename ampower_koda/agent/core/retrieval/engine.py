@@ -10,7 +10,6 @@ from ..constants import (
     BRIDGE_MAX_SYMBOLS,
     BRIDGE_SCORE_PER_TERM,
     BRIDGE_TERM_WEIGHT,
-    DEFAULT_SEARCH_LIMIT,
     MAX_SEARCH_LIMIT,
     SEED_LIMIT,
     SOURCE_LIMIT,
@@ -19,18 +18,20 @@ from ..constants import (
     SYMBOL_EXPANSION_WEIGHT,
     VIEW_RANK_DECAY,
 )
-from ..contracts.repo_map import FileRanks, MirrorSet
+from ..config.schema import RerankConfig, RetrievalConfig
+from ..contracts.rerank import Reranker
 from ..contracts.repository import RepositoryIndex
 from ..contracts.retrieval import Hit, LegResult, SearchResult
 from ..contracts.session import CoChangeMemory
 from ..graph.edges import CodeGraph
 from . import select
 from .bm25 import LexicalIndex, ScoredDocument, build_lexical_index, score
-from .confidence import compute_confidence, margin_of
+from .confidence import hit_coverage, margin_of
+from .excerpts import best_chunks
 from .fusion import fuse
-from .legs import graph_leg, history_leg, seeds_from, structural_leg
-from .query import QueryPlan, merged_weight, plan_query
-from .rerank import RerankContext, rerank
+from .legs import graph_leg, history_leg, related_leg, seeds_from, structural_leg
+from .query import QueryPlan, merged_weight, named_paths, plan_query
+from .rerank import rerank
 from .tokenize import tokenize
 
 
@@ -41,22 +42,25 @@ class Retriever:
     index: RepositoryIndex
     lexical: LexicalIndex
     graph: CodeGraph
-    ranks: FileRanks
-    mirrors: MirrorSet = field(default_factory=MirrorSet)
     cochange: CoChangeMemory = field(default_factory=CoChangeMemory)
 
     prose: frozenset[str] = frozenset()
     """Digests of mostly-comment chunks, precomputed from the one definition in
     :mod:`bm25` so selection and reranking cannot disagree about what prose is."""
 
+    config: RetrievalConfig = field(default_factory=RetrievalConfig)
+    rerank_config: RerankConfig = field(default_factory=RerankConfig)
+    reranker: Reranker | None = None
+
 
 def build_retriever(
     index: RepositoryIndex,
     graph: CodeGraph,
-    ranks: FileRanks,
     *,
-    mirrors: MirrorSet | None = None,
     cochange: CoChangeMemory | None = None,
+    config: RetrievalConfig | None = None,
+    rerank_config: RerankConfig | None = None,
+    reranker: Reranker | None = None,
 ) -> Retriever:
     """Build the retriever. The expensive half of cold start after indexing."""
     lexical = build_lexical_index(index)
@@ -64,9 +68,10 @@ def build_retriever(
         index=index,
         lexical=lexical,
         graph=graph,
-        ranks=ranks,
-        mirrors=mirrors or MirrorSet(),
         cochange=cochange or CoChangeMemory(),
+        config=config or RetrievalConfig(),
+        rerank_config=rerank_config or RerankConfig(),
+        reranker=reranker,
         prose=frozenset(
             document.chunk.digest for document in lexical.documents if document.prose
         ),
@@ -77,59 +82,59 @@ def search(
     retriever: Retriever,
     query: str,
     *,
-    limit: int = DEFAULT_SEARCH_LIMIT,
+    limit: int | None = None,
 ) -> SearchResult:
     """Run the whole pipeline and return the visible list."""
-    limit = max(1, min(limit, MAX_SEARCH_LIMIT))
+    limit = max(1, min(retriever.config.limit if limit is None else limit, MAX_SEARCH_LIMIT))
     plan = plan_query(query, retriever.lexical)
 
-    lexical, scored = _lexical_leg(retriever, plan)
-    if lexical.is_empty:
+    lexical = _lexical_leg(retriever, plan)
+    named = _named_leg(retriever, plan.original)
+    if lexical.is_empty and named.is_empty:
         return SearchResult(notes=("no lexical match",), legs_run=("lexical",))
 
-    legs: list[LegResult] = [lexical]
-    if plan.anchored:
-        seeds = seeds_from(lexical.hits, limit=SEED_LIMIT)
+    legs: list[LegResult] = [lexical, named]
+    if retriever.config.expand:
+        seeds = seeds_from((*named.hits, *lexical.hits), limit=SEED_LIMIT)
+        legs.append(related_leg(seeds, retriever.index, retriever.graph, query=plan.original))
         legs.append(structural_leg(seeds, retriever.index, retriever.graph))
-        legs.append(graph_leg(seeds, retriever.index, retriever.graph))
-        legs.append(history_leg(seeds, retriever.index, retriever.cochange))
+        legs.append(graph_leg(seeds, retriever.index, retriever.graph, query=plan.original))
+        legs.append(history_leg(seeds, retriever.index, retriever.cochange, query=plan.original))
 
     ran = tuple(result.leg for result in legs if not result.is_empty)
     notes = tuple(note for result in legs for note in result.notes)
 
-    if len(ran) < 2:
-        hits = _finish(retriever, lexical.hits, lexical.hits, limit)
-        return SearchResult(
-            hits=hits,
-            confidence=compute_confidence(retriever.lexical, plan.original, scored),
-            margin=margin_of(hits),
-            notes=notes,
-            legs_run=ran,
-        )
-
-    fused = fuse(legs)
-    context = RerankContext(
-        query=plan.original,
-        ranks=retriever.ranks,
-        mirrors=retriever.mirrors,
-        index=retriever.lexical,
-        prose=retriever.prose,
-    )
-    hits = _finish(retriever, rerank(fused, context), lexical.hits, limit)
+    # Apply file diversity before the candidate cutoff, so one large file
+    # cannot consume the union and hide companions from the reranker.
+    fused = fuse(legs, limit=sum(len(leg.hits) for leg in legs))
+    ranking = rerank(fused, plan.original, model=retriever.reranker,
+                     config=retriever.rerank_config, prose=retriever.prose,
+                     index=retriever.index, graph=retriever.graph)
+    hits = select.diversify(ranking.hits, limit=limit)
 
     return SearchResult(
         hits=hits,
-        confidence=compute_confidence(retriever.lexical, plan.original, scored),
+        confidence=hit_coverage(retriever.lexical, plan.original, hits),
         margin=margin_of(hits),
-        notes=notes,
+        notes=(*notes, *ranking.notes),
         legs_run=ran,
+        reranked=ranking.reranked,
     )
+
+
+def _named_leg(retriever: Retriever, query: str) -> LegResult:
+    """A named file participates before ranking, even outside BM25's top forty."""
+    hits = []
+    for path in named_paths(query, retriever.index.paths):
+        hits.extend(Hit(chunk=chunk, score=1.0) for chunk in
+                    best_chunks(retriever.index, path, query))
+    return LegResult(leg="named", hits=tuple(hits))
 
 
 def _lexical_leg(
     retriever: Retriever,
     plan: QueryPlan,
-) -> tuple[LegResult, tuple[ScoredDocument, ...]]:
+) -> LegResult:
     """BM25 across every view, merged by weighted rank, expanded if weak."""
     merged: dict[int, float] = {}
     primary: tuple[ScoredDocument, ...] = ()
@@ -149,14 +154,14 @@ def _lexical_leg(
         # outvote, the chunks the query itself matched.
         scale = primary[0].score if primary else 1.0
         for position, value in _expand(retriever, plan).items():
-            merged[position] = merged.get(position, 0.0) + value / scale
+            merged[position] = merged.get(position, 0.0) + min(0.5, value / scale)
 
     ordered = sorted(merged.items(), key=lambda item: (-item[1], item[0]))[:SOURCE_LIMIT]
     hits = tuple(
         Hit(chunk=retriever.lexical.documents[position].chunk, score=value)
         for position, value in ordered
     )
-    return LegResult(leg="lexical", hits=hits), primary
+    return LegResult(leg="lexical", hits=hits)
 
 
 def _looks_weak(index: LexicalIndex, plan: QueryPlan, primary: Sequence[ScoredDocument]) -> bool:
@@ -262,18 +267,3 @@ def _spread_bonus(index: LexicalIndex, name: str) -> float:
 
     spread = max(1, index.document_frequency.get(name.lower(), 1))
     return log(1.0 + max(index.counted, 1) / spread)
-
-
-def _finish(
-    retriever: Retriever,
-    ranked: Sequence[Hit],
-    original: Sequence[Hit],
-    limit: int,
-) -> tuple[Hit, ...]:
-    """The floors and the diversity cap, in the one order that is correct."""
-    hits = select.penalise_prose(ranked, retriever.prose)
-    hits = select.decay_same_file(hits)
-    hits = select.preserve_original_window(hits, original)
-    hits = select.diversify(hits, limit=limit + 1)
-    hits = select.add_supplemental(hits, ranked)
-    return select.preserve_direct_files(hits, original[:3], limit=limit)

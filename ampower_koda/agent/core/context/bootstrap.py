@@ -4,18 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from ..budget.allocator import ContextBudget, allocate
 from ..config.merge import merge_config, parse_toml
 from ..config.schema import CoreConfig
 from ..contracts.session import CoChangeMemory, RepoMemory, SessionContext
 from ..contracts.source import Overlay
 from ..errors import ConfigError, CoreError
 from ..history.cochange import build_cochange, empty_memory, git_log_arguments, parse_git_log
-from ..indexing.build import BuildStats, build_index
+from ..indexing.build import build_index
 from ..indexing.incremental import apply_overlays
 from ..indexing.parsers.registry import ParserRegistry, default_registry
 from ..memory.repo_memory import read_repo_memory
-from ..repomap.build import MapBuild, build_map
+from ..repomap.build import build_map
 from ..retrieval.engine import Retriever, build_retriever
 from ..workspace.discovery import discover
 from ..workspace.local import SystemClock
@@ -26,25 +25,16 @@ CONFIG_PATH = ".koda/config.toml"
 
 @dataclass(frozen=True, slots=True)
 class Bootstrap:
-    """A built session context, plus what building it cost."""
+    """A built session context and its retriever."""
 
     context: SessionContext
-    stats: BuildStats
-
-    budget: ContextBudget
-    """Every ceiling this session runs under, derived from its window."""
 
     retriever: Retriever
     """The search engine, built once. Not on the context because a
     :class:`~ampower_koda.agent.core.contracts.session.SessionContext` is a
     contract — data with no behaviour — and a retriever holds a scored corpus
-    and knows how to walk a graph."""
-
-    ranking: MapBuild
-    """The map's ranking machinery: the code graph, the unpersonalized file
-    ranks, and the mirror set. Three consumers need these and all three are
-    expensive; computing them once here is the difference between a few
-    milliseconds of cold start and a few milliseconds per query."""
+    and knows how to walk a graph. It shares the map's code graph, so the graph
+    is built once per cold start."""
 
     notes: tuple[str, ...] = ()
     """Non-fatal things a developer would want to know: a config file that
@@ -102,21 +92,13 @@ def build_context(
 
     return Bootstrap(
         context=context,
-        stats=build.stats,
-        budget=allocate(
-            config.context.window_tokens,
-            ledger_override=config.context.ledger_soft_tokens,
-            map_tokens=config.context.map_tokens,
-            memory_tokens=config.context.memory_tokens,
-        ),
         retriever=build_retriever(
             context.index,
             ranking.graph,
-            ranking.ranks,
-            mirrors=ranking.mirrors,
             cochange=cochange,
+            config=config.retrieval,
+            rerank_config=config.rerank,
         ),
-        ranking=ranking,
         notes=tuple(notes),
     )
 
