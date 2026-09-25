@@ -943,7 +943,7 @@ def _opened(session: Session) -> tuple[str, ...]:
     editing.
     """
     paths: list[str] = []
-    for entry in session.ledger.live():
+    for entry in session.ledger.entries:
         if entry.kind != "span":
             continue
         for ref in entry.refs:

@@ -306,7 +306,7 @@ def _salvage(state, body: str, reason: str) -> str:  # noqa: ANN001
     if body:
         return f"{body}\n\n[{reason}]"
 
-    block = render_ledger(state.ledger.live(), soft_tokens=state.session.budget.ledger)
+    block = render_ledger(state.ledger.entries, soft_tokens=state.session.budget.ledger)
     if block.is_empty:
         return f"[{reason} - the turn produced no findings]"
     return (
@@ -329,7 +329,7 @@ def _coverage(state):  # noqa: ANN001
 
     opened = {
         ref.path
-        for entry in state.ledger.live()
+        for entry in state.ledger.entries
         if entry.kind == "span"
         for ref in entry.refs
     }
@@ -411,7 +411,7 @@ def _tail(state, working: WorkingSet) -> str:
         if rendered:
             parts.append(rendered)
 
-    block = render_ledger(state.ledger.live(), soft_tokens=state.session.budget.ledger)
+    block = render_ledger(state.ledger.entries, soft_tokens=state.session.budget.ledger)
     if not block.is_empty:
         parts.append(block.text)
     if working.text:

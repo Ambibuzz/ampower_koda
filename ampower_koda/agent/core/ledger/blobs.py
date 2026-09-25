@@ -9,8 +9,3 @@ def blob_sha(content: bytes) -> str:
     """Return the git blob sha1 of ``content``."""
     header = f"blob {len(content)}\0".encode()
     return hashlib.sha1(header + content).hexdigest()
-
-
-def short(sha: str, length: int = 8) -> str:
-    """The display form. Empty stays empty rather than becoming ``'        '``."""
-    return sha[:length] if sha else ""
