@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import copy
+import difflib
 import posixpath
 import re
-
-
+from collections.abc import Callable, Iterable
 MAX_PLAN_TASKS = 12
 MAX_TASK_CONTEXT_REFS = 6
 VALID_ACTIONS = {"MODIFY", "CREATE", "DELETE"}
@@ -365,3 +366,122 @@ def plan_to_markdown(plan: dict) -> str:
     if plan.get("risks"):
         lines.append("## Risks\n" + "\n".join(f"- {item}" for item in plan["risks"]))
     return "\n\n".join(lines).strip()
+def _canonicalize_task_paths(tasks: list[dict], path_exists: Callable[[str], bool], *,
+                             prefix: str, start: int = 0,
+                             task_id: str = "") -> list[tuple[str, dict[str, str]]]:
+    """Remove one proven-redundant app prefix from task paths in place."""
+    changed = []
+    for index, task in enumerate(tasks):
+        if index < start or (task_id and task["id"] != task_id):
+            continue
+        replacements = {}
+        for path in [*task["files"], *[ref["path"] for ref in task["context_refs"]]]:
+            if path_exists(path):
+                continue
+            if not path.startswith(prefix):
+                continue
+            candidate = path[len(prefix):]
+            if candidate and path_exists(candidate):
+                replacements[path] = candidate
+        if not replacements:
+            continue
+        task["files"] = [replacements.get(path, path) for path in task["files"]]
+        for ref in task["context_refs"]:
+            ref["path"] = replacements.get(ref["path"], ref["path"])
+        changed.append((task["id"], replacements))
+    return changed
+
+
+def ground_plan_references(plan: dict, path_exists: Callable[[str], bool], *, app_name: str) -> dict:
+    """Resolve a proven package-root mismatch before the plan is approved.
+
+    New destinations remain advisory. Existing context references must resolve,
+    or be supplied by an earlier dependency. A proven root correction on a peer
+    also applies to a new sibling under that same root, never to unrelated paths.
+    """
+    result = copy.deepcopy(plan)
+    prefix = app_name.strip('/') + '/' if app_name else ''
+    transforms: dict[str, set[str]] = {}
+    replacements = {}
+    for task in result['tasks']:
+        for ref in task['context_refs']:
+            source = ref['path']
+            if path_exists(source) or not prefix:
+                continue
+            candidates = {prefix + source}
+            if source.startswith(prefix):
+                candidates.add(source[len(prefix):])
+            found = [p for p in candidates if path_exists(p)]
+            if len(found) != 1:
+                continue
+            target = found[0]
+            replacements[source] = target
+            if target == prefix + source:
+                old_root = source.split('/')[0] + '/'
+                transforms.setdefault(old_root, set()).add(prefix + old_root)
+            elif source == prefix + target:
+                # Keep the next directory in the key so a correction for
+                # app/public/... cannot rewrite app/doctype/... as a side effect.
+                new_root = target.split('/')[0] + '/'
+                transforms.setdefault(prefix + new_root, set()).add(new_root)
+    def resolve(path):
+        if path_exists(path):
+            return path
+        if path in replacements:
+            return replacements[path]
+        matches = {next(iter(targets)) + path[len(root):]
+                   for root, targets in transforms.items()
+                   if len(targets) == 1 and path.startswith(root)}
+        return next(iter(matches)) if len(matches) == 1 else path
+    for task in result['tasks']:
+        task['files'] = [resolve(p) for p in task['files']]
+        for ref in task['context_refs']:
+            ref['path'] = resolve(ref['path'])
+    issues, earlier = [], {}
+    for task in result['tasks']:
+        supplied = set().union(*(earlier.get(dep.casefold(), set()) for dep in task['depends_on']))
+        for ref in task['context_refs']:
+            if not path_exists(ref['path']) and ref['path'] not in supplied:
+                issues.append(f"{task['id']}: context reference {ref['path']!r} does not exist. "
+                              "Use the exact verified path from the codebase findings.")
+        earlier[task['id'].casefold()] = set(task['files']) | supplied
+    if issues:
+        raise PlanValidationError(issues)
+    # Root corrections may reveal duplicate paths/dependency conflicts.
+    return validate_plan(result)
+
+
+def _path_key(path: str) -> str:
+    return re.sub(r"[\s_\-]+", "", path.replace("\\", "/").casefold())
+
+
+def nearest_paths(path: str, candidates: Iterable[str], *, limit: int = 3) -> list[str]:
+    """Existing files a planner most likely meant by ``path``.
+
+    Spaces, underscores and hyphens are ignored, so ``sales_invoice.js`` finds
+    ``sales _invoice.js``; a bare suffix finds its prefixed form. Ranked, and
+    cut off below a similarity a human would still call "the same file".
+    """
+    wanted = _path_key(path)
+    if not wanted:
+        return []
+    wanted_base = wanted.rsplit("/", 1)[-1]
+    scored: list[tuple[float, str]] = []
+    for candidate in candidates:
+        key = _path_key(candidate)
+        if not key:
+            continue
+        if key == wanted:
+            score = 1.0
+        elif key.endswith("/" + wanted) or wanted.endswith("/" + key):
+            score = 0.95
+        else:
+            ratio = difflib.SequenceMatcher(None, wanted, key).ratio()
+            base = key.rsplit("/", 1)[-1]
+            score = 0.85 + ratio * 0.1 if base == wanted_base else ratio
+        if score >= 0.75:
+            scored.append((score, candidate))
+    scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    return [candidate for _, candidate in scored[:limit]]
+
+
