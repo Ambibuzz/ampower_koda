@@ -3,51 +3,39 @@
 
 ``agent/core`` is pure: it imports nothing from ``frappe``, ``langchain`` or
 ``langgraph``, and it reaches no network. Everything it needs from outside
-arrives through four small seams, and this module is all four of them plus the
-one function the graph calls::
+arrives through small interfaces implemented here, plus the explore helper's
+entry point::
 
-    understand(state) -> Understanding
+    understand(question=..., app_name=..., llm=..., provider=...) -> Understanding
 
-**What the core does that the old explore loop did not.** The previous
-understanding node was an LLM with five read tools and a history trimmer. This
-one adds, in the order a turn uses them: a tree-sitter index of the whole app, a
-PageRank'd repo map in the cached prefix, a per-message retrieval pass that runs
-*before* the model says anything, a ranked ``search`` that fuses BM25 with graph
-proximity, an append-only ledger so a finding survives its own tool result, and
-hot/cold elision that turns an old result into ``[search "x" -> L14]`` instead of
-dropping it. The trimmer is replaced by a fold that summarises a turn *before*
-anything is deleted.
+A turn uses a tree-sitter index of the app, a per-message retrieval pass, a
+ranked ``search`` (BM25 plus graph proximity), an append-only ledger, hot/cold
+elision of old results, and a fold that summarises before anything is deleted.
 
-**Four seams, and why each is here rather than there.**
+**Provider and workspace interfaces.**
 
 ``ChatModel``       one provider request per round. Only this class knows what
                     ``cache_control`` is spelled like.
 ``UtilityModel``    the fold and compaction summariser. Optional: without it a
                     session simply never folds, and says so in ``notes``.
+``Reranker``        OpenRouter's dedicated relevance endpoint, used only for the
+                    user's task-context suggestions; agent turns rank locally.
 ``ToolHost``        the tools the core cannot implement against a read-only
-                    workspace. In this phase that is ``read_doctype_schema``
-                    and nothing else — every writing tool is declined, so the
-                    understanding phase is read-only *structurally* rather than
-                    by review.
+                    workspace: only ``read_doctype_schema``. Every writing tool
+                    is declined, so the explore helper is read-only by construction.
 ``Workspace``       already implemented by the core's ``LocalWorkspace``, over
                     the app root Frappe resolves.
 
-**A session is expensive once and free afterwards.** Cold start indexes the app;
-on this repository that is well under a second, but it is not free, and the
-`Session` it produces is a frozen value that carries the index, the map, the
-retriever and the ledger. It cannot go into LangGraph state — that state is
-JSON-persisted — so it lives in a process-local cache keyed by request name, and
-a cache miss simply pays for cold start again. Nothing is *wrong* after a miss;
-it is slower.
+Each explore call opens a fresh session. The last session per app root is kept
+(while the checkout is unchanged) so context suggestions skip a cold start.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import threading
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -110,16 +98,14 @@ DOCTYPE_FIELD_KEYS = ("fieldname", "fieldtype", "label", "options", "reqd")
 #: Rows of a doctype's field table handed back before truncating.
 DOCTYPE_FIELD_ROWS = 200
 
-#: This adapter runs a bounded planning investigation, not an open-ended repo
-#: chat. Independent tools may be emitted together, so sixteen rounds leave
-#: ample room without exposing the core's sixty-round emergency ceiling.
-UNDERSTANDING_MAX_ROUNDS = 16
-UNDERSTANDING_MAX_OUTPUT_TOKENS = 4_096
+#: Rounds for one bounded explore pass: enough to read a feature in full, well
+#: under the core's sixty-round emergency ceiling.
+UNDERSTANDING_MAX_ROUNDS = 24
+#: Reasoning shares this cap with the summary, which may run to ~1200 words.
+UNDERSTANDING_MAX_OUTPUT_TOKENS = 8_192
 
 
-# ---------------------------------------------------------------------------
 # Seam 1 — the conversational model
-# ---------------------------------------------------------------------------
 
 
 class LangChainChatModel:
@@ -524,14 +510,12 @@ class UnderstandingHost:
 
     app_name: str
     request_name: str = ""
-    refused: list = field(default_factory=list)
 
     def call(self, name: str, arguments) -> ToolOutcome:
         if name == "read_doctype_schema":
             return self._doctype(str(arguments.get("doctype") or ""))
 
-        reason = DECLINED.get(name, f"{name} is not available in the understanding phase")
-        self.refused.append(name)
+        reason = DECLINED.get(name, f"{name} is not available to the explore helper")
         return ToolOutcome(text=f"[declined: {reason}]", ok=False)
 
     def _doctype(self, doctype: str) -> ToolOutcome:
@@ -579,54 +563,11 @@ class UnderstandingHost:
         )
 
 
-# ---------------------------------------------------------------------------
-# The session cache
-# ---------------------------------------------------------------------------
-
-_SESSIONS: dict[str, Session] = {}
 _SESSIONS_LOCK = threading.Lock()
 
 
 # Shared retrieval for a task the user is writing by hand
 
-
-#: Sessions held in this worker before the oldest is dropped. Small: a session
-#: holds an index of a whole app, and a worker serving eleven requests at once
-#: is not the shape this runs in.
-MAX_CACHED_SESSIONS = 10
-
-
-def _cached(request_name: str) -> Session | None:
-    with _SESSIONS_LOCK:
-        return _SESSIONS.get(request_name)
-
-
-def _remember(request_name: str, session: Session) -> None:
-    """Hold the session for the next turn of the same request.
-
-    Process-local on purpose. A ``Session`` carries the index, the repo map and
-    the retriever, none of which are JSON, so it cannot ride in LangGraph state —
-    and a cache that spanned workers would have to serialise all three. A miss
-    costs one cold start and loses nothing: the ledger and transcript are
-    rebuilt from the request row, and cold start on this tree is sub-second.
-    """
-    if not request_name:
-        return
-    with _SESSIONS_LOCK:
-        _SESSIONS[request_name] = session
-        while len(_SESSIONS) > MAX_CACHED_SESSIONS:
-            _SESSIONS.pop(next(iter(_SESSIONS)))
-
-
-def forget_session(request_name: str) -> None:
-    """Drop a request's cached session. Call when a request finishes."""
-    with _SESSIONS_LOCK:
-        _SESSIONS.pop(request_name, None)
-
-
-# ---------------------------------------------------------------------------
-# Model-free retrieval for a task the user is writing by hand
-# ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=16)
 def _rerank_client(site: str, api_key: str, model: str, timeout: float) -> OpenRouterReranker:
@@ -766,21 +707,15 @@ def _enclosing_definition(index, path: str, start: int, end: int, identity: str 
 MAX_WIDEN_LINES = 200
 
 
-# ---------------------------------------------------------------------------
-# The one function the graph calls
-# ---------------------------------------------------------------------------
+# The explore helper's pass
 
 
 @dataclass(frozen=True)
 class Understanding:
-    """What one understanding pass produced."""
+    """What one explore pass produced; ``tokens`` is the request's running total after it."""
 
     summary: str
-    explored_paths: tuple[str, ...] = ()
-    tools_called: tuple[str, ...] = ()
-    rounds: int = 0
     tokens: int = 0
-    notes: tuple[str, ...] = ()
     error: str = ""
     stop_reason: str = ""
 
@@ -790,18 +725,12 @@ class Understanding:
 
     @property
     def why(self) -> str:
-        """Why this pass produced nothing, in the caller's words rather than none.
-
-        Only ``stop_reason == "error"`` used to reach the graph, so a turn that
-        ran out of rounds or was stopped by a late tool call arrived with an
-        empty ``error`` and was reported as "produced no output" - the one
-        message that says nothing about the cause.
-        """
+        """Why this pass produced nothing: the error, or where the turn stopped."""
         if self.error:
             return self.error
         if self.stop_reason and self.stop_reason != "answered":
-            return f"Understanding phase stopped: {self.stop_reason}"
-        return "Understanding phase produced no output"
+            return f"the helper stopped: {self.stop_reason}"
+        return "the helper produced no answer"
 
 
 def understand(
@@ -815,17 +744,17 @@ def understand(
     retrieval_query: str = "",
     utility_llm=None,
     spent: int = 0,
+    rerank: bool = True,
 ) -> Understanding:
-    """Run one full core turn and return the summary the plan phase needs.
+    """Run one full core turn for the explore helper and return its answer.
 
-    Everything §1–§17 does happens inside :func:`run_turn`: cold start, the
-    working set, prompt assembly with its cache plan, the round loop, tools, the
-    ledger, elision, the fold and compaction. What this function adds is the
-    four seams and the translation back to the flat ``understanding_summary``
-    string the rest of the graph already knows how to read.
+    Cold start happens in :func:`open_session`; everything else — the working
+    set, prompt assembly with its cache plan, the round loop, tools, the ledger,
+    elision under input pressure, pressure summarisation and the fold — happens
+    inside :func:`run_turn`. What this function adds is the provider interfaces.
+    ``rerank=False`` skips the paid reranking request.
 
-    Never raises. The graph's nodes short-circuit on ``state["error"]``, so a
-    failure has to arrive as a value or the whole request dies on a traceback.
+    Never raises: a failure arrives as a value, never as a traceback.
     """
     chat = None
     host = UnderstandingHost(app_name=app_name, request_name=request_name)
@@ -834,13 +763,13 @@ def understand(
         chat = LangChainChatModel(
             llm, provider=provider, request_name=request_name, spent=spent
         )
-        session = _cached(request_name)
-        if session is None:
-            session = open_session(
-                LocalWorkspace(root_path=Path(_app_root(app_name))),
-                model=chat.model_id,
-                overrides=_overrides(chat.model_id),
-            )
+        session = open_session(
+            LocalWorkspace(root_path=Path(_app_root(app_name))),
+            model=chat.model_id,
+            overrides=_overrides(chat.model_id),
+        )
+        if rerank:
+            session = _with_reranker(session)
         result = run_turn(
             question,
             session=session,
@@ -864,22 +793,14 @@ def understand(
             stop_reason="error",
         )
 
-    _remember(request_name, result.session)
-    # The index this turn just built is exactly what a task-suggestion search
-    # needs; keeping it under the app key saves the next click a cold start.
+    # Keep the index this turn built under the app key, so the next search skips a cold start.
     remember_app_session(app_name, result.session)
-    notes = tuple(result.notes)
-    if host.refused:
-        notes = (*notes, f"declined: {', '.join(sorted(set(host.refused)))}")
-
+    total_tokens = chat.total_tokens + result.side_usage.total_tokens
+    _persist_tokens(request_name, total_tokens)
     return Understanding(
         summary=result.answer,
-        explored_paths=_opened(result.session),
-        tools_called=tuple(result.calls),
-        rounds=result.rounds,
-        tokens=chat.total_tokens,
-        notes=notes,
-        error=chat.failure if result.stop_reason == "error" else "",
+        tokens=total_tokens,
+        error=(chat.failure or result.answer) if result.stop_reason == "error" else "",
         stop_reason=result.stop_reason,
     )
 
@@ -972,24 +893,6 @@ def _role_prompt(system_prompt: str) -> str:
     """
     house = (system_prompt or "").strip()
     return f"{house}\n\n{ROLE_PROMPT}" if house else ROLE_PROMPT
-
-
-def _opened(session: Session) -> tuple[str, ...]:
-    """Paths the turn actually read, from the ledger's span entries.
-
-    The ledger rather than a regex over the answer. A path scraped out of prose
-    is a path the model *mentioned*, which is a different and much weaker claim
-    than one it opened — and the span entries are the same set that would gate
-    editing.
-    """
-    paths: list[str] = []
-    for entry in session.ledger.entries:
-        if entry.kind != "span":
-            continue
-        for ref in entry.refs:
-            if ref.path not in paths:
-                paths.append(ref.path)
-    return tuple(paths)
 
 
 def _publish(request_name: str, log_type: str, **payload) -> None:

@@ -50,8 +50,6 @@ from ampower_koda.agent.execution_contract import (
 from ampower_koda.agent.execution_evidence import source_context, SourceMemory
 from ampower_koda.agent.prompts import (
     get_system_prompt,
-    get_understand_system_prompt,
-    get_understand_prompt,
     get_plan_prompt,
     get_implement_prompt,
     get_follow_up_implement_prompt,
@@ -167,11 +165,8 @@ ENABLE_PROMPT_CACHE = True
 
 DOCTYPE_NAME = "Agent Request"
 
-# Appended to the understanding prompt. That prompt is configurable per request
-# ("Understand Prompt"), so a site's customized copy still names the old explore
-# tools — and a model told to call find_files() calls it and gets nothing back.
-# Stating the mapping is cheaper than migrating every customized prompt, and it
-# is correct for the ones nobody customized too.
+# Appended to the explore helper's question. A customized "Understand Prompt" may
+# name the implementation tools (find_files, read_file), which the helper lacks.
 CORE_TOOL_NOTE = """
 
 ## TOOLS AVAILABLE IN THIS PHASE
@@ -185,7 +180,7 @@ If the instructions above name a different tool, use these instead:
 find_files / list_directory -> glob, search_code -> search, read_file -> read,
 get_file_outline -> outline.
 
-There is no shell and no editing in this phase. Describe the change; do not make it.
+There is no shell and no editing here: answer the question with what you found.
 Results you have already seen may be replaced by a pointer like [search "x" -> L14];
 that is not a loss — call `recall` with the id to get the full text back.
 """
@@ -2088,117 +2083,6 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 
 # Planner calls: the plan coverage check and blocked-implementation amendments
 
-def understand_node(state: dict) -> dict:
-    """Explore the codebase with the retrieval core and summarize it for planning.
-
-    This is the one node backed by ``agent/core`` rather than by the tool-calling
-    loop the other phases use, and the difference is worth naming because it is
-    the difference between *searching* and *retrieving*.
-
-    The old loop handed the model five read tools and trimmed its history when it
-    got long. This one opens a session — a tree-sitter index of the app, a
-    PageRank'd repo map in the cached prefix, a fused BM25 + graph retriever —
-    then runs one turn against it. Before the model says anything, a retrieval
-    pass has already put the files this request is about in front of it. Every
-    finding goes to an append-only ledger, so an old tool result becomes
-    ``[search "reminders" -> L14]`` instead of being cut; and a turn is
-    summarized into SESSION STATE *before* anything is dropped rather than after.
-
-    Read-only structurally, not by review: the writing tools are in the frozen
-    array (removing them would invalidate the cached prefix) and the host
-    declines every one of them by name.
-    """
-    if state.get("error"):
-        return {"error": state["error"]}
-
-    logs = _log_stage(state, "Understanding", "started", "Indexing the app and exploring")
-    request_name = state.get("request_name", "")
-    try:
-        app_name = state.get("target_app_name", "")
-        provider = state.get("ai_provider", "OpenAI")
-        spent = int(state.get("tokens_used") or 0)
-
-        llm = _get_llm(provider=provider, model=state.get("ai_model", "gpt-4o-mini"))
-        # A planning run is explicitly from scratch. The process-local core cache is
-        # useful for multi-turn chat, but this graph has one understanding turn; if
-        # the same request is restarted, reusing that entry imports the old run's
-        # transcript and tool results into a supposedly fresh request.
-        koda_core.forget_session(request_name)
-        try:
-            result = koda_core.understand(
-                question=(
-                    get_understand_prompt(
-                        state.get("user_message", ""),
-                        state.get("request_type", "Improvement"),
-                        request_name=request_name,
-                    )
-                    + CORE_TOOL_NOTE
-                ),
-                app_name=app_name,
-                llm=llm,
-                provider=provider,
-                request_name=request_name,
-                system_prompt=get_understand_system_prompt(
-                    app_name or "target_app", request_name=request_name
-                ),
-                retrieval_query=state.get("user_message", ""),
-                utility_llm=llm,
-                spent=spent,
-            )
-        finally:
-            koda_core.forget_session(request_name)
-
-        steps = list(state.get("intermediate_steps") or []) + [
-            {"phase": "Understanding", "output": result.summary[:MAX_PHASE_OUTPUT_CHARS]}
-        ]
-        updates = {
-            "current_stage": "Understanding",
-            "intermediate_steps": steps,
-            "tokens_used": result.tokens,
-            "understanding_summary": result.summary,
-            "explored_paths": list(result.explored_paths),
-        }
-
-        if not result.ok:
-            # Fail here rather than letting the plan node discover an empty summary,
-            # and name the stop reason while doing it: `why` reports the rounds
-            # ceiling, a late tool call or the provider error, where this used to
-            # report only "produced no output" and send someone to look at nothing.
-            #
-            # And the summary is cleared. `result.summary` on a failed turn is the
-            # error rendered as prose - "[the model call failed: 429]" - and leaving
-            # that in the field the plan phase reads is how an outage becomes a plan.
-            updates["understanding_summary"] = ""
-            updates["error"] = result.why
-            logs = _log_stage({**state, "stage_log": logs}, "Understanding", "failed",
-                              updates["error"][:200])
-            updates["stage_log"] = logs
-            return updates
-
-        summary = (
-            f"{result.summary}\n\n"
-            f"[explored {len(result.explored_paths)} file(s) over {result.rounds} round(s)]"
-        )
-        updates["understanding_summary"] = summary
-        logs = _log_stage({**state, "stage_log": logs}, "Understanding", "completed",
-                          result.summary[:200])
-        updates["stage_log"] = logs
-        return updates
-    except Exception as e:
-        log_agent_error(
-            "Agent Graph: Understanding",
-            f"request={request_name}\n{e}\n{frappe.get_traceback()}",
-        )
-        logs = _log_stage({**state, "stage_log": logs}, "Understanding", "failed",
-                          str(e)[:200])
-        return {
-            "current_stage": "Understanding",
-            "intermediate_steps": list(state.get("intermediate_steps") or [])
-            + [{"phase": "Understanding", "output": f"Error: {e}"}],
-            "error": str(e),
-            "stage_log": logs,
-        }
-
 def _structured_plan_model(llm, provider: str):
     """Bind the plan schema using the provider's structured-output API."""
     # Native structured-output path per wrapper: OpenAI/OpenRouter enforce json_schema (strict),
@@ -3205,22 +3089,6 @@ def should_retry_implement(state: dict) -> str:
 # ---------------------------------------------------------------------------
 # Graph builders
 # ---------------------------------------------------------------------------
-
-def build_planning_graph():
-    """
-    Constructs the state machine for the Planning Phase.
-    Flow: Understand the code → Draft a Plan.
-    """
-    workflow = StateGraph(AgentState)
-    workflow.add_node("understand", understand_node)
-    workflow.add_node("plan", plan_node)
-
-    workflow.set_entry_point("understand")
-    workflow.add_edge("understand", "plan")
-    workflow.add_edge("plan", END)
-
-    return workflow.compile()
-
 
 def build_execution_graph():
     """Sequential implementation/gates, bounded repair, final semantic review."""

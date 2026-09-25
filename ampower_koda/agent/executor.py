@@ -15,9 +15,9 @@ from ampower_koda.agent.execution_contract import load_plan
 from ampower_koda.agent.graph import (
     _get_bench_env,
     _message_content_to_str,
-    build_planning_graph,
     build_execution_graph,
 )
+from ampower_koda.agent import session as koda_session
 from ampower_koda.agent import verification
 from ampower_koda.agent.run_control import managed_job, check_active, set_request_value
 from ampower_koda.agent.git_ops import (
@@ -295,9 +295,7 @@ def run_planning_phase(request_name: str) -> None:
         if revert_msg:
             _update_status(request_name, user, "Queued", revert_msg)
 
-        _update_status(request_name, user, "Understanding", "Exploring codebase...")
-
-        graph = build_planning_graph()
+        graph = koda_session.build_planning_graph()
         initial = {
             "user_message": doc.user_message or "",
             "request_type": doc.request_type or "Improvement",
@@ -306,7 +304,6 @@ def run_planning_phase(request_name: str) -> None:
             "ai_provider": config["ai_provider"],
             "ai_model": config["ai_model"],
             "github_repo_url": config["github_repo_url"],
-            "github_token": config["github_token"],
             "base_branch": config["base_branch"],
             "branch_prefix": config["branch_prefix"],
             "git_user_name": config["git_user_name"],
@@ -356,9 +353,8 @@ def run_planning_phase(request_name: str) -> None:
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
-# ---------------------------------------------------------------------------
 # Phase 2: Execution (Implement + Review)
-# ---------------------------------------------------------------------------
+
 
 @managed_job
 def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_up: int = 0) -> None:
@@ -1182,41 +1178,5 @@ def _append_conversation_log(request_name: str, new_block: str) -> str:
 
 
 def _extract_understanding(doc) -> str:
-    """Extract the Understanding section from the conversation log.
-
-    Prefers the dedicated understanding_snapshot field (stable across runs and log
-    trimming). Falls back to parsing the clean sectioned-text conversation log, then
-    to the legacy JSON format for requests logged before the format change.
-    """
-    snapshot = (getattr(doc, "understanding_snapshot", "") or "").strip()
-    if snapshot:
-        return snapshot
-
-    text = doc.conversation_log or ""
-    try:
-        if text.strip():
-            marker = f"{_PHASE_MARKER}Understanding ====="
-            idx = text.find(marker)
-            if idx != -1:
-                start = idx + len(marker)
-                # Stop at the next phase or run boundary, whichever comes first.
-                candidates = [
-                    pos for pos in (
-                        text.find(f"\n{_PHASE_MARKER}", start),
-                        text.find(f"\n{_RUN_MARKER}", start),
-                    ) if pos != -1
-                ]
-                next_idx = min(candidates) if candidates else -1
-                section = text[start:] if next_idx == -1 else text[start:next_idx]
-                return section.strip()
-
-            # Legacy JSON-formatted logs.
-            for step in as_json_list(text):
-                if isinstance(step, dict) and step.get("phase") == "Understanding":
-                    return _message_content_to_str(step.get("output", ""))
-    except Exception as e:
-        log_agent_error(
-            "Agent Executor: extract understanding",
-            f"request={getattr(doc, 'name', '')}\n{e}\n{frappe.get_traceback()}",
-        )
-    return ""
+    """The investigation's findings, saved with the plan when planning finished."""
+    return (getattr(doc, "understanding_snapshot", "") or "").strip()
