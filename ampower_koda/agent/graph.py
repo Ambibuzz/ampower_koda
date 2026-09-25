@@ -36,10 +36,13 @@ from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.plan_contract import (
     MAX_PLAN_TASKS,
     PLAN_JSON_SCHEMA,
+    PLAN_PATCH_SCHEMA,
     PlanValidationError,
+    apply_plan_patch,
     complete_rename_file_scope,
     nearest_paths,
     plan_to_markdown,
+    repair_feedback,
     validate_plan,
 )
 from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, CheckResult, HealthReport
@@ -68,6 +71,8 @@ REVIEW_COST_PRESSURE_ATTEMPT = 4
 # an indefinitely recoverable run cannot accumulate an indefinitely large tail.
 REVIEW_HISTORY_RECHECKS = 4
 MAX_REVIEW_RECHECKS = 2           # source changed while being reviewed; take a fresh bounded snapshot
+MAX_PLAN_AMENDMENTS = 2           # blocked-implementation plan patches per run
+MAX_PLAN_AMENDMENTS_HARD = 6      # even a run that keeps finding new blockers stops here
 BASE_EXECUTION_CALL_BUDGET = 56   # includes room for diagnosis and re-testing
 # Each plan task adds room for two full implementation turns, each with its forced final call.
 PER_TASK_CALL_BUDGET = 2 * (MAX_TOOL_ROUNDS_EXECUTION + 1)
@@ -2392,6 +2397,174 @@ def prepare_execution_node(state: dict) -> dict:
         return {"error": str(exc)}
 
 
+#: The only edits an amendment may make: extend file/context scope, or turn MODIFY into CREATE.
+AMENDMENT_OPS = frozenset({"add_file", "add_context_ref", "set_action"})
+#: A validation repair may also withdraw a reference; the approved ones are checked afterwards.
+AMENDMENT_REPAIR_OPS = AMENDMENT_OPS | {"remove_context_ref"}
+AMENDMENT_SCOPE_ONLY = "An amendment may only extend required file/context scope."
+
+
+def _amendment_ops_only(parsed: dict, allowed=AMENDMENT_OPS) -> bool:
+    return all(e.get("op") in allowed for e in parsed.get("edits", []) if isinstance(e, dict))
+
+
+def _amendment_keeps_approved(tasks: list[dict], new_tasks: list[dict]) -> bool:
+    """Every approved outcome, description, dependency, file and reference is still in the plan."""
+    def kept(t):
+        return t["id"], t["goal"], t["acceptance_criteria"], t.get("description"), t.get("depends_on")
+
+    def refs(t):
+        return {(r.get("path"), r.get("start"), r.get("end")) for r in t.get("context_refs") or []}
+
+    return (len(tasks) == len(new_tasks) and all(
+        kept(old) == kept(new) and set(old["files"]) <= set(new["files"]) and refs(old) <= refs(new)
+        for old, new in zip(tasks, new_tasks)))
+
+
+def _amend_plan_for_blocker(state: dict, completion: dict) -> tuple[dict | None, str]:
+    """Ask the planner for edits that clear an implementation blocker.
+
+    The planner sees the plan, the implementer's report and the nearest real files
+    for each named path. Approved outcomes are frozen; the amended plan is validated,
+    then persisted to the request.
+    """
+    if state.get("is_follow_up"):
+        return None, "Follow-up work uses its own fixed outcome; no plan amendment attempted."
+    spent = int(state.get("plan_amendments") or 0)
+    blocker_key = " ".join(str(completion.get("summary") or "").split())[:500]
+    repeated = bool(blocker_key) and blocker_key == (state.get("plan_last_blocker") or "")
+    if spent >= MAX_PLAN_AMENDMENTS_HARD or (spent >= MAX_PLAN_AMENDMENTS and repeated):
+        return None, (f"Plan already amended {spent} time(s) this run"
+                      + (" for this same blocker" if repeated else "") + "; not amending again.")
+    request_name = state.get("request_name", "")
+    app_name = state.get("target_app_name", "")
+    provider = state.get("ai_provider", "OpenAI")
+    plan = state.get("plan_object") or {}
+    tasks = list(state.get("execution_tasks") or [])
+    tokens_used = int(state.get("tokens_used") or 0)
+    try:
+        completed = complete_rename_file_scope(plan, lambda p: _app_file_exists(app_name, p), app_name=app_name)
+        if completed.repairs:
+            amended = validate_plan(completed.plan)
+            _persist_execution_plan(request_name, amended)
+            return {
+                "plan_object": amended, "execution_tasks": amended["tasks"],
+                "plan_amendments": spent + 1, "plan_last_blocker": blocker_key, "tokens_used": tokens_used,
+                "plan_scope_repairs": [*(state.get("plan_scope_repairs") or []), *completed.repairs],
+            }, "Completed the already-approved rename's file scope without another model call. Retrying."
+        llm = _get_llm(provider=provider, model=state.get("ai_model", "gpt-4o-mini"), session_id=request_name)
+        budget = _plan_budget(provider, state)
+        candidates_for = _plan_path_candidates(app_name)
+        blocker = " ".join(
+            [str(completion.get("summary") or "")] + [str(u) for u in completion.get("unverified") or []]
+        ).strip()
+        # Paths the report names, plus the plan's own files. Spaces are
+        # excluded from the token so a sentence is not swallowed whole; a name
+        # with a space inside still surfaces through the approved-files list.
+        mentioned = _re.findall(r"[\w./-]+/[\w.-]+\.[A-Za-z0-9]{1,6}", blocker)
+        lookups = []
+        planned = [p for task in tasks for p in [*task.get("files", []),
+                                                  *(ref.get("path", "") for ref in task.get("context_refs", []))]]
+        for path in dict.fromkeys([*mentioned, *planned]):
+            path = path.strip().lstrip("/")
+            if not path:
+                continue
+            exists = _app_file_exists(app_name, path)
+            near = candidates_for(path)
+            lookups.append(f"- {path}: {'exists' if exists else 'does not exist'}"
+                           + (f"; nearest existing: {', '.join(near)}" if near and not exists else ""))
+        feedback = (
+            "## IMPLEMENTATION BLOCKED — AMEND THE PLAN\n"
+            "The approved plan could not be completed. The implementer reported:\n"
+            f"{blocker}\n\n"
+            "Files named in the report or the plan, checked on disk:\n" + ("\n".join(lookups) or "- (none)") + "\n\n"
+            "Return PlanPatch edits that make the approved outcomes completable. All approved outcomes and "
+            "existing task details are frozen: only add_file, add_context_ref, and set_action (MODIFY to CREATE "
+            "for a newly added missing file) are allowed. Add only the missing paths needed to meet the existing "
+            "approved outcomes. A task's `files` is the implementer's starting point, not a permission list, so "
+            "do not add paths merely to unblock a write. Do not change DELETE tasks, remove paths, change "
+            "dependencies, or change goals, scope, assumptions or risks; do not weaken the requested outcome to "
+            "clear a blocker."
+        )
+        messages = [
+            _build_system_message(provider, get_system_prompt(app_name or "target_app", request_name=request_name),
+                                  state.get("ai_model", "")),
+            HumanMessage(content="## CURRENT PLAN\n" + json.dumps(plan, ensure_ascii=False)),
+            HumanMessage(content=feedback),
+        ]
+        _publish_agent_log(request_name, "llm_response", round=0,
+                           preview=f"Implementation blocked; asking the planner for edits: {blocker[:300]}")
+        _check_plan_input(state, messages, PLAN_PATCH_SCHEMA, budget)
+        check_active(reserve=MODEL_TIME_RESERVE)
+        response, tokens_used = _invoke_structured(
+            llm, provider, PLAN_PATCH_SCHEMA, messages,
+            _plan_run_config(f"plan:amend:{spent + 1}", round_number=spent + 1, mode="amend"),
+            budget=budget, request_name=request_name, total_tokens=tokens_used, round_label=0,
+        )
+        check_active()
+        raw_response, parsed = _unpack_structured_plan(response)
+        failed = {"tokens_used": tokens_used, "plan_amendments": spent + 1, "plan_last_blocker": blocker_key}
+        if not _amendment_ops_only(parsed):
+            return failed, AMENDMENT_SCOPE_ONLY
+        result = apply_plan_patch(plan, parsed)
+        if not result.applied:
+            return {"tokens_used": tokens_used, "plan_amendments": spent + 1, "plan_last_blocker": blocker_key}, (
+                "Planner returned no applicable edits" + (": " + "; ".join(result.rejected) if result.rejected else "") + ".")
+        # An amended plan that fails validation is sent back with the exact
+        # issues, the same way plan repair works, instead of being discarded.
+        for repair in range(PLAN_PATCH_ROUNDS + 1):
+            try:
+                amended = validate_plan(result.plan)
+                break
+            except PlanValidationError as exc:
+                if repair >= PLAN_PATCH_ROUNDS:
+                    return {"tokens_used": tokens_used, "plan_amendments": spent + 1, "plan_last_blocker": blocker_key}, (
+                        "Plan amendment failed validation after " + str(PLAN_PATCH_ROUNDS) + " repair round(s): "
+                        + "; ".join(exc.issues)[:300])
+                issues = list(exc.issues) + list(result.rejected)
+                messages.extend([
+                    AIMessage(content=json.dumps(parsed, ensure_ascii=False)),
+                    HumanMessage(content=repair_feedback(issues)),
+                ])
+                _publish_agent_log(request_name, "llm_response", round=0,
+                                   preview=f"Amended plan rejected ({len(issues)} issue(s)); asking for corrections: {issues[0]}"[:400])
+                _check_plan_input(state, messages, PLAN_PATCH_SCHEMA, budget)
+                check_active(reserve=MODEL_TIME_RESERVE)
+                response, tokens_used = _invoke_structured(
+                    llm, provider, PLAN_PATCH_SCHEMA, messages,
+                    _plan_run_config(f"plan:amend:{spent + 1}:repair:{repair + 1}", round_number=spent + 1, mode="amend"),
+                    budget=budget, request_name=request_name, total_tokens=tokens_used, round_label=0,
+                )
+                check_active()
+                raw_response, parsed = _unpack_structured_plan(response)
+                if not _amendment_ops_only(parsed, AMENDMENT_REPAIR_OPS):
+                    return {**failed, "tokens_used": tokens_used}, AMENDMENT_SCOPE_ONLY
+                result = apply_plan_patch(result.plan, parsed)
+        new_tasks = amended["tasks"]
+        if (any(amended[key] != plan.get(key) for key in ("scope", "assumptions", "risks", "overview"))
+                or not _amendment_keeps_approved(tasks, new_tasks)):
+            return {"tokens_used": tokens_used, "plan_amendments": spent + 1, "plan_last_blocker": blocker_key}, "Planner edits changed the approved outcomes or scope; discarded."
+        for old, new in zip(tasks, new_tasks):
+            if (old["action"] == "DELETE" and old != new) or (
+                new["action"] != old["action"] and not (old["action"] == "MODIFY" and new["action"] == "CREATE")
+            ):
+                return {"tokens_used": tokens_used, "plan_amendments": spent + 1, "plan_last_blocker": blocker_key}, "An amendment cannot change approved removal operations."
+        _persist_execution_plan(request_name, amended)
+        summary = "; ".join(
+            f"{e.get('op')} {e.get('task_id')} {e.get('from') or e.get('path') or e.get('field') or ''}".strip()
+            for e in (parsed.get("edits") or []) if isinstance(e, dict)
+        )[:600]
+        _publish_agent_log(request_name, "llm_response", round=0,
+                           preview=f"Plan amended ({result.applied} edit(s)): {summary}")
+        return {
+            "plan_object": amended, "execution_tasks": new_tasks,
+            "plan_amendments": spent + 1, "plan_last_blocker": blocker_key, "tokens_used": tokens_used,
+        }, f"Plan amended with {result.applied} edit(s): {summary}. Retrying against the amended plan."
+    except Exception as exc:
+        log_agent_error("Agent Graph: plan amendment", f"request={request_name}\n{exc}\n{frappe.get_traceback()}")
+        return {"tokens_used": tokens_used, "plan_amendments": spent + 1, "plan_last_blocker": blocker_key}, f"Plan amendment failed: {str(exc)[:300]}"
+
+
 def _execution_context(state: dict) -> tuple[dict, list[str], list[str] | None]:
     """The whole plan as one unit, every task's acceptance criteria, and the paths the plan names.
 
@@ -2727,9 +2900,23 @@ def review_node(state: dict) -> dict:
         updates["review_repairable"] = True
         updates["test_repair_rounds"] = test_repairs + 1
     elif completion.get("status") == "blocked":  # an exhausted turn took the branch above
+        # A scope blocker must reach the planner even when an uncreated destination
+        # also fails the existence check. Repeating the same contract cannot fix it.
         passed = False
-        notes = f"Implementation blocked: {completion['summary']}"
-        updates["review_repairable"] = True
+        plan_recovery_attempted = True
+        amended, note = _amend_plan_for_blocker(state, completion)
+        # Keep the repair outcome before the model's often-long blocker report,
+        # so dashboard previews and bounded errors cannot hide why recovery failed.
+        notes = f"Plan recovery: {note}\nImplementation blocked: {completion['summary']}"
+        _publish_agent_log(state.get("request_name", ""), "llm_response", round=0,
+                           preview=f"{active['id']} plan recovery: {note}")
+        if amended:
+            updates.update(amended)
+        if amended and "execution_tasks" in amended:
+            attempt = 0  # A repaired contract gets a fresh, still-bounded review budget.
+            updates["review_fingerprint"] = ""
+            updates["review_fingerprints_seen"] = []
+            updates["review_failure_fingerprints_seen"] = []
         if not health.passed:
             notes += " Current checks: " + health.summary()
     elif not health.passed:
