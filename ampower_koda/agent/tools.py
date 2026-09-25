@@ -3,11 +3,35 @@
 
 import os
 import re
+import site
+import sys
 
 import frappe
 
 from ampower_koda.agent.errors import log_agent_error
+from ampower_koda.agent.javascript_validation import globals_configs, validate_javascript_names
 
+
+
+def command_environment() -> dict:
+    """Resolve bench/Python and nvm Node in workers without a login-shell PATH."""
+    env = os.environ.copy()
+    # RQ started by a service does not inherit ~/.local/bin. Bench commonly
+    # lives there, while Python entry points live beside the worker interpreter.
+    python_bin = os.path.dirname(sys.executable)
+    user_bin = os.path.join(site.getuserbase(), 'Scripts' if os.name == 'nt' else 'bin')
+    additions = [path for path in (python_bin, user_bin) if os.path.isdir(path)]
+    env['PATH'] = os.pathsep.join([*additions, env.get('PATH', '')])
+    versions = os.path.join(env.get("NVM_DIR", os.path.expanduser("~/.nvm")), "versions", "node")
+    if os.path.isdir(versions):
+        candidates = sorted((name for name in os.listdir(versions) if re.fullmatch(r"v\d+(?:\.\d+)*", name)),
+                            key=lambda name: tuple(map(int, name[1:].split("."))), reverse=True)
+        for name in candidates:
+            bin_dir = os.path.join(versions, name, "bin")
+            if os.path.isfile(os.path.join(bin_dir, "node")):
+                env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+                break
+    return env
 
 def _tool_error(tool: str, exc: Exception, message: str) -> str:
     log_agent_error(f"Agent Tool: {tool}", f"{exc}\n{frappe.get_traceback()}")
@@ -405,8 +429,35 @@ def read_doctype_schema(app_name: str, doctype_name: str) -> str:
         return _tool_error("read_doctype_schema", ex, f"Error: {ex}")
 
 
+def _syntax_excerpt(line: str, column: int) -> str:
+    """Keep the failing anchor even on a generated line thousands of characters long."""
+    column = min(len(line), max(0, column))
+    start = max(0, column - 140)
+    end = min(len(line), column + 180)
+    return (('…' if start else '') + line[start:end] + ('…' if end < len(line) else '')
+            + '\n' + ' ' * (column - start + int(bool(start))) + '^')
+
+
+def _javascript_syntax_error(path: str, output: str) -> str:
+    lines = output.splitlines()
+    reason = next((line.strip() for line in lines if re.match(r'^\w*Error:', line.strip())), 'JavaScript syntax check failed')
+    for index, line in enumerate(lines[:-2]):
+        location = re.search(r':(\d+)\s*$', line)
+        if location:
+            if '^' in lines[index + 2]:
+                column = lines[index + 2].index('^')
+                return (f'SYNTAX_ERROR in {path} at line {location.group(1)}, col {column + 1}: {reason}\n'
+                        + _syntax_excerpt(lines[index + 1], column))
+            # V8 truncates the caret line on very long source lines. Preserve
+            # its actual line number without inventing an unreported column.
+            source = lines[index + 1]
+            excerpt = source if len(source) <= 400 else source[:180] + ' … ' + source[-220:]
+            return f'SYNTAX_ERROR in {path} at line {location.group(1)}: {reason}\n{excerpt}'
+    return f'SYNTAX_ERROR in {path}: {reason}\n{output[-800:]}'
+
+
 def validate_code(app_name: str, path: str) -> str:
-    """Check for syntax errors in a .py or .js file (path relative to app root)."""
+    """Check Python syntax or JavaScript syntax/undefined names (app-relative path)."""
     try:
         full = _resolve_path(app_name, path)
         if not os.path.isfile(full):
@@ -423,7 +474,7 @@ def validate_code(app_name: str, path: str) -> str:
             except SyntaxError as e:
                 return (
                     f"SYNTAX_ERROR in {path} at line {e.lineno}, col {e.offset}: "
-                    f"{e.msg}\nLine content: {e.text.strip() if e.text else 'N/A'}"
+                    f"{e.msg}\n" + _syntax_excerpt((e.text or '').rstrip(), (e.offset or 1) - 1)
                 )
             except Exception as e:
                 log_agent_error(
@@ -434,31 +485,23 @@ def validate_code(app_name: str, path: str) -> str:
 
         elif path.endswith(".js"):
             import subprocess
+            env = command_environment()
             try:
                 result = subprocess.run(
                     ["node", "--check", full],
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    env=env,
                 )
                 if result.returncode == 0:
-                    return f"VALID: {path} has no syntax errors."
-                return f"SYNTAX_ERROR in {path}:\n{result.stderr.strip() or result.stdout.strip()}"
+                    return validate_javascript_names(path, content, configs=globals_configs(
+                        full, _app_root(app_name), frappe.get_app_path("frappe")), env=env)
+                return _javascript_syntax_error(path, result.stderr.strip() or result.stdout.strip())
             except FileNotFoundError:
-                stack = []
-                for i, char in enumerate(content):
-                    if char in "({[":
-                        stack.append((char, i))
-                    elif char in ")}]":
-                        if not stack:
-                            return f"SYNTAX_ERROR in {path}: Unmatched closing {char} near char {i}"
-                        top, _ = stack.pop()
-                        if (top == "(" and char != ")") or (top == "{" and char != "}") or (top == "[" and char != "]"):
-                            return f"SYNTAX_ERROR in {path}: Mismatched {top} and {char} near char {i}"
-                if stack:
-                    char, i = stack.pop()
-                    return f"SYNTAX_ERROR in {path}: Unclosed {char} starting at char {i}"
-                return f"VALID: {path} (basic check: brackets balanced)"
+                return "VALIDATION_UNAVAILABLE: Node.js is missing; JavaScript syntax was not checked."
+            except subprocess.TimeoutExpired:
+                return "VALIDATION_UNAVAILABLE: node --check timed out; JavaScript syntax was not checked."
             except Exception as e:
                 log_agent_error(
                     "Agent Tool: validate_code javascript",
