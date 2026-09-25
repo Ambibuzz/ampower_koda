@@ -5,7 +5,6 @@ import frappe
 
 from ampower_koda.agent.errors import log_agent_error
 
-# Mapping internal fieldname -> prompt_key option label
 PROMPT_LABEL_MAP = {
     "system_prompt": "System Prompt",
     "understand_prompt": "Understand Prompt",
@@ -44,11 +43,11 @@ def render_prompt_safe(template: str, context: dict, default_template: str) -> s
             result = default_template
 
     for key, value in context.items():
-        if f"{{{key}}}" not in used and isinstance(value, str) and len(value) < 500:
+        if (f"{{{key}}}" not in used and isinstance(value, str) and value.strip()
+                and len(value) < 500 and value not in result):
             result += f"\n\n## {key.upper().replace('_', ' ')}\n{value}"
 
     return result
-
 
 
 def get_config_prompt(fieldname: str, default_template: str, request_name: str = None) -> str:
@@ -60,13 +59,10 @@ def get_config_prompt(fieldname: str, default_template: str, request_name: str =
     """
     prompt_label = PROMPT_LABEL_MAP.get(fieldname, fieldname)
 
-    # Only request-level override
     if request_name:
         try:
-            # Fetch parent doc first
             doc = frappe.get_doc("Agent Request", request_name)
 
-            # If "Use Default Prompts" is enabled → skip overrides completely
             if doc.use_default_prompts:
                 return default_template
 
@@ -74,7 +70,7 @@ def get_config_prompt(fieldname: str, default_template: str, request_name: str =
                 "Agent Prompt Configuration",
                 filters={
                     "parent": request_name,
-                    "prompt_key": ["in", [prompt_label, fieldname]]  
+                    "prompt_key": ["in", [prompt_label, fieldname]]
                 },
                 fields=["content"],
                 order_by="idx asc"
@@ -198,149 +194,6 @@ Before creating DocType, Report, or Page JSON: read an existing artifact of the 
 """
     template = get_config_prompt("system_prompt", default, request_name)
     context = {"app_name": app_name}
-
-    return render_prompt_safe(template, context, default)
-
-
-def get_understand_system_prompt(app_name: str, request_name: str = None) -> str:
-    """Small, read-only system prompt for the retrieval-backed understand pass.
-
-    The implementation system prompt contains editing, validation, artifact and
-    Frappe workflow rules. None of those rules can be acted on in the read-only
-    phase, yet they used to be re-sent on every discovery round. A request-level
-    System Prompt override is still honoured; only the built-in default is
-    phase-specific.
-    """
-    default = """You are a senior Frappe engineer performing a read-only code investigation.
-
-Find the smallest amount of verified repository evidence needed to plan the user's
-request accurately. Stay inside the requested feature or failure path. Do not survey
-the whole app, propose unrelated improvements, or infer details you have not read.
-
-## Investigation discipline
-- Start from the automatically retrieved working set; do not remap the repository.
-- Prefer search and outline over full-file reads.
-- Read targeted line ranges. Read a whole file only when it is small and all of it matters.
-- Never repeat a tool call with the same arguments. Never re-read an unchanged span.
-- Batch independent lookups in one response when possible.
-- Stop calling tools as soon as the change surface, current behavior, and verification path are clear.
-- Cite evidence as `path:line` and distinguish verified facts from assumptions.
-
-## Target app: {app_name}
-Tool paths are relative to this app's root.
-"""
-    template = get_config_prompt("system_prompt", default, request_name)
-    return render_prompt_safe(template, {"app_name": app_name}, default)
-
-
-
-def get_understand_prompt(user_message: str, request_type: str, request_name: str = None) -> str:
-    default = """## USER REQUEST
-**Type:** {request_type}
-**Description:**
-{user_message}
-
-## TASK
-
-Gather only the evidence needed to create an implementation plan for this request.
-Trace the relevant failure path or feature path, identify the files that must change,
-and verify the local pattern the implementation should follow.
-
-### Tool budget and stopping rule
-
-- Use the automatically supplied working set before calling another discovery tool.
-- Prefer `search`, `outline`, `definition`, `symbols`, and `refs` over `read`.
-- Use `read` for the smallest useful span; avoid whole-file reads above 300 lines.
-- Do not call the same tool with the same arguments twice or read overlapping spans
-  unless the first result explicitly says it was incomplete.
-- Batch independent calls. Aim for at most 8 discovery calls total.
-- Stop when you can name the exact change surface and a concrete verification path.
-- Inspect `hooks.py`, schemas, peer artifacts, client/server wiring, or migrations only
-  when the user request makes them relevant.
-
-### OUTPUT (maximum 1,000 words; no code blocks)
-
-#### 1. Request interpretation and current behavior
-State the scoped goal and the verified flow or root cause.
-
-#### 2. Evidence
-List at most 8 relevant files. For each, give exact `path:line-range`, the symbol or
-section that matters, and one sentence explaining why. Use very short excerpts only
-when a name cannot be communicated otherwise.
-
-#### 3. Change surface
-Name files to modify/create, the behavior each change owns, existing patterns to
-follow, and any assumptions that could not be verified.
-
-#### 4. Verification
-List focused tests/checks and any migration, build, or cache step actually required.
-
-Do not include a generic app overview, exhaustive inventory, unrelated conventions,
-or repeated evidence. The planner needs precise conclusions, not a transcript."""
-    template = get_config_prompt("understand_prompt", default, request_name)
-
-    context = {
-        "user_message": user_message,
-        "request_type": request_type
-    }
-
-    return render_prompt_safe(template, context, default)
-
-
-def get_plan_prompt(understanding_summary: str, user_message: str = "", request_name: str = None) -> str:
-    user_section = f"## USER REQUEST\n{user_message}\n\n" if user_message else ""
-    default = """{user_section}## CODEBASE ANALYSIS
-{understanding_summary}
-
-## YOUR TASK: Create an Implementation Plan
-
-Create the complete review plan that a human approves before implementation.
-Your response is constrained to the plan schema by the provider. Populate every
-field; do not write code, pseudocode, or prose outside the structured response.
-
-### Planning principles
-1. **Tasks, not code** — each task needs a complete description and measurable
-   acceptance criteria.
-2. **State assumptions, don't block** — if scope, behaviour, field names or UX
-   are unclear, make the most reasonable evidence-based choice and record it in
-   `assumptions`.
-3. **Ground in the analysis** — use exact paths and line ranges from the
-   codebase analysis.
-4. **Minimal scope** — only what this request needs. No drive-by refactors.
-5. **Exploration is done** — no read/inspect/investigate tasks.
-
-### Task fields
-- Use sequential ids: `TODO 1`, `TODO 2`, and so on.
-- `title` is a short action phrase; `goal` is one sentence of outcome.
-- `description` is the complete implementation brief: what changes, where, why,
-  and which existing pattern to follow. Do not include source code.
-- `action` is `MODIFY` or `CREATE`. Every file in one task must use that action;
-  split a task when existing and new files are both involved.
-- `files` contains app-relative owned paths.
-- `context_refs` contains only the code spans needed to implement the task, at
-  most 6. Use `start: 0` and `end: 0` for a whole-file reference. Always provide
-  `symbol` and `why`; either may be an empty string, but not both.
-- `acceptance_criteria` contains observable outcomes the reviewer can check by
-  reading the resulting source or by a mechanical check available in the sandbox
-  (syntax validation, import, migration). The reviewer has no browser, server or
-  test runner. Never require a live UI session, manual clicks, screenshots or
-  production data; phrase UI or runtime behavior as the code path that produces it
-  (for example "stale responses are ignored because the callback compares the
-  captured request token to the current one").
-- `depends_on` contains earlier task ids. Tasks sharing a file must declare an
-  ordering dependency.
-
-Typically use 2–8 tasks and never more than 12. For a new file, reference an
-existing peer file that supplies the pattern. Resolve ambiguity in `assumptions`;
-do not ask questions or add exploration tasks.
-"""
-    template = get_config_prompt("plan_prompt", default, request_name)
-
-    context = {
-        "user_section": user_section,
-        "understanding_summary": understanding_summary,
-        "user_message": user_message
-    }
 
     return render_prompt_safe(template, context, default)
 

@@ -41,7 +41,6 @@ from ampower_koda.agent.plan_contract import (
     PlanValidationError,
     nearest_paths,
     plan_to_markdown,
-    validate_plan,
 )
 from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, run_task_checks, CheckResult, HealthReport
 from ampower_koda.agent.execution_contract import (
@@ -50,7 +49,6 @@ from ampower_koda.agent.execution_contract import (
 from ampower_koda.agent.execution_evidence import source_context, SourceMemory
 from ampower_koda.agent.prompts import (
     get_system_prompt,
-    get_plan_prompt,
     get_implement_prompt,
     get_follow_up_implement_prompt,
     get_review_prompt,
@@ -644,21 +642,6 @@ def _invoke_limited(model, messages: list, max_tokens: int):
     return result
 
 
-def _extract_file_paths(text: str) -> list[str]:
-    """Extract app-relative file paths from text produced by understand/plan phases."""
-    patterns = [
-        r'(?:[a-zA-Z_][a-zA-Z0-9_]*/[a-zA-Z0-9_/]+\.(?:py|js|json|html|css))',
-        r'(?:hooks\.py|setup\.py|__init__\.py)',
-        r'(?:patches/[a-zA-Z0-9_/]+\.py)',
-        r'(?:public/[a-zA-Z0-9_/]+\.(?:js|css))',
-    ]
-    paths = set()
-    for pat in patterns:
-        for m in _re.finditer(pat, text):
-            paths.add(m.group(0))
-    return sorted(paths)
-
-
 def tool_reader(provider: str, model: str, request_name: str = ""):
     """The bare call that reads a purpose read for the model: low effort, no tools, no conversation."""
     llm = _get_llm(provider=provider, model=model, session_id=request_name, reasoning_effort="low")
@@ -694,22 +677,6 @@ def _app_file_exists(app_name: str, rel_path: str) -> bool:
         return os.path.isfile(agent_tools._resolve_path(app_name, rel_path))
     except Exception:
         return False
-
-
-def _extract_change_summary(text: str) -> str:
-    """Pull the plain-English 'SUMMARY OF CHANGES' the model writes at the end.
-
-    Falls back to the trailing prose of the final message if the explicit heading
-    is missing, so the request always shows a readable summary.
-    """
-    text = (text or "").strip()
-    if not text:
-        return ""
-    m = _re.search(r"(?is)summary of changes\s*:?\s*(.+)$", text)
-    summary = (m.group(1) if m else text).strip()
-    # Drop leftover markdown fences / list bullets noise but keep readable text.
-    summary = summary.strip("`").strip()
-    return summary[:4000]
 
 
 def _file_manifest(paths: list[str], max_files: int = 25) -> str:
@@ -2083,26 +2050,6 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 
 # Planner calls: the plan coverage check and blocked-implementation amendments
 
-def _structured_plan_model(llm, provider: str):
-    """Bind the plan schema using the provider's structured-output API."""
-    # Native structured-output path per wrapper: OpenAI/OpenRouter enforce json_schema (strict),
-    # Claude only has json_schema on newer models so use tool input, Gemini rejects json_schema.
-    method = {
-        "Claude": "function_calling",
-        "Gemini": "json_mode",
-    }.get(provider, "json_schema")
-    options = {"method": method, "include_raw": True}
-    if provider in ("OpenAI", "OpenRouter"):
-        options["strict"] = True
-    structured = llm.with_structured_output(PLAN_JSON_SCHEMA, **options)
-    if provider == "OpenRouter":
-        structured = structured.bind(extra_body={
-            "usage": {"include": True},
-            "provider": {"require_parameters": True},
-        })
-    return structured
-
-
 PLAN_PATCH_ROUNDS = 2
 """Repair rounds that ask for edits to a rejected plan amendment. Each costs a
 cached-prefix read plus a few hundred new tokens."""
@@ -2371,108 +2318,6 @@ def _unpack_structured_plan(result) -> tuple[object, dict]:
         raise PlanValidationError(["Provider returned no structured plan object"])
     return raw, parsed
 
-
-def plan_node(state: dict) -> dict:
-    """Turn the understanding summary into a step-by-step implementation plan."""
-    if state.get("error"):
-        return {"error": state["error"]}
-
-    logs = _log_stage(state, "Planning", "started", "Creating todo-based implementation plan")
-
-    try:
-        provider = state.get("ai_provider", "OpenAI")
-        model = state.get("ai_model", "gpt-4o-mini")
-        app_name = state.get("target_app_name", "target_app")
-        request_name = state.get("request_name", "")
-        understanding = _message_content_to_str(state.get("understanding_summary", ""))
-        user_message = state.get("user_message", "")
-
-        if not understanding.strip():
-            logs = _log_stage({**state, "stage_log": logs}, "Planning", "failed",
-                "No understanding summary available — explore phase produced no output")
-            return {"error": "Understanding phase produced no output", "stage_log": logs}
-
-        llm = _get_llm(provider=provider, model=model)
-        system_prompt = get_system_prompt(app_name, request_name=request_name)
-        plan_prompt = get_plan_prompt(understanding, user_message, request_name=request_name)
-
-        _publish_agent_log(request_name, "llm_response",
-            preview="Generating todo-based plan from codebase analysis...", round=1)
-
-        structured_llm = _structured_plan_model(llm, provider)
-        response = structured_llm.invoke([
-            _build_system_message(provider, system_prompt, model),
-            HumanMessage(content=plan_prompt),
-        ], max_tokens=MODEL_PLAN_OUTPUT_TOKENS)
-        raw_response, plan_object = _unpack_structured_plan(response)
-
-        total_tokens = state.get("tokens_used", 0)
-        usage = getattr(raw_response, "usage_metadata", None)
-        if usage:
-            total_tokens += int(usage.get("total_tokens") or 0)
-            _publish_agent_log(request_name, "token_usage",
-                round=1,
-                tokens_this_round=usage.get("total_tokens", 0),
-                tokens_total=total_tokens,
-            )
-            _persist_token_usage(request_name, total_tokens)
-        else:
-            logs = _log_stage(
-                {**state, "stage_log": logs}, "Planning", "progress",
-                f"{provider} reported no token usage for the plan call - "
-                f"recorded total stays at {total_tokens} and undercounts this request",
-            )
-
-        plan_object = validate_plan(plan_object)
-
-        tasks = plan_object["tasks"]
-        _publish_agent_log(
-            request_name,
-            "llm_response",
-            preview=f"Structured plan returned {len(tasks)} validated task(s)",
-            round=2,
-        )
-        logs = _log_stage(
-            {**state, "stage_log": logs},
-            "Planning",
-            "progress",
-            f"{len(tasks)} task(s) validated; paths and dependency graph verified",
-        )
-
-        # Markdown is a display projection; execution consumes plan_object.
-        plan = plan_to_markdown(plan_object)
-
-        steps = list(state.get("intermediate_steps") or []) + [
-            {"phase": "Planning", "output": plan[:MAX_PHASE_OUTPUT_CHARS]}
-        ]
-
-        logs = _log_stage({**state, "stage_log": logs}, "Planning", "completed",
-            f"Plan generated ({len(plan)} chars, {len(tasks)} task(s))")
-
-        return {
-            "current_stage": "Planning",
-            "plan": plan,
-            "plan_object": plan_object,
-            "intermediate_steps": steps,
-            "stage_log": logs,
-            "tokens_used": total_tokens,
-        }
-    except Exception as e:
-        log_agent_error(
-            "Agent Graph: Planning",
-            f"request={state.get('request_name')}\n{e}\n{frappe.get_traceback()}",
-        )
-        logs = _log_stage({**state, "stage_log": logs}, "Planning", "failed", str(e)[:200])
-        return {
-            "current_stage": "Planning",
-            "error": str(e),
-            "stage_log": logs,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Graph nodes — Execution phase
-# ---------------------------------------------------------------------------
 
 def _check_plan_input(state: dict, messages: list, schema: dict, budget: dict) -> None:
     estimate = estimate_messages(messages) + serialized_tokens(schema)
