@@ -15,7 +15,7 @@ session, and "5 minutes loses nothing at 30 seconds and everything at 400".
 ``1h`` for the rolling transcript marker, which is the one boundary that moves —
 and the one whose expiry costs a whole conversation rewrite."""
 
-BlockRole = Literal["map+memory", "system+tools", "tail"]
+BlockRole = Literal["map+memory", "system+tools"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,10 +68,6 @@ class CachePlan:
     point the previous entry is evicted and the whole prefix is rewritten.
     Pinning the older one first keeps it alive."""
 
-    tail: str = ""
-    """The single trailing user message: session state, the ledger, the working
-    set. Nothing is cached behind it, so appending to it invalidates nothing."""
-
     session_id: str = ""
     """The one routing control worth sending. A prompt cache lives on one
     upstream instance, and a load balancer that only enables sticky routing
@@ -101,10 +97,6 @@ class PromptBudget:
 
     map_tokens: int = 2000
     memory_tokens: int = 800
-    tail_tokens: int = 0
-    """0 means unbounded. The tail is uncached and therefore fully paid for, but
-    it is also where the ledger and the working set live, and both already carry
-    their own allocator-derived caps."""
 
     reserved_breakpoints: int = 1
     """Boundaries held back from the prefix for the rolling marker. Providers cap

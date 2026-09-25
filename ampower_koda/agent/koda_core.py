@@ -193,8 +193,6 @@ class LangChainChatModel:
         """
         messages: list = [self._system(request)]
         messages.extend(_replay(request.transcript))
-        if request.plan.tail:
-            messages.append(HumanMessage(content=request.plan.tail))
         return messages
 
     def _system(self, request: ModelRequest):

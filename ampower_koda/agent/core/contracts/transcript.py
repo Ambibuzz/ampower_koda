@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from ..errors import CoreError
 from ..tokens import estimate_tokens
 from .prompt import Message
 
-BlockKind = Literal["prose", "tool_use", "tool_result"]
+BlockKind = Literal["prose", "context", "tool_use", "tool_result"]
 Role = Literal["user", "assistant"]
 
 
@@ -20,6 +20,7 @@ class Block:
 
     role: Role
     kind: BlockKind = "prose"
+    """Context snapshots are evidence, not user requests pinned by compaction."""
     text: str = ""
 
     tool: str = ""
@@ -47,12 +48,15 @@ class Block:
 
     elided: bool = False
     tokens: int = 0
+    provider_context_json: str = field(default='', repr=False)
+    parallel_call_ids: tuple[str, ...] = ()
+    """The first call retains its original assistant round for exact provider replay."""
 
     def __post_init__(self) -> None:
         if self.kind in ("tool_use", "tool_result") and not self.call_id:
             raise CoreError(f"a {self.kind} block must carry a call id")
-        if not self.tokens and self.text:
-            object.__setattr__(self, "tokens", estimate_tokens(self.text))
+        if not self.tokens:
+            object.__setattr__(self, "tokens", estimate_tokens(self.text + self.arguments_json + self.provider_context_json))
 
     @property
     def is_result(self) -> bool:
@@ -72,16 +76,6 @@ class Transcript:
     """Blocks in order, plus where each turn begins."""
 
     blocks: tuple[Block, ...] = ()
-
-    dropped_turns: int = 0
-    """Turns the trimmer has already removed from the front.
-
-    Carried because two counters live on different axes and used to be compared
-    directly: the fold's ``turns_folded`` counts turns over the *session's*
-    lifetime, and ``turn_starts`` lists only the turns still present. Once one
-    turn had been trimmed, "digest turn 4" indexed the wrong turn — and then the
-    fold stopped finding anything to do while the trimmer kept cutting, which is
-    exactly the "drop a turn nothing digested" failure §13 exists to prevent."""
 
     @property
     def turn_starts(self) -> tuple[int, ...]:
@@ -121,37 +115,8 @@ class Transcript:
     def live_result_count(self) -> int:
         return sum(1 for _, block in self.results() if not block.elided)
 
-    def suffix_tokens(self, index: int) -> int:
-        """Tokens from ``index`` to the end — what a rewrite here re-sends."""
-        return sum(block.tokens for block in self.blocks[index:])
-
     def with_blocks(self, blocks: Iterable[Block]) -> Transcript:
         return replace(self, blocks=tuple(blocks))
-
-    def trimmed_from(self, index: int, *, turns: int) -> Transcript:
-        """Cut at ``index`` and record that ``turns`` turns went with it."""
-        return replace(
-            self.slice_from(index), dropped_turns=self.dropped_turns + max(0, turns)
-        )
-
-    def local_turn(self, absolute_turn: int) -> int:
-        """A session-lifetime turn number as an index into :attr:`turn_starts`."""
-        return absolute_turn - self.dropped_turns
-
-    def slice_from(self, index: int) -> Transcript:
-        """Drop everything before ``index``. Refuses a cut that splits a pair."""
-        if index <= 0:
-            return self
-        orphans = {
-            block.call_id
-            for block in self.blocks[index:]
-            if block.is_result
-        } - {block.call_id for block in self.blocks[index:] if block.kind == "tool_use"}
-        if orphans:
-            raise CoreError(
-                f"cutting at {index} would orphan tool result(s) {sorted(orphans)}"
-            )
-        return replace(self, blocks=self.blocks[index:])
 
     def to_messages(self) -> tuple[Message, ...]:
         """The cache planner's view. Tool blocks are structured, prose is plain."""
@@ -164,5 +129,3 @@ class Transcript:
             )
             for block in self.blocks
         )
-
-

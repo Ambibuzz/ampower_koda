@@ -114,12 +114,13 @@ MAP_MAX_TOKENS: Final[int] = 2_000
 
 BUDGET_SHARES: Final[dict[str, float]] = {
     "ledger": 0.03,
-    "working_set": 0.08,
-    "hot_results": 0.12,
+    # About two whole functions plus a names-only outline; the most that fits
+    # a 32k input unsqueezed.
+    "working_set": 0.12,
     "fold": 0.015,
 }
 
-BUDGET_FLOORS: Final[dict[str, int]] = {"ledger": 4_000, "hot_results": 12_000, "hot_count": 20}
+BUDGET_FLOORS: Final[dict[str, int]] = {"ledger": 4_000}
 
 BUDGET_FLOOR_CEILING: Final[float] = 0.25
 
@@ -133,11 +134,6 @@ BUDGET_CEILED_REGIONS: Final[tuple[str, ...]] = (
     "memory",
 )
 
-BUDGET_TOKENS_PER_HOT_RESULT: Final[int] = 6_000
-
-COMPACTION_TRIGGER_FRACTION: Final[float] = 0.75
-
-REPLY_HEADROOM_TOKENS: Final[int] = 8_000
 MAX_TURN_TOKENS_MARGINAL: Final[int] = 80_000
 MAX_TURN_TOKENS_OBSERVED: Final[int] = 160_000
 OBSERVED_WINDOW_MULTIPLE: Final[float] = 1.25
@@ -161,8 +157,6 @@ MIN_CACHEABLE_BY_FAMILY: Final[dict[str, int]] = {
 MIN_CACHEABLE_DEFAULT: Final[int] = 1_024
 
 SESSION_ID_MAX_CHARS: Final[int] = 256
-
-CACHE_WRITE_TO_READ: Final[int] = 20
 
 
 BM25_K1: Final[float] = 1.2
@@ -214,7 +208,6 @@ GRAPH_HOP_DECAY: Final[float] = 0.45
 HISTORY_NEIGHBOURS: Final[int] = 6
 
 FUSION_RANK_DECAY: Final[float] = 0.35
-RRF_K: Final[int] = 60
 SEED_LIMIT: Final[int] = 8
 SOURCE_LIMIT: Final[int] = 40
 UNION_LIMIT: Final[int] = 60
@@ -242,12 +235,6 @@ WORKING_SET_MAX_EDITED: Final[int] = 8
 WORKING_SET_EXCERPT_CHARS: Final[int] = 600
 
 WORKING_SET_WEAK_COVERAGE: Final[float] = 0.75
-
-HOTCOLD_LOW_WATER: float = 0.5
-
-AMORTISATION_RATIO: Final[int] = CACHE_WRITE_TO_READ
-
-HOTCOLD_HARD_PRESSURE: Final[int] = 2
 
 WORKING_SET_RELATIVE_FLOOR: Final[float] = 0.5
 """Hits below this share of the top score are dropped."""

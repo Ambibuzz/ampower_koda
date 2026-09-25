@@ -9,17 +9,18 @@ from ..constants import (
     BUDGET_FLOOR_CEILING,
     BUDGET_FLOORS,
     BUDGET_SHARES,
-    BUDGET_TOKENS_PER_HOT_RESULT,
     BUDGET_TOTAL_CEILING,
-    COMPACTION_TRIGGER_FRACTION,
     MAP_MAX_TOKENS,
     MAX_TURN_TOKENS_MARGINAL,
     MAX_TURN_TOKENS_OBSERVED,
     MEMORY_MAX_TOKENS,
     OBSERVED_WINDOW_MULTIPLE,
-    REPLY_HEADROOM_TOKENS,
 )
 from ..errors import ConfigError
+from .request import DEFAULT_INPUT_TOKENS
+
+# More history capacity must not inflate automatically injected context.
+AUTO_CONTEXT_WINDOW = 32_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,42 +31,14 @@ class ContextBudget:
 
     ledger: int
     working_set: int
-    hot_results: int
-    hot_count: int
     fold: int
 
     repo_map: int
     memory: int
 
-    compaction_trigger: int
-    reply_headroom: int
     marginal_turn: int
     observed_turn: int
-
-    @property
-    def claimed(self) -> int:
-        """What the allocator has spoken for, map and memory included."""
-        return (
-            self.ledger
-            + self.working_set
-            + self.hot_results
-            + self.fold
-            + self.repo_map
-            + self.memory
-        )
-
-    @property
-    def claimed_share(self) -> float:
-        return self.claimed / self.window if self.window else 0.0
-
-    def summary(self) -> str:
-        return (
-            f"{self.window:,}-token window: "
-            f"ledger {self.ledger:,}, working set {self.working_set:,}, "
-            f"hot results {self.hot_results:,} ({self.hot_count}), "
-            f"map {self.repo_map:,}, memory {self.memory:,} "
-            f"— {self.claimed_share:.0%} claimed, compaction at {self.compaction_trigger:,}"
-        )
+    input_tokens: int = DEFAULT_INPUT_TOKENS
 
 
 def allocate(
@@ -74,22 +47,26 @@ def allocate(
     ledger_override: int = 0,
     map_tokens: int = MAP_MAX_TOKENS,
     memory_tokens: int = MEMORY_MAX_TOKENS,
+    input_tokens: int = DEFAULT_INPUT_TOKENS,
 ) -> ContextBudget:
     """Derive every context budget from the window size."""
     if window <= 0:
         raise ConfigError("context.window_tokens", "must be positive")
+    if input_tokens <= 0:
+        raise ConfigError("context.input_tokens", "must be positive")
+    active = min(window, input_tokens)
 
-    prefix = _prefix_blocks(window, map_tokens, memory_tokens)
+    automatic = min(active, AUTO_CONTEXT_WINDOW)
+    prefix = _prefix_blocks(automatic, map_tokens, memory_tokens)
     regions = _fit(
         {
-            "ledger": ledger_override or _at_least("ledger", window),
-            "working_set": _at_least("working_set", window),
-            "hot_results": _at_least("hot_results", window),
-            "fold": _at_least("fold", window),
+            "ledger": ledger_override or _at_least("ledger", automatic),
+            "working_set": _at_least("working_set", automatic),
+            "fold": _at_least("fold", automatic),
             "repo_map": prefix.repo_map,
             "memory": prefix.memory,
         },
-        window,
+        active,
         protected="ledger" if ledger_override else "",
     )
 
@@ -97,15 +74,12 @@ def allocate(
         window=window,
         ledger=regions["ledger"],
         working_set=regions["working_set"],
-        hot_results=regions["hot_results"],
-        hot_count=max(BUDGET_FLOORS["hot_count"], round(window / BUDGET_TOKENS_PER_HOT_RESULT)),
         fold=regions["fold"],
         repo_map=regions["repo_map"],
         memory=regions["memory"],
-        compaction_trigger=int(window * COMPACTION_TRIGGER_FRACTION),
-        reply_headroom=min(REPLY_HEADROOM_TOKENS, window // 2),
-        marginal_turn=MAX_TURN_TOKENS_MARGINAL,
+        marginal_turn=max(MAX_TURN_TOKENS_MARGINAL, 2 * active),
         observed_turn=min(MAX_TURN_TOKENS_OBSERVED, int(window * OBSERVED_WINDOW_MULTIPLE)),
+        input_tokens=active,
     )
 
 

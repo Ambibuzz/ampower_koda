@@ -94,7 +94,6 @@ def assemble(
     *,
     blocks: Sequence[PromptBlock],
     transcript: Sequence[Message],
-    tail: str,
     model: str,
     session_id: str = "",
     previous_marker: TranscriptMarker | None = None,
@@ -107,7 +106,6 @@ def assemble(
         blocks=tuple(blocks),
         marker=marker,
         previous_marker=_keep_alive(previous_marker, marker, transcript),
-        tail=tail,
         session_id=routing_key(session_id),
     )
 
@@ -125,5 +123,3 @@ def _keep_alive(
     if previous.index >= len(transcript) or not transcript[previous.index].plain:
         return None
     return previous
-
-

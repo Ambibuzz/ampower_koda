@@ -73,6 +73,8 @@ class ModelTurn:
 
     failed: bool = False
     detail: str = ""
+    provider_context_json: str = field(default='', repr=False)
+    """Opaque provider continuation fields, never rendered as user-facing prose."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,7 +185,7 @@ class TurnResult:
     rounds: int = 0
     usage: TurnUsage = TurnUsage()
     side_usage: SideUsage = SideUsage()
-    """Escalation, fold and compaction calls — charged separately because the
+    """Fold and history-summary calls — charged separately because the
     loop cannot see them in its own request/response pair."""
 
     calls: tuple[str, ...] = ()
