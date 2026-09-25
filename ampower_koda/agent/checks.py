@@ -1,11 +1,9 @@
-"""Real, mechanical Frappe health checks — run before any LLM review.
+"""Mechanical Frappe health checks, run before the LLM review.
 
-Task checks cover syntax and JSON. Final integration also checks Query Builder
-fields, imports and wiring, once all dependent tasks have been implemented. Mechanical checks do
-not replace review against the approved acceptance criteria.
-
-Each checker runs per file in isolation, so a bad file or a crashing checker
-becomes a failure line instead of aborting the whole check pass.
+Syntax, JSON, Query Builder fields against installed columns, imports and
+frappe.call wiring. Each checker runs per file in isolation, so a bad file or a
+crashing checker becomes a failure line instead of aborting the pass. These
+checks do not replace review against the approved acceptance criteria.
 """
 
 from __future__ import annotations
@@ -90,11 +88,6 @@ def run_health_checks(app_name: str, edits: list[dict]) -> HealthReport:
     for checker in (_syntax_checks, _json_checks, _query_schema_checks, _import_checks, _wiring_checks):
         results.extend(_isolated_checks(checker, app_name, paths))
     return HealthReport(results)
-
-
-def run_task_checks(app_name: str, paths: list[str]) -> HealthReport:
-    """Check an intermediate task without requiring later tasks' wiring."""
-    return HealthReport(_syntax_checks(app_name, paths) + _json_checks(app_name, paths))
 
 
 def run_query_schema_checks(app_name: str, paths: list[str]) -> HealthReport:

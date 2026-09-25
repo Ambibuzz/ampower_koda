@@ -11,14 +11,12 @@ from copy import deepcopy
 from datetime import datetime
 
 import frappe
-from langgraph.graph import END, StateGraph
 from langchain_core.tools import StructuredTool, tool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from ampower_koda.agent.prompt_caching import mark_message, native_cache_messages, openai_breakpoints, rolling_messages, terminal_model
 from langchain_openai import ChatOpenAI
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.state import AgentState
 from ampower_koda.agent.cache_usage import persist_usage, provider_cost
 from ampower_koda.agent import koda_core
 from ampower_koda.agent import checkpoint
@@ -46,22 +44,17 @@ from ampower_koda.agent.plan_contract import (
 )
 from ampower_koda.agent.checks import run_health_checks, run_query_schema_checks, CheckResult, HealthReport
 from ampower_koda.agent.execution_contract import (
-    load_plan, read_snapshot, change_evidence, review_verdict, review_decision, completion_report, completion_report_problem, revision, renamed_sources,
+    completion_report_problem,
+    load_plan, read_snapshot, change_evidence, review_decision, completion_report, revision, renamed_sources,
 )
 from ampower_koda.agent.execution_evidence import source_context, SourceMemory
-from ampower_koda.agent.prompts import (
-    get_system_prompt,
-    get_implement_prompt,
-    get_follow_up_implement_prompt,
-    get_review_prompt,
-)
-
-
 from ampower_koda.agent.history_prune import describe_call, drop_followups, prune_price, prune_rounds
+from ampower_koda.agent.prompts import get_review_prompt, get_system_prompt
+
+
 # Runaway guards, not work units: a turn ends when the model reports, and the
 # request-wide call budget bounds the whole run.
 MAX_TOOL_ROUNDS_EXECUTION = 60
-MAX_TOOL_ROUNDS_REPAIR = 8        # a retry continues from current source with a remaining-work list
 MIN_REPAIR_ROUNDS = 30            # a pass with fewer calls left than this first extends the budget
 MAX_TOOL_ROUNDS_REVIEW = 12       # includes live call_method checks, not only reads
 MAX_TOOL_ROUNDS_REVIEW_RECOVERY = 6  # continues the first pass's history, so these are new reads only
@@ -220,10 +213,6 @@ def _message_content_to_str(content) -> str:
 def _llm_response_text(response) -> str:
     """Extract plain text from a LangChain chat model response."""
     return _message_content_to_str(getattr(response, "content", ""))
-
-
-def _parse_review_verdict(text: str, criteria: list[str] | None = None) -> tuple[bool, str]:
-    return review_verdict(_extract_review_json(text or ""), criteria or [])
 
 
 def _review_recovery_reason(decision: str, notes: str, payload, criteria: list[str]) -> str:
@@ -685,21 +674,6 @@ def _app_file_exists(app_name: str, rel_path: str) -> bool:
         return os.path.isfile(agent_tools._resolve_path(app_name, rel_path))
     except Exception:
         return False
-
-
-def _file_manifest(paths: list[str], max_files: int = 25) -> str:
-    """Name likely files without injecting their bodies into every model round.
-
-    The old preloader inserted up to 120k characters and the implementation
-    prompt then told the model to call ``read_file`` for those same files. A
-    manifest preserves routing while one targeted tool read supplies the bytes.
-    """
-    unique = list(dict.fromkeys(path for path in paths if path))
-    shown = unique[:max_files]
-    lines = [f"- {path}" for path in shown]
-    if len(unique) > len(shown):
-        lines.append(f"- ... ({len(unique) - len(shown)} additional paths omitted)")
-    return "\n".join(lines) if lines else "(no target files identified yet)"
 
 
 def _log_stage(state: dict, stage: str, status: str, summary: str) -> list:
@@ -2556,105 +2530,6 @@ def _persist_task_results(state: dict):
         frappe.db.commit()
 
 
-def implement_node(state: dict) -> dict:
-    """Implement one ready task, or repair concrete integration findings."""
-    if state.get("error"):
-        return {"error": state["error"]}
-    active, criteria, allowed = _execution_context(state)
-    dependencies = {d.casefold() for d in active.get("depends_on", [])}
-    completed = [r for r in state.get("task_results", []) if r["task_id"].casefold() in dependencies]
-    ready = {r["task_id"].casefold() for r in completed if r.get("status") in {"implemented", "passed"}}
-    if dependencies - ready:
-        return {"error": "Incomplete dependency: " + ", ".join(sorted(dependencies - ready))}
-    if state.get("integration_mode"):
-        completed = [r for r in state.get("task_results", []) if r["task_id"] != "INTEGRATION"]
-    completed = [{**r, "changed_since_completion": any(
-        revision(_read_current(state, c["path"])) != c["after"] for c in r.get("changes", [])
-    )} for r in completed]
-    logs = _log_stage(state, "Implementing", "started", f"{active['id']}: attempt {state.get('review_attempts', 0) + 1}")
-    task_before = dict(state.get("task_baseline") or {})
-    for path in allowed or []:
-        if path not in task_before:
-            task_before[path] = _read_current(state, path)
-    plan = state["plan_object"]
-    if state.get("is_follow_up"):
-        prompt = get_follow_up_implement_prompt(
-            state.get("follow_up_message", ""), json.dumps(plan, ensure_ascii=True),
-            # The snapshot accumulates across follow-ups up to 50k; unbounded it
-            # trips MAX_TASK_PROMPT_CHARS and fails every later follow-up.
-            _bounded_text(state.get("implementation_memory", ""), MAX_UNDERSTANDING_CONTEXT_CHARS),
-            "\n".join(state.get("prior_changed_paths") or []),
-            _file_manifest(state.get("prior_changed_paths") or []),
-            request_name=state.get("request_name"),
-        )
-    else:
-        # Custom implementation instructions still apply, but receive only the active task.
-        prompt = get_implement_prompt(
-            json.dumps(active, ensure_ascii=True),
-            _bounded_text(state.get("understanding_summary", ""), MAX_UNDERSTANDING_CONTEXT_CHARS),
-            state.get("user_message", ""), _file_manifest(allowed or []),
-            request_name=state.get("request_name"),
-        )
-    prompt += "\n\n## EXECUTION CONTRACT (authoritative)\n" + json.dumps({
-        "overview": plan.get("overview", ""), "scope": plan.get("scope", {}),
-        "active_task": active, "dependency_results": completed,
-        "acceptance_criteria": criteria,
-    }, ensure_ascii=True)
-    prompt += (
-        "\nImplement only the active task. Read its context_refs from the CURRENT files; "
-        "line numbers may have shifted. Dependency reports are implementation claims, not proof. "
-        "Do not execute other tasks. If approved scope is insufficient, report the blocker. "
-        "Preserve the dependency behavior across files and languages; verify shared input/output examples. "
-        "Do not claim runtime tests ran when only static checks are available."
-    )
-    dependency_ids = {r["task_id"].casefold() for r in completed}
-    dependency_paths = list(dict.fromkeys(p for task in state["execution_tasks"]
-        if task["id"].casefold() in dependency_ids for p in task["files"]))
-    if dependency_paths:
-        prompt += "\n\n## CURRENT DEPENDENCY SOURCE\n" + source_context(
-            dependency_paths, lambda p: _read_current(state, p), state.get("execution_baseline"), limit=8000)
-    prompt += (
-        '\nReturn ONLY a JSON completion report: {"status":"complete","summary":"Actual changes",'
-        '"behavior":["path:symbol, rule and concrete input/output example for dependents"],'
-        '"verification":["Checks actually performed, with outcomes"],"unverified":["Remaining uncertainty"]}. '
-        'Use status "blocked" if scope or missing information prevents completion. '
-        'List all unresolved work; do not claim complete after a forced call-limit summary. '
-        'Verification and unverified may be empty arrays; behavior must describe the completed contract. '
-        'This JSON format overrides any summary-format instructions above.'
-    )
-    if state.get("integration_mode"):
-        prompt += "\nThis is an integration repair: fix only the findings below; do not rebuild completed tasks."
-    if state.get("review_notes"):
-        prompt += "\n\n## FINDINGS TO REPAIR\n" + state["review_notes"]
-    updates = _run_agent_turn(
-        {**state, "allowed_write_paths": allowed}, "Implementing", prompt,
-        read_only_tools=False,
-        max_rounds=MAX_TOOL_ROUNDS_REPAIR if state.get("review_attempts") else MAX_TOOL_ROUNDS_EXECUTION,
-    )
-    before = updates.pop("_write_baseline", {})
-    updates.pop("_tool_edited_paths", None)
-    global_before = dict(state.get("execution_baseline") or {})
-    for path, content in before.items():
-        task_before.setdefault(path, content)
-        global_before.setdefault(path, content)
-    # Include approved files even for no-op tasks; the reviewer must verify them.
-    for path, content in task_before.items():
-        global_before.setdefault(path, content)
-    edits, _ = change_evidence(global_before, lambda p: _read_current(state, p))
-    steps = updates.get("intermediate_steps") or []
-    output = steps[-1].get("output", "") if steps else ""
-    completion = completion_report(output)
-    updates.update({
-        "task_baseline": task_before, "execution_baseline": global_before,
-        "edits_made": edits,
-        "task_completion": completion,
-        "task_summary": completion.get("summary", _bounded_text(output, 4000)),
-        "stage_log": _log_stage({**state, "stage_log": logs}, "Implementing", "completed" if not updates.get("error") else "failed",
-                                f"{active['id']}: {len(edits)} total changed file(s); review pending"),
-    })
-    return updates
-
-
 def _implementation_updates(state: dict, updates: dict, logs: list) -> dict:
     """Fold an implementation turn's writes into the baseline, change evidence and completion report."""
     before = updates.pop("_write_baseline", {})
@@ -3080,21 +2955,6 @@ def review_node(state: dict) -> dict:
     return updates
 
 
-def advance_task_node(state: dict) -> dict:
-    active = state["execution_tasks"][state["task_index"]]
-    completed = any(r.get("task_id") == active["id"] and r.get("status") in {"implemented", "passed"}
-                    for r in state.get("task_results", []))
-    if state.get("error") or state.get("turn_exhausted") or not state.get("review_passed") or not completed:
-        return {"error": state.get("error") or "Cannot advance an unfinished task.", "review_passed": False}
-    index = state["task_index"] + 1
-    integration = index >= len(state["execution_tasks"])
-    return {
-        "task_index": index, "integration_mode": integration,
-        "task_baseline": {}, "review_attempts": 0, "review_notes": "",
-        "review_passed": False, "turn_exhausted": False, "task_summary": "", "task_completion": {},
-    }
-
-
 def _get_bench_env() -> dict:
     """Build a subprocess environment with the correct Node.js on PATH.
     nvm installs Node under ~/.nvm/versions/node/<version>/bin but background
@@ -3131,23 +2991,6 @@ def should_retry_implement(state: dict) -> str:
     return "done"
 
 
-def build_execution_graph():
-    """Sequential implementation/gates, bounded repair, final semantic review."""
-    workflow = StateGraph(AgentState)
-    workflow.add_node("prepare", prepare_execution_node)
-    workflow.add_node("implement", implement_node)
-    workflow.add_node("review", review_node)
-    workflow.add_node("advance", advance_task_node)
-    workflow.set_entry_point("prepare")
-    workflow.add_edge("prepare", "implement")
-    workflow.add_edge("implement", "review")
-    workflow.add_conditional_edges("review", should_retry_implement, {
-        "implement": "implement", "advance": "advance", "done": END,
-    })
-    workflow.add_conditional_edges("advance", lambda s: "review" if s["integration_mode"] else "implement", {
-        "review": "review", "implement": "implement",
-    })
-    return workflow.compile()
 def _checkpoint_next_node(name: str, merged: dict, updates: dict) -> str:
     """Persist the node that can make progress, not merely the node that failed."""
     if updates.get("error"):

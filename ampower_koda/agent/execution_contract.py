@@ -210,7 +210,3 @@ def review_decision(payload, criteria: list[str]) -> tuple[str, str]:
         return "repair", json.dumps(payload, ensure_ascii=True)
     return "invalid", invalid
 
-
-def review_verdict(payload, criteria: list[str]) -> tuple[bool, str]:
-    decision, notes = review_decision(payload, criteria)
-    return decision == "pass", notes

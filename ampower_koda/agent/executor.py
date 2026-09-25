@@ -12,13 +12,10 @@ import frappe
 from ampower_koda.agent import koda_core
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.execution_contract import load_plan
-from ampower_koda.agent.graph import (
-    _get_bench_env,
-    _message_content_to_str,
-)
 from ampower_koda.agent import session as koda_session
 from ampower_koda.agent import verification
 from ampower_koda.agent.run_control import managed_job, check_active, set_request_value
+from ampower_koda.agent.graph import _get_bench_env, _message_content_to_str
 from ampower_koda.agent.git_ops import (
     branch_exists,
     generate_branch_name,
