@@ -18,6 +18,7 @@ from ampower_koda.agent.graph import (
     build_planning_graph,
     build_execution_graph,
 )
+from ampower_koda.agent import verification
 from ampower_koda.agent.run_control import managed_job, check_active, set_request_value
 from ampower_koda.agent.git_ops import (
     branch_exists,
@@ -36,7 +37,7 @@ DOCTYPE_NAME = "Agent Request"
 
 
 def _revert_previous_changes(app_name: str, base_branch: str, request_name: str = "",
-                              user: str = "", branch_prefix: str = "ai-agent/"):
+                              user: str = "", branch_prefix: str = "ai-agent/", *, archive_tests: bool = True):
     """Revert all uncommitted changes and agent-created branches before a fresh run.
     Steps:
       1. Discard all modified/staged files (git reset --hard + git checkout .)
@@ -85,6 +86,20 @@ def _revert_previous_changes(app_name: str, base_branch: str, request_name: str 
         if has_untracked:
             run_git(["clean", "-fd"], cwd=repo_root)
             reverted_items.append("removed untracked files")
+
+    # `git clean -fd` skips ignored files, and all of `.koda/` is ignored, so
+    # an earlier run's tests would otherwise become this run's frozen contract.
+    # Only planning archives: an approved plan was written against the tests
+    # present when it was made, and executing it must not remove them.
+    archived = []
+    try:
+        if archive_tests:
+            archived = verification.archive_untracked_tests(app_name, label=request_name)
+    except (OSError, ValueError):
+        log_agent_error("Agent Executor: archive leftover tests", frappe.get_traceback())
+    if archived:
+        reverted_items.append(f"archived {len(archived)} leftover agent test file(s) to "
+                              f"{verification.ARCHIVE_DIRECTORY}")
 
     if reverted_items and request_name:
         summary = "Reverted previous changes: " + "; ".join(reverted_items)
@@ -406,7 +421,7 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
             revert_msg = _revert_previous_changes(
                 config["target_app_name"], config["base_branch"],
                 request_name=request_name, user=user,
-                branch_prefix=config["branch_prefix"],
+                branch_prefix=config["branch_prefix"], archive_tests=False,
             )
             if revert_msg:
                 _update_status(request_name, user, "Implementing", f"Cleaned up: {revert_msg}")
@@ -619,7 +634,8 @@ def _strip_stray_notes(repo_root: str, keep: set[str]) -> list[str]:
     removed = []
     for rel in (untracked or "").splitlines():
         rel = rel.strip()
-        if not rel.lower().endswith(_NOTE_EXTENSIONS) or _same_file(rel, keep):
+        if (not rel.lower().endswith(_NOTE_EXTENSIONS) or _same_file(rel, keep)
+                or '.koda' in rel.replace('\\', '/').split('/')):
             continue
         try:
             os.remove(os.path.join(repo_root, rel))
