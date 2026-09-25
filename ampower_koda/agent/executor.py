@@ -488,6 +488,10 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
             "follow_up_message": follow_up_message,
             "prior_changed_paths": prior_changed_paths,
             "implementation_memory": implementation_memory,
+            "follow_up_worktree_before": worktree_before,
+            "prior_file_moves": (json.loads(doc.execution_results or "{}").get("file_moves", []) if is_follow_up_mode else []),
+            "prior_deleted_paths": [e["path"] for e in as_json_list(doc.files_changed)
+                                     if isinstance(e, dict) and e.get("path") and e.get("summary") == "Deleted"] if is_follow_up_mode else [],
         }
 
         final_state = graph.invoke(initial, config={"recursion_limit": 100})
