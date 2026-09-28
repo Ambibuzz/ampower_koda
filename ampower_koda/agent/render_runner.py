@@ -9,6 +9,7 @@ A report built this way let a model find 88-96% of seeded UI bugs, against 67% f
 alone (compare-outputs/browser-lab/FINDINGS.md).
 """
 
+import re
 MAX_STEPS = 20
 DIFF_LINES = 25
 REMOVED_SHOWN = 3  # removed lines listed per changed block before the rest are counted
@@ -148,4 +149,158 @@ FIND_JS = r"""(ask) => {
   }
   return out;
 }"""
+
+# Installed before any page script: the visible text every frame, running animations and layout shifts.
+MOTION_JS = r"""
+(() => {
+  if (window.__motion) return;
+  const shifts = [];
+  const label = el => {
+    if (!el) return '';
+    const text = (el.getAttribute && el.getAttribute('aria-label')) || el.innerText || '';
+    return el.tagName.toLowerCase() + (el.classList && el.classList[0] ? '.' + el.classList[0] : '')
+      + (text.trim() ? ' "' + text.trim().replace(/\s+/g, ' ').slice(0, 30) + '"' : '');
+  };
+  try {
+    new PerformanceObserver(list => {
+      for (const e of list.getEntries()) {
+        if (e.hadRecentInput) continue;
+        const sources = (e.sources || []).map(s => [s, s.node && (s.node.nodeType === 1 ? s.node : s.node.parentElement)])
+          .filter(([, n]) => n && n.closest && n.closest('.page-container, .modal, #alert-container'));
+        if (!sources.length) continue;  // Desk's own sidebar and navbar
+        shifts.push({t: e.startTime, value: e.value, sources: sources.slice(0, 3).map(([s, n]) => (
+          {label: label(n), dy: Math.round(s.currentRect.y - s.previousRect.y),
+           dx: Math.round(s.currentRect.x - s.previousRect.x)}))});
+      }
+    }).observe({type: 'layout-shift', buffered: true});
+  } catch (e) {}
+  const scope = '.page-container, .modal.show, #alert-container';
+  const visibleLines = () => {
+    const out = [];
+    for (const root of document.querySelectorAll(scope)) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let n;
+      while ((n = walker.nextNode())) {
+        const text = n.textContent.trim();
+        const el = n.parentElement;
+        if (!text || !el || !el.checkVisibility({opacityProperty: true, visibilityProperty: true})) continue;
+        const r = el.getBoundingClientRect();
+        if (r.right <= 0 || r.left >= innerWidth || r.bottom <= 0 || r.top >= innerHeight) continue;
+        out.push(text.replace(/\s+/g, ' ').slice(0, 80));
+      }
+    }
+    return out;
+  };
+  let trace = null;
+  const inScope = el => el && el.closest && el.closest(scope);
+  window.__motion = {
+    start() {
+      const t0 = performance.now();
+      trace = {t0, samples: [], anims: {}, from: shifts.length};
+      let last = null;
+      const tick = () => {
+        if (!trace || trace.t0 !== t0) return;
+        const t = Math.round(performance.now() - t0);
+        const lines = visibleLines();
+        const key = lines.join('\n');
+        if (key !== last) { trace.samples.push({t, lines}); last = key; }
+        for (const a of document.getAnimations()) {
+          const el = a.effect && a.effect.target;
+          if (!el || !el.isConnected || !inScope(el)) continue;
+          const name = a.animationName || a.transitionProperty || 'animation';
+          const k = label(el) + '|' + name;
+          const r = el.getBoundingClientRect();
+          const timing = a.effect.getTiming();
+          const entry = trace.anims[k] || (trace.anims[k] = {target: label(el), name,
+            duration: Math.round(Number(timing.duration) || 0), infinite: timing.iterations === Infinity,
+            first: [Math.round(r.x), Math.round(r.y)], opacity: [getComputedStyle(el).opacity]});
+          entry.last = [Math.round(r.x), Math.round(r.y)];
+          entry.opacity[1] = getComputedStyle(el).opacity;
+        }
+        requestAnimationFrame(tick);
+      };
+      tick();
+    },
+    stop() {
+      if (!trace) return null;
+      const t0 = trace.t0;
+      const still = document.getAnimations().filter(a => a.playState === 'running' && inScope(a.effect && a.effect.target))
+        .map(a => ({target: label(a.effect.target), name: a.animationName || a.transitionProperty || 'animation',
+                    infinite: a.effect.getTiming().iterations === Infinity}));
+      const out = {samples: trace.samples, anims: Object.values(trace.anims), still,
+                   shifts: shifts.slice(trace.from).map(s => Object.assign({}, s, {t: Math.round(s.t - t0)}))};
+      trace = null;
+      return out;
+    },
+  };
+})();
+"""
+
+# Frame timing and element geometry each frame: freezes (with the script that was busy, where the browser
+# reports it) and how every element that grew, shrank or moved got there.
+SMOOTH_JS = r"""
+(() => {
+  if (window.__smooth) return;
+  const loafs = [];
+  const add = list => { for (const e of list.getEntries()) loafs.push({t: e.startTime, d: Math.round(e.duration),
+    scripts: (e.scripts || []).slice(0, 3).map(s => ({fn: s.sourceFunctionName || '',
+      src: (s.sourceURL || '').split('/').pop().split('?')[0], d: Math.round(s.duration)}))}); };
+  try { new PerformanceObserver(add).observe({type: 'long-animation-frame', buffered: true}); }
+  catch (e) { try { new PerformanceObserver(add).observe({type: 'longtask', buffered: true}); } catch (e2) {} }
+  const scope = '.page-container, .modal, #alert-container';
+  const label = el => {
+    const text = (el.getAttribute && el.getAttribute('aria-label')) || el.innerText || '';
+    return el.tagName.toLowerCase() + (el.classList && el.classList[0] ? '.' + el.classList[0] : '')
+      + (text.trim() ? ' "' + text.trim().replace(/\s+/g, ' ').slice(0, 30) + '"' : '');
+  };
+  let run = null;
+  const track = el => {
+    if (run && el && el.closest && el.closest(scope) && !run.tracked.has(el) && run.tracked.size < 12)
+      run.tracked.set(el, {label: label(el), points: []});
+  };
+  new MutationObserver(list => { for (const m of list) if (m.target.nodeType === 1) track(m.target); })
+    .observe(document, {subtree: true, attributes: true, attributeFilter: ['style', 'class']});
+  window.__smooth = {
+    start() {
+      const t0 = performance.now();
+      run = {t0, tracked: new Map(), gaps: [], last: t0, changed: t0};
+      const tick = () => {
+        if (!run || run.t0 !== t0) return;
+        const now = performance.now();
+        if (now - run.last > FROZEN_MS) run.gaps.push([Math.round(run.last - t0), Math.round(now - run.last)]);
+        run.last = now;
+        for (const a of document.getAnimations()) track(a.effect && a.effect.target);
+        for (const [el, entry] of run.tracked) {
+          if (!el.isConnected) continue;
+          const r = el.getBoundingClientRect();
+          const prev = entry.points[entry.points.length - 1];
+          // A hidden element measures 0x0 at 0,0: keep its place, only its size went to zero.
+          const hidden = !r.width && !r.height && prev;
+          const p = [Math.round(now - t0), hidden ? prev[1] : Math.round(r.x), hidden ? prev[2] : Math.round(r.y),
+                     Math.round(r.width), Math.round(r.height)];
+          if (!prev || prev.slice(1).join() !== p.slice(1).join()) { entry.points.push(p); run.changed = now; }
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    },
+    idle() { return run ? Math.round(performance.now() - run.changed) : 99999; },
+    stop() {
+      if (!run) return null;
+      const t0 = run.t0;
+      const out = {gaps: run.gaps, loafs: loafs.filter(l => l.t >= t0 - 50).map(l => Object.assign({}, l, {t: Math.round(l.t - t0)})),
+                   tracks: [...run.tracked.values()].filter(e => e.points.length > 1)
+                     .map(e => ({label: e.label, points: e.points.slice(0, 400)}))};
+      run = null;
+      return out;
+    },
+  };
+})();
+""".replace("FROZEN_MS", str(FROZEN_MS))
+
+LEAF_CELL = re.compile(r'^\s*- (?:cell|columnheader|gridcell|rowheader)(?: "[^"]*")?$')
+UNSELECTED_OPTION = re.compile(r'^\s*- option "[^"]*"$')
+NUMBER = re.compile(r"^[^\d\-]{0,4}-?\d[\d,]*(?:\.\d+)?$")
+DATE = re.compile(r"^(\d{2})-(\d{2})-(\d{4})$")
+
 
