@@ -1921,6 +1921,8 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         # text anchor build on it. prune_rounds retires it once a newer view exists.
         rounds.append(round_entry)
         prune("batch", force=False, calls_made=round_num + 1)
+        # Numbered with the round it is saved with, so a resumed pass does not reuse its label.
+        history["rounds_done"] = label
         if after_round is not None:
             after_round()
 
