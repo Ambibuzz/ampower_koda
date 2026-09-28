@@ -1145,12 +1145,13 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
                                       replacements=replacements, expected_sha256=revision(known) if known is not None else '')
         if result.startswith('COPY_OK:'):
             copied[canonical] = source_path
-            if known is not None:
-                observed[destination] = read_snapshot(destination)
-                if not any("\n" in old + new for old, new in replacements.items()):
-                    # Single-line replacements keep the copy line for line with its source.
-                    result += (f" It matches {source_path} line for line, so what you read of the source is "
-                               "this file with the replacements applied: edit it from that without reading it again.")
+            # This tool wrote these bytes, so replacing the copy whole needs no read of it first:
+            # AGENT-0029 was refused, then read a 60k-char copy it was about to overwrite.
+            observed[destination] = read_snapshot(destination)
+            if known is not None and not any("\n" in old + new for old, new in replacements.items()):
+                # Single-line replacements keep the copy line for line with its source.
+                result += (f" It matches {source_path} line for line, so what you read of the source is "
+                           "this file with the replacements applied: edit it from that without reading it again.")
         return source_feedback(result, destination_path)
 
     @tool
@@ -1173,7 +1174,7 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         if read_only:
             return read_only_failure("RENAME_FAILED")
         full, source, current = capture_write(source_path, fresh_read=True)
-        _, destination, destination_content = capture_write(destination_path)
+        target, destination, destination_content = capture_write(destination_path)
         known = current if current is not None else observed.get(full)
         if known is None and before is not None and before.get(destination) is None:
             known = before.get(source)
@@ -1182,6 +1183,12 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
             checkpoint.write_intent({source: current, destination: destination_content},
                 {source: None, destination: known}, move={"source": source, "destination": destination, "sha256": expected})
         result = agent_tools.rename_file(app_name, source_path, destination_path, expected_sha256=expected)
+        if result.startswith("RENAME_OK:"):
+            # The bytes the model read moved with the file: the new path is read, the old one is gone.
+            observed.pop(full, None)
+            moved = read_snapshot(target)
+            if moved is not None:
+                observed[target] = moved
         if result.startswith("RENAME_OK:") and file_moves is not None:
             move = {"source": source, "destination": destination, "sha256": expected}
             if move not in file_moves:
