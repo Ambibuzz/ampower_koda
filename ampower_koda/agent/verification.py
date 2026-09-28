@@ -31,11 +31,80 @@ DEFAULT_TIMEOUT = 120
 MAX_TIMEOUT = 300
 MAX_OUTPUT = 8000
 
+# Classify SQL before it reaches the live site: the reason a statement is refused, '' when it
+# may run. Comments are dropped (outside quoted text) and every statement is checked, so a
+# leading comment or a second statement cannot hide DDL. Refused: statements MariaDB commits
+# on its own (DDL, COMMIT, START TRANSACTION, LOCK...), CALL/PREPARE/EXECUTE (their contents
+# are unseen), SET of autocommit or transaction state, and executable /*! */ comments.
+# ROLLBACK and savepoints stay allowed: they cannot persist anything, and Frappe's own
+# rollback() and the runner's teardown use them. read_only (the SQL read probe) also refuses
+# writes and SELECT ... INTO OUTFILE/DUMPFILE/@var. This is a filter for MariaDB syntax, not
+# a sandbox: raw cursors bypass it, and the real fix is an isolated verification database.
+# _commits stays self-contained: the host executes this same source for the read probe.
+_SQL_GUARD = r"""
+_COMMITTING = {'create', 'alter', 'drop', 'truncate', 'rename', 'commit', 'begin', 'start', 'grant', 'revoke',
+               'lock', 'unlock', 'analyze', 'optimize', 'repair', 'flush', 'check', 'cache', 'load', 'reset',
+               'purge', 'install', 'uninstall', 'xa', 'call', 'prepare', 'execute', 'deallocate', 'change',
+               'stop', 'kill', 'shutdown'}
+def _commits(query, read_only=False):
+    import re
+    text, code, i = str(query or ''), [], 0
+    while i < len(text):
+        c = text[i]
+        if c in '\'"`':
+            end = i + 1
+            while end < len(text) and text[end] != c:
+                end += 2 if text[end] == '\\' and c != '`' else 1
+            if end >= len(text):
+                return 'an unterminated quoted string'
+            code.append(' ? ')  # doubled quotes ('it''s') read as two adjacent literals
+            i = end + 1
+        elif text.startswith('/*', i):
+            if text.startswith(('/*!', '/*M!'), i):
+                return 'an executable /*! */ comment'
+            end = text.find('*/', i + 2)
+            if end < 0:
+                return 'an unterminated comment'
+            code.append(' ')
+            i = end + 2
+        elif c == '#' or text.startswith('--', i) and (i + 2 == len(text) or text[i + 2] <= ' '):
+            end = text.find('\n', i)
+            code.append(' ')
+            i = len(text) if end < 0 else end
+        else:
+            code.append(c)
+            i += 1
+    statements = [s.strip().lower() for s in ''.join(code).split(';') if s.strip()]
+    if read_only and len(statements) != 1:
+        return 'more than one statement'
+    for statement in statements:
+        words = re.findall(r'[a-z_][a-z0-9_]*', statement) + ['', '']
+        if words[0] in ('create', 'drop') and words[1] == 'temporary':
+            continue  # temporary tables commit nothing
+        if words[0] in _COMMITTING:
+            return words[0].upper() + ', which commits or escapes the open transaction'
+        if words[0] == 'set' and re.search(r'\b(autocommit|transaction|transaction_\w+|tx_\w+|completion_type'
+                                           r'|password|statement)\b', statement):
+            return 'a SET that changes autocommit or transaction state'
+        if read_only:
+            if words[0] not in ('select', 'with', 'show', 'describe', 'desc', 'explain'):
+                return words[0].upper() + ', which is not a read'
+            # a word followed by "(" is a function (REPLACE(), INSERT(), TRUNCATE()), not a statement
+            found = re.search(r'\b(into|outfile|dumpfile|insert|update|delete|replace|merge|create|drop|alter'
+                              r'|truncate|rename|call|lock|grant|revoke|procedure)\b(?!\s*\()'
+                              r'|\b(nextval|setval)\s*\(', statement)
+            if found:
+                return found.group(0).split('(')[0].strip().upper() + ' inside a read'
+    return ''
+"""
+_SQL_RULES: dict = {}
+exec(_SQL_GUARD, _SQL_RULES)
+
 # Connect to the bench site the agent runs on, so tests and calls see the real
 # schema and records; commits are disabled and the connection is rolled back.
-# SQL that MariaDB commits on its own (DDL, COMMIT, START TRANSACTION, LOCK...)
-# is refused, since no rollback could undo it; with autocommit off the server
-# opens the next transaction itself, so begin() has nothing to do.
+# SQL that could persist on its own is refused by _SQL_GUARD above, since no
+# rollback could undo it; with autocommit off the server opens the next
+# transaction itself, so begin() has nothing to do.
 #
 # Frappe resolves its log files relative to the working directory ("../logs"
 # and "<site>/logs"), as bench does, so the runner starts in the sites folder.
@@ -45,13 +114,7 @@ MAX_OUTPUT = 8000
 _SITE_CONNECT = """
 import os, sys, traceback
 SITE = os.environ.get('KODA_SITE')
-_COMMITTING = {'create', 'alter', 'drop', 'truncate', 'rename', 'commit', 'begin', 'start', 'grant', 'revoke',
-               'lock', 'unlock', 'analyze', 'optimize', 'repair', 'flush'}
-def _commits(query):
-    words = str(query or '').lower().split(None, 2)[:2] + ['', '']
-    if words[0] in ('create', 'drop') and words[1] == 'temporary':
-        return False  # temporary tables commit nothing
-    return words[0] in _COMMITTING or words[0] == 'set' and words[1].startswith('autocommit')
+""" + _SQL_GUARD + """
 if SITE:
     try:
         os.chdir(os.environ['KODA_SITES_PATH'])
@@ -65,11 +128,12 @@ if SITE:
         frappe.db.begin = lambda *args, **kwargs: None
         _unguarded_sql = frappe.db.sql
         def _guarded_sql(query, *args, **kwargs):
-            if _commits(query):
+            reason = _commits(query)
+            if reason:
                 raise frappe.ValidationError(
-                    'Koda runner refused "' + ' '.join(str(query).split())[:100] + '": it would commit on the '
-                    'live site and could not be rolled back. Use existing DocTypes and fields; schema changes '
-                    'reach the site through bench migrate after the user approves them.')
+                    'Koda runner refused "' + ' '.join(str(query).split())[:100] + '": it contains ' + reason
+                    + ', which could persist on the live site where no rollback undoes it. Use existing DocTypes '
+                    'and fields; schema changes reach the site through bench migrate after the user approves them.')
             return _unguarded_sql(query, *args, **kwargs)
         frappe.db.sql = _guarded_sql
     except Exception:
