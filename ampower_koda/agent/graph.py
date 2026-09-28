@@ -3,6 +3,7 @@
 # execution setup and the independent review. session.py runs a request through
 # them as one conversation; bench and deploy run in executor.py.
 
+import hashlib
 import html
 import json
 import os
@@ -2723,6 +2724,24 @@ def _approved_plan_context(state: dict) -> dict:
             for key in ("overview", "scope", "assumptions", "risks")}
 
 
+def _model_receipts(receipts) -> list[dict]:
+    """Receipts as the reviewer reads them: an inline runner program is named by its hash, not pasted.
+
+    The unittest runner is ~17.7k characters of Koda's own code in every argv; the stored receipt keeps it
+    whole, because freezing tests checks the test paths against that argv.
+    """
+    compact = []
+    for receipt in receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        argv = [f"<{receipt.get('name') or 'runner'} program, {len(arg)} chars, sha256 "
+                f"{hashlib.sha256(arg.encode()).hexdigest()[:12]}>"
+                if isinstance(arg, str) and ("\n" in arg or len(arg) > 500) else arg
+                for arg in receipt.get("argv") or []]
+        compact.append({**receipt, "argv": argv} if "argv" in receipt else receipt)
+    return compact
+
+
 def _compact_execution_results(results) -> list[dict]:
     """The model's claims without past reviews or receipts, which the review supplies fresh."""
     compact = []
@@ -3108,7 +3127,7 @@ def review_node(state: dict) -> dict:
         }, ensure_ascii=True)
         prompt += "\n\n## STATIC CHECKS\n" + health.summary()
         prompt += "\n\n## EXECUTED BEHAVIORAL CHECKS\n" + json.dumps(
-            updates.get("verification_receipts", []), ensure_ascii=True)
+            _model_receipts(updates.get("verification_receipts", [])), ensure_ascii=True)
         prompt += (
             "\nAssess every criterion against current source. Behavior is proven by running it: use "
             "call_method to run the changed endpoints and helpers against the live site (database writes are "
@@ -3168,7 +3187,7 @@ def review_node(state: dict) -> dict:
                     _compact_execution_results(claims), ensure_ascii=True)
                 + "\n\n### CURRENT STATIC CHECKS\n" + health.summary()
                 + "\n\n### CURRENT EXECUTED BEHAVIORAL CHECKS\n" + json.dumps(
-                    updates.get("verification_receipts", []), ensure_ascii=True)
+                    _model_receipts(updates.get("verification_receipts", [])), ensure_ascii=True)
             )
             # The repair changed the source: earlier reads, and calls that failed
             # against the old revision, may run again.
