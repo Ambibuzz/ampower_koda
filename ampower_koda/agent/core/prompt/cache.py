@@ -12,14 +12,12 @@ from ..contracts.prompt import (
     PromptBudget,
     TranscriptMarker,
 )
-from ..contracts.repo_map import RepoMap
 from ..contracts.session import RepoMemory
 from ..tokens import estimate_tokens, truncate_to_tokens
 from .models import cache_limits, routing_key
 
 
 def build_prefix(
-    repo_map: RepoMap,
     memory: RepoMemory,
     role_prompt: str,
     *,
@@ -33,7 +31,7 @@ def build_prefix(
     blocks = [
         # Anthropic requires longer TTLs before shorter ones. The rolling
         # transcript uses 1h, so its preceding system boundaries must too.
-        PromptBlock(role="map+memory", text=_map_and_memory(repo_map, memory, budget), ttl="1h"),
+        PromptBlock(role="memory", text=_memory(memory, budget), ttl="1h"),
         PromptBlock(role="system+tools", text=role_prompt.strip(), ttl="1h"),
     ]
 
@@ -41,14 +39,9 @@ def build_prefix(
     return tuple(_mark_breakpoints(blocks, min_cacheable=limits.min_cacheable, allowed=allowed))
 
 
-def _map_and_memory(repo_map: RepoMap, memory: RepoMemory, budget: PromptBudget) -> str:
-    """The first cached block: what the repository is, then what it asks of you."""
-    sections: list[str] = []
-    if not repo_map.is_empty:
-        sections.append(truncate_to_tokens(repo_map.text, budget.map_tokens))
-    if not memory.is_empty:
-        sections.append(truncate_to_tokens(memory.text, budget.memory_tokens))
-    return "\n\n".join(sections)
+def _memory(memory: RepoMemory, budget: PromptBudget) -> str:
+    """The first cached block: what the repository asks of you."""
+    return "" if memory.is_empty else truncate_to_tokens(memory.text, budget.memory_tokens)
 
 
 def _mark_breakpoints(

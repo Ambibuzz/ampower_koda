@@ -14,7 +14,6 @@ from .contracts import (
     CoChangeMemory,
     Definition,
     FileAnalysis,
-    FileRanks,
     Hit,
     Ledger,
     LedgerEntry,
@@ -23,7 +22,6 @@ from .contracts import (
     ModelTurn,
     Overlay,
     Reference,
-    RepoMap,
     RepoMemory,
     RepositoryIndex,
     SearchResult,
@@ -46,11 +44,10 @@ from .contracts import (
 from .elide import compact_for_request, hot_cold
 from .errors import ConfigError, CoreError, ParseError, WorkspaceError
 from .fold import SessionState, fold_turn
-from .graph import CodeGraph, build_graph, pagerank
+from .graph import CodeGraph, build_graph
 from .ledger import distil_into, record, record_read, rehydrate, render_ledger
 from .loop import TurnMeters
 from .prompt import assemble, build_prefix
-from .repomap import MapBuild, build_map
 from .retrieval import Retriever, build_retriever, search
 from .tokens import estimate_tokens
 from .tools import TOOL_NAMES
@@ -72,12 +69,10 @@ __all__ = [
     "CoreError",
     "Definition",
     "FileAnalysis",
-    "FileRanks",
     "Hit",
     "Ledger",
     "LedgerEntry",
     "LocalWorkspace",
-    "MapBuild",
     "MirrorSet",
     "ModelRequest",
     "ModelTurn",
@@ -86,7 +81,6 @@ __all__ = [
     "ParseError",
     "ROLE_PROMPT",
     "Reference",
-    "RepoMap",
     "RepoMemory",
     "RepositoryIndex",
     "Retriever",
@@ -115,7 +109,6 @@ __all__ = [
     "assemble",
     "build_context",
     "build_graph",
-    "build_map",
     "build_prefix",
     "build_retriever",
     "compact_for_request",
@@ -127,7 +120,6 @@ __all__ = [
     "iter_chunks",
     "merge_config",
     "open_session",
-    "pagerank",
     "record",
     "record_read",
     "rehydrate",

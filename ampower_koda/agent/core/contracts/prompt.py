@@ -13,7 +13,7 @@ CacheTtl = Literal["none", "5m", "1h"]
 System and rolling transcript boundaries use ``1h``. Earlier boundaries must
 not have a shorter TTL than later ones on Anthropic."""
 
-BlockRole = Literal["map+memory", "system+tools"]
+BlockRole = Literal["memory", "system+tools"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +93,6 @@ class CachePlan:
 class PromptBudget:
     """The per-region ceilings a plan is assembled against."""
 
-    map_tokens: int = 2000
     memory_tokens: int = 800
 
     reserved_breakpoints: int = 2

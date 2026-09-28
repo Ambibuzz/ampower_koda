@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from ..config.load import CONFIG_PATH, resolve_config  # noqa: F401 - CONFIG_PATH re-exported
 from ..config.schema import CoreConfig
@@ -13,7 +13,7 @@ from ..indexing.build import build_index
 from ..indexing.incremental import apply_overlays
 from ..indexing.parsers.registry import ParserRegistry, default_registry
 from ..memory.repo_memory import read_repo_memory
-from ..repomap.build import build_map
+from ..graph import build_graph, detect_mirrors
 from ..retrieval.engine import Retriever, build_retriever
 from ..workspace.discovery import discover
 from ..workspace.local import SystemClock
@@ -30,8 +30,7 @@ class Bootstrap:
     """The search engine, built once. Not on the context because a
     :class:`~ampower_koda.agent.core.contracts.session.SessionContext` is a
     contract — data with no behaviour — and a retriever holds a scored corpus
-    and knows how to walk a graph. It shares the map's code graph, so the graph
-    is built once per cold start."""
+    and knows how to walk the code graph, which is built once per cold start."""
 
     notes: tuple[str, ...] = ()
     """Non-fatal things a developer would want to know: a config file that
@@ -79,19 +78,17 @@ def build_context(
         registry=registry,
     )
 
-    ranking = build_map(context.index, max_tokens=config.context.map_tokens)
-    context = replace(context, repo_map=ranking.map)
-
-    if ranking.map.degraded:
-        notes.append("repo map degraded to a directory tree: no parseable definitions")
-    if ranking.mirrors.roots:
-        notes.append("vendored copies demoted: " + ", ".join(sorted(ranking.mirrors.roots)))
+    graph = build_graph(context.index)
+    mirrors = detect_mirrors(context.index.paths)
+    if mirrors.roots:
+        notes.append("vendored copies demoted: " + ", ".join(sorted(mirrors.roots)))
 
     return Bootstrap(
         context=context,
         retriever=build_retriever(
             context.index,
-            ranking.graph,
+            graph,
+            mirrors=mirrors,
             cochange=cochange,
             config=config.retrieval,
             rerank_config=config.rerank,

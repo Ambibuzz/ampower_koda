@@ -130,7 +130,6 @@ BUDGET_CEILED_REGIONS: Final[tuple[str, ...]] = (
     "ledger",
     "working_set",
     "fold",
-    "repo_map",
     "memory",
 )
 

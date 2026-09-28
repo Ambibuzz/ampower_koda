@@ -19,6 +19,7 @@ from ..constants import (
     VIEW_RANK_DECAY,
 )
 from ..config.schema import RerankConfig, RetrievalConfig
+from ..contracts.mirrors import MirrorSet
 from ..contracts.rerank import Reranker
 from ..contracts.repository import RepositoryIndex
 from ..contracts.retrieval import Hit, LegResult, SearchResult
@@ -52,6 +53,8 @@ class Retriever:
     rerank_config: RerankConfig = field(default_factory=RerankConfig)
     reranker: Reranker | None = None
 
+    mirrors: MirrorSet = field(default_factory=MirrorSet)
+
 
 def build_retriever(
     index: RepositoryIndex,
@@ -61,6 +64,7 @@ def build_retriever(
     config: RetrievalConfig | None = None,
     rerank_config: RerankConfig | None = None,
     reranker: Reranker | None = None,
+    mirrors: MirrorSet | None = None,
 ) -> Retriever:
     """Build the retriever. The expensive half of cold start after indexing."""
     lexical = build_lexical_index(index)
@@ -72,6 +76,7 @@ def build_retriever(
         config=config or RetrievalConfig(),
         rerank_config=rerank_config or RerankConfig(),
         reranker=reranker,
+        mirrors=mirrors or MirrorSet(),
         prose=frozenset(
             document.chunk.digest for document in lexical.documents if document.prose
         ),

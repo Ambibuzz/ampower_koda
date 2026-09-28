@@ -72,11 +72,9 @@ def open_session(
         model_id=model,
         context=context,
         retriever=bootstrap.retriever,
-        repo_map=context.repo_map,
         budget=allocate(
             context.config.context.window_tokens,
             ledger_override=context.config.context.ledger_soft_tokens,
-            map_tokens=context.config.context.map_tokens,
             memory_tokens=context.config.context.memory_tokens,
             input_tokens=context.config.context.input_tokens,
         ),
@@ -461,12 +459,10 @@ def _plan(state, *, model_id, role):  # noqa: ANN001
         state.marker = None
         state.marker_prefix = ()
     blocks = build_prefix(
-        state.session.repo_map,
         state.session.context.memory,
         role,
         model=model_id,
         budget=PromptBudget(
-            map_tokens=state.session.budget.repo_map,
             memory_tokens=state.session.budget.memory,
         ),
     )

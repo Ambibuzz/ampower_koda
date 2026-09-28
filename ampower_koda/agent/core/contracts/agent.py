@@ -11,7 +11,6 @@ from ..tokens import estimate_tokens
 from .escalation import SideUsage
 from .ledger import Ledger
 from .prompt import CachePlan, TranscriptMarker
-from .repo_map import RepoMap
 from .session import SessionContext
 from .transcript import Transcript
 from .working_set import WorkingSet
@@ -156,7 +155,6 @@ class Session:
     """The built :class:`~…retrieval.engine.Retriever`. Untyped here only to
     keep this contracts module free of a dependency on the retrieval package."""
 
-    repo_map: RepoMap
     budget: ContextBudget
 
     ledger: Ledger = field(default_factory=Ledger)

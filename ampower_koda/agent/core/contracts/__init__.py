@@ -35,7 +35,7 @@ from .prompt import (
     PromptBudget,
     TranscriptMarker,
 )
-from .repo_map import FileRanks, MirrorSet, RepoMap
+from .mirrors import MirrorSet
 from .repository import (
     RepositoryIndex,
     definitions_by_name,
@@ -75,7 +75,6 @@ __all__ = [
     "Definition",
     "DefinitionSite",
     "FileAnalysis",
-    "FileRanks",
     "FileStat",
     "Hit",
     "LEDGER_KINDS",
@@ -97,7 +96,6 @@ __all__ = [
     "REFERENCE_KINDS",
     "Reference",
     "ReferenceKind",
-    "RepoMap",
     "RepoMemory",
     "RepositoryIndex",
     "SYMBOL_ROLES",

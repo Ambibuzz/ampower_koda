@@ -15,6 +15,9 @@ RETIRED_GROUPS = frozenset({"escalation"})
 """Top-level tables that no longer configure anything. An old config file that
 still carries one is accepted and the table ignored, not rejected."""
 
+RETIRED_KEYS = frozenset({"context.map_tokens"})
+"""Single keys that no longer configure anything (the repo map was removed)."""
+
 
 def merge_config(
     *overrides: Mapping[str, Any] | None,
@@ -81,7 +84,7 @@ def _apply(node: T, override: Mapping[str, Any], *, prefix: str) -> T:
     for key, value in override.items():
         path = f"{prefix}{key}"
         spec = known.get(key)
-        if spec is None and not prefix and key in RETIRED_GROUPS:
+        if spec is None and (not prefix and key in RETIRED_GROUPS or path in RETIRED_KEYS):
             continue
         if spec is None:
             raise ConfigError(path, f"unknown key; expected one of {sorted(known)}")

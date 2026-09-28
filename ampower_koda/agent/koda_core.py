@@ -865,12 +865,9 @@ def _window_for(model_id: str) -> int:
 
 
 def _overrides(model_id: str) -> dict | None:
-    """Investigations use question-specific retrieval instead of a global map."""
+    """The model's context window, when this host knows it."""
     window = _window_for(model_id)
-    context = {"map_tokens": 0}
-    if window:
-        context["window_tokens"] = window
-    return {"context": context}
+    return {"context": {"window_tokens": window}} if window else None
 
 
 def request_limits(app_name: str, model_id: str) -> tuple[int, int]:

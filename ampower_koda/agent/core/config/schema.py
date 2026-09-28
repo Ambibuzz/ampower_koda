@@ -13,7 +13,6 @@ from ..constants import (
     DEFAULT_ARCHITECT_MODEL,
     DEFAULT_SEARCH_LIMIT,
     DEFAULT_WINDOW_TOKENS,
-    MAP_MAX_TOKENS,
     MAX_INDEX_FILE_BYTES,
     MAX_SEARCH_LIMIT,
     MEMORY_MAX_TOKENS,
@@ -50,8 +49,6 @@ class ContextConfig:
     memory_tokens: int = MEMORY_MAX_TOKENS
     """Shared across all repository memory files, not per file."""
 
-    map_tokens: int = MAP_MAX_TOKENS
-
     input_tokens: int = DEFAULT_INPUT_TOKENS
     """Full-input cleanup threshold, capped by model capacity and reply space.
     History stays intact below it; pressure cleanup targets two thirds of it."""
@@ -68,8 +65,6 @@ class ContextConfig:
             raise ConfigError("context.input_tokens", "must be positive")
         if self.memory_tokens < 0:
             raise ConfigError("context.memory_tokens", "cannot be negative")
-        if self.map_tokens < 0:
-            raise ConfigError("context.map_tokens", "cannot be negative")
         if self.ledger_soft_tokens < 0:
             raise ConfigError("context.ledger_soft_tokens", "cannot be negative")
 

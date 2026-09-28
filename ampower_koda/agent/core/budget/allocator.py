@@ -10,7 +10,6 @@ from ..constants import (
     BUDGET_FLOORS,
     BUDGET_SHARES,
     BUDGET_TOTAL_CEILING,
-    MAP_MAX_TOKENS,
     MAX_TURN_TOKENS_MARGINAL,
     MAX_TURN_TOKENS_OBSERVED,
     MEMORY_MAX_TOKENS,
@@ -33,7 +32,6 @@ class ContextBudget:
     working_set: int
     fold: int
 
-    repo_map: int
     memory: int
 
     marginal_turn: int
@@ -45,7 +43,6 @@ def allocate(
     window: int,
     *,
     ledger_override: int = 0,
-    map_tokens: int = MAP_MAX_TOKENS,
     memory_tokens: int = MEMORY_MAX_TOKENS,
     input_tokens: int = DEFAULT_INPUT_TOKENS,
 ) -> ContextBudget:
@@ -57,14 +54,13 @@ def allocate(
     active = min(window, input_tokens)
 
     automatic = min(active, AUTO_CONTEXT_WINDOW)
-    prefix = _prefix_blocks(automatic, map_tokens, memory_tokens)
+    memory = min(memory_tokens, int(automatic * BUDGET_FLOOR_CEILING))
     regions = _fit(
         {
             "ledger": ledger_override or _at_least("ledger", automatic),
             "working_set": _at_least("working_set", automatic),
             "fold": _at_least("fold", automatic),
-            "repo_map": prefix.repo_map,
-            "memory": prefix.memory,
+            "memory": memory,
         },
         active,
         protected="ledger" if ledger_override else "",
@@ -75,7 +71,6 @@ def allocate(
         ledger=regions["ledger"],
         working_set=regions["working_set"],
         fold=regions["fold"],
-        repo_map=regions["repo_map"],
         memory=regions["memory"],
         marginal_turn=max(MAX_TURN_TOKENS_MARGINAL, 2 * active),
         observed_turn=min(MAX_TURN_TOKENS_OBSERVED, int(window * OBSERVED_WINDOW_MULTIPLE)),
@@ -104,19 +99,6 @@ def _fit(regions: dict[str, int], window: int, *, protected: str = "") -> dict[s
         else max(1, int(value * factor))
         for name, value in regions.items()
     }
-
-
-@dataclass(frozen=True, slots=True)
-class _PrefixBlocks:
-    repo_map: int
-    memory: int
-
-
-def _prefix_blocks(window: int, map_tokens: int, memory_tokens: int) -> _PrefixBlocks:
-    """Split one quarter-window ceiling between the map and the memory files."""
-    ceiling = int(window * BUDGET_FLOOR_CEILING)
-    memory = min(memory_tokens, ceiling)
-    return _PrefixBlocks(repo_map=min(map_tokens, max(0, ceiling - memory)), memory=memory)
 
 
 def _at_least(region: str, window: int) -> int:
