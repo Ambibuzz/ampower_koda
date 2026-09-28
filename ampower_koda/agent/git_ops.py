@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
 # Git and GitHub operations for the agent — all functions accept explicit parameters
 
+import base64
 import hashlib
 import os
 import re
@@ -54,10 +55,48 @@ def get_repo_root(app_name: str) -> str:
     return os.path.dirname(app_path)
 
 
-def run_git(cmd: list[str], cwd: str | None = None) -> tuple[bool, str]:
+#: The user[:password]@ part of any URL, e.g. https://x-access-token:TOKEN@github.com.
+_URL_CREDENTIALS = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s@]+@")
+
+
+def redact(text: str, secrets=()) -> str:
+    """Remove URL credentials and each known secret value from text.
+
+    Every log message, exception text and returned output of a git command goes
+    through this, so a token cannot reach the Error Log, the UI or a realtime event.
     """
-    Executes a Git command in the specified directory. 
+    text = _URL_CREDENTIALS.sub(r"\1***@", str(text or ""))
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _token_env(token: str) -> tuple[dict, tuple[str, ...]]:
+    """Environment that authenticates HTTPS git requests to GitHub with ``token``.
+
+    The token travels as an http.extraHeader set through GIT_CONFIG_* variables
+    (git 2.31+), so it is never part of the command line that the operating
+    system shows to other processes. Returns the environment and the secret
+    forms (raw and base64) to redact.
+    """
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
+    }
+    return env, (token, basic)
+
+
+def run_git(cmd: list[str], cwd: str | None = None, *, env: dict | None = None,
+            secrets=()) -> tuple[bool, str]:
+    """
+    Executes a Git command in the specified directory.
     Returns a success flag and the combined output of the command.
+    Output and log messages are redacted (see ``redact``) on every path.
     """
     try:
         result = subprocess.run(
@@ -66,18 +105,20 @@ def run_git(cmd: list[str], cwd: str | None = None) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=120,
+            env=env,
         )
         out = ((result.stdout or "").strip() + "\n" + (result.stderr or "").strip()).strip()
-        return result.returncode == 0, out
+        return result.returncode == 0, redact(out, secrets)
     except subprocess.TimeoutExpired:
-        log_agent_error("Agent Git: command timeout", f"cmd={' '.join(cmd)}\ncwd={cwd}")
+        log_agent_error("Agent Git: command timeout",
+                        redact(f"cmd={' '.join(cmd)}\ncwd={cwd}", secrets))
         return False, "Git command timed out"
     except Exception as e:
         log_agent_error(
             "Agent Git: command failed",
-            f"cmd={' '.join(cmd)}\ncwd={cwd}\n{e}\n{frappe.get_traceback()}",
+            redact(f"cmd={' '.join(cmd)}\ncwd={cwd}\n{e}\n{frappe.get_traceback()}", secrets),
         )
-        return False, str(e)
+        return False, redact(str(e), secrets)
 
 
 def _parse_github_repo(url: str) -> tuple[str, str] | None:
@@ -165,21 +206,20 @@ def push_branch(app_name: str, branch_name: str, repo_url: str, token: str) -> t
     if clean_token.startswith("http"):
         # Help the user by pointing out the likely mistake
         return False, (
-            f"Invalid GitHub token: The token field seems to contain a URL ('{clean_token[:30]}...'). "
+            f"Invalid GitHub token: The token field seems to contain a URL ('{redact(clean_token[:30])}...'). "
             "Please ensure you enter a valid Personal Access Token (PAT) in the 'GitHub Token' field."
         )
 
     parsed = _parse_github_repo(repo_url)
     if not parsed:
-        return False, f"Invalid GitHub URL: {repo_url}"
+        return False, f"Invalid GitHub URL: {redact(repo_url)}"
     owner, repo = parsed
-    
-    # Construct authenticated remote URL
-    remote = f"https://{clean_token}@github.com/{owner}/{repo}.git"
+
+    # The URL carries no credentials: the token goes in the environment.
+    remote = f"https://github.com/{owner}/{repo}.git"
     root = get_repo_root(app_name)
-    ok, out = run_git(["push", remote, branch_name], cwd=root)
-    safe_out = out.replace(clean_token, "***")
-    return ok, safe_out
+    env, secrets = _token_env(clean_token)
+    return run_git(["push", remote, branch_name], cwd=root, env=env, secrets=secrets)
 
 
 def create_pull_request(
@@ -225,9 +265,9 @@ def create_pull_request(
     except Exception as e:
         log_agent_error(
             "Agent Git: create pull request",
-            f"repo={repo_url}\n{e}\n{frappe.get_traceback()}",
+            redact(f"repo={repo_url}\n{e}\n{frappe.get_traceback()}", (token,)),
         )
-        return False, str(e), None, None
+        return False, redact(str(e), (token,)), None, None
 
 
 def generate_branch_name(request_name: str, branch_prefix: str = "ai-agent/", app_name: str = "") -> str:
@@ -288,12 +328,12 @@ def run_git_stdout(cmd: list[str], cwd: str | None = None) -> tuple[bool, str]:
         )
         return result.returncode == 0, (result.stdout or "")
     except subprocess.TimeoutExpired:
-        log_agent_error("Agent Git: stdout command timeout", f"cmd={' '.join(cmd)}\ncwd={cwd}")
+        log_agent_error("Agent Git: stdout command timeout", redact(f"cmd={' '.join(cmd)}\ncwd={cwd}"))
         return False, ""
     except Exception as e:
         log_agent_error(
             "Agent Git: stdout command failed",
-            f"cmd={' '.join(cmd)}\ncwd={cwd}\n{e}\n{frappe.get_traceback()}",
+            redact(f"cmd={' '.join(cmd)}\ncwd={cwd}\n{e}\n{frappe.get_traceback()}"),
         )
         return False, ""
 
