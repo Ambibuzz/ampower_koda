@@ -103,9 +103,6 @@ VENDOR_DIRECTORIES: Final[frozenset[str]] = frozenset(
     }
 )
 
-MAP_MAX_TOKENS: Final[int] = 2_000
-
-
 BUDGET_SHARES: Final[dict[str, float]] = {
     "ledger": 0.03,
     # About two whole functions plus a names-only outline; the most that fits
