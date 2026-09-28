@@ -21,6 +21,7 @@ from ampower_koda.agent.git_ops import (
     generate_branch_name,
     get_repo_root,
     get_current_branch,
+    ignored_regression_tests,
     run_git,
     create_branch,
     commit_changes,
@@ -1014,6 +1015,10 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
             summary_parts.append(f"PR #{pr_number} created")
         elif existing_pr and do_push:
             summary_parts.append(f"existing PR updated ({existing_pr})")
+        unshipped = ignored_regression_tests(app_name)
+        if unshipped:
+            summary_parts.append(f"{len(unshipped)} regression test(s) not committed because git ignores them: "
+                                 f"{', '.join(unshipped[:5])}")
 
         extra = {"branch_name": branch_name}
         if pr_url:

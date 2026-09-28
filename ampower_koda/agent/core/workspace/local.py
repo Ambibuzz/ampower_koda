@@ -18,6 +18,13 @@ _ALLOWED_GIT_SUBCOMMANDS = frozenset({"log"})
 
 _GIT_TIMEOUT_SECONDS = 20
 
+#: ``.koda/.gitignore``: Koda's generated state only (index cache, render
+#: output, archived tests, bytecode) and the marker itself. Regression tests,
+#: config.toml and verification.json stay visible to git so they can be committed.
+_GENERATED_MARKER = ".gitignore\ncache/\nrender/\narchive/\n__pycache__/\n"
+#: The earlier marker, which ignored everything, tests included; it is replaced.
+_LEGACY_MARKER = "*\n"
+
 
 @dataclass(frozen=True, slots=True)
 class LocalWorkspace:
@@ -68,9 +75,10 @@ class LocalWorkspace:
             directory.mkdir(parents=True, exist_ok=True)
             # The cache lives inside the app checkout. Without this marker it
             # is untracked there, and the patch/push path sweeps it into the PR.
+            # Only generated state is ignored: tests/ and config.toml ship.
             marker = self.root_path / Path(self.cache_directory).parts[0] / ".gitignore"
-            if not marker.exists():
-                marker.write_text("*\n", encoding="utf-8")
+            if not marker.exists() or marker.read_text(encoding="utf-8") == _LEGACY_MARKER:
+                marker.write_text(_GENERATED_MARKER, encoding="utf-8")
             temporary.write_bytes(payload)
             os.replace(temporary, target)
         except OSError:

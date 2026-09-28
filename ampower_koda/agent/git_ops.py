@@ -58,6 +58,10 @@ def get_repo_root(app_name: str) -> str:
 #: The user[:password]@ part of any URL, e.g. https://x-access-token:TOKEN@github.com.
 _URL_CREDENTIALS = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s@]+@")
 
+#: ``git clean`` arguments that keep every ``.koda/`` directory: its config and
+#: regression tests are meant to be committed, so they are no longer ignored.
+KODA_CLEAN_EXCLUDES = ("-e", ".koda/")
+
 
 def redact(text: str, secrets=()) -> str:
     """Remove URL credentials and each known secret value from text.
@@ -195,6 +199,24 @@ def commit_changes(app_name: str, message: str, git_user_name: str = "AI Agent",
         return False, "No changes to commit"
     ok, out = run_git(["commit", "-m", message], cwd=root)
     return ok, out
+
+
+def ignored_regression_tests(app_name: str) -> list[str]:
+    """Regression tests under the app's .koda/tests that git ignores, so no commit carries them.
+
+    Koda's own marker no longer ignores them; a repository rule (e.g. `.koda/`
+    in the root .gitignore) still can, and deploy reports that rather than
+    overriding the team's rule.
+    """
+    root = get_repo_root(app_name)
+    tests = os.path.join(frappe.get_app_path(app_name), ".koda", "tests")
+    if not os.path.isdir(tests):
+        return []
+    ok, out = run_git_stdout(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--",
+                              os.path.relpath(tests, root).replace(os.sep, "/")], cwd=root)
+    if not ok:
+        return []
+    return [p for p in out.split("\0") if p and "__pycache__" not in p.split("/")]
 
 
 def push_branch(app_name: str, branch_name: str, repo_url: str, token: str) -> tuple[bool, str]:
