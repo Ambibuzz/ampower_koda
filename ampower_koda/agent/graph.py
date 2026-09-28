@@ -104,6 +104,12 @@ TOOL_FAILURE_PREFIXES = (
 )
 #: Tools whose failures say what to fix in the arguments, not a cause in the code.
 CAUSE_GUARD_EXEMPT = {"submit_plan", "explore"}
+#: How the review notes that mean "carry on", not "fix a finding", begin. session.py keeps those
+#: in the implementation conversation, so the notes are built from these and never retyped.
+CALL_LIMIT_NOTE = "Implementation reached its call limit"
+PLAN_RECOVERY_NOTE = "Plan recovery:"
+INVALID_REPORT_NOTE = "Implementation did not return a valid"
+CONTINUE_NOTES = (CALL_LIMIT_NOTE, PLAN_RECOVERY_NOTE, INVALID_REPORT_NOTE)
 
 # Per-phase output stored in conversation_log. High so full phase text is retained
 # (phase outputs are LLM summaries and are naturally well under this in practice).
@@ -3066,7 +3072,7 @@ def review_node(state: dict) -> dict:
     elif state.get("turn_exhausted") and completion.get("status") != "complete":
         # Unfinished, not failed: the continuation gets what is left and every
         # check result, and a check it has not reached yet is not a stall.
-        passed, notes = False, "Implementation reached its call limit without finishing. Inspect current changes and complete the plan."
+        passed, notes = False, f"{CALL_LIMIT_NOTE} without finishing. Inspect current changes and complete the plan."
         updates["review_repairable"] = True
         unfinished_at_cap = True
         # A blocked report from the forced final call says what is left; hand
@@ -3091,7 +3097,7 @@ def review_node(state: dict) -> dict:
         amended, note = _amend_plan_for_blocker(state, completion)
         # Keep the repair outcome before the model's often-long blocker report,
         # so dashboard previews and bounded errors cannot hide why recovery failed.
-        notes = f"Plan recovery: {note}\nImplementation blocked: {completion['summary']}"
+        notes = f"{PLAN_RECOVERY_NOTE} {note}\nImplementation blocked: {completion['summary']}"
         _publish_agent_log(state.get("request_name", ""), "llm_response", round=0,
                            preview=f"{active['id']} plan recovery: {note}")
         if amended:
@@ -3109,7 +3115,8 @@ def review_node(state: dict) -> dict:
     elif (state.get("review_attempts", 0) > 0
           and not state.get("review_retry_requested")
           and completion.get("status") != "complete"):
-        passed, notes = False, "Implementation did not return a valid complete JSON report. Finish the task and report its behavior and verification."
+        passed, notes = False, (f"{INVALID_REPORT_NOTE} complete JSON report. Finish the task and report its "
+                                "behavior and verification.")
         updates["review_repairable"] = True
     else:
         # _run_agent_turn sends the shared request context as its own message.

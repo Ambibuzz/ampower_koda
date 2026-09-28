@@ -5,6 +5,7 @@ Each prompt is an exact prefix of the next, so the provider cache covers it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,8 @@ from ampower_koda.agent import checkpoint, graph, koda_core, verification
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.plan_contract import PlanValidationError, ground_plan_references, plan_to_markdown, validate_plan
 from ampower_koda.agent.prompts import (
+    COMPLETION_REPORT_FORMAT,
+    VERIFICATION_RULES,
     get_explore_prompt,
     get_plan_feedback_prompt,
     get_session_approval_prompt,
@@ -44,10 +47,17 @@ PERSISTED = ("compacted", "task_prompt", "rounds_done", "failed_calls", "failure
 
 PLANNING = "plan"
 IMPLEMENTATION = "work"
+REPAIR = "repair"
+
+#: The change evidence a repair opens with: the review's own budget.
+REPAIR_EVIDENCE_CHARS = 20000
+#: What a repair keeps of the passes before it, one line per tool call.
+EARLIER_REPAIR_CHARS = 4000
 
 
 def _path(request_name: str, kind: str = IMPLEMENTATION) -> Path:
-    name = f"{request_name}.plan.json" if kind == PLANNING else f"{request_name}.json"
+    name = {PLANNING: f"{request_name}.plan.json", REPAIR: f"{request_name}.repair.json"}.get(
+        kind, f"{request_name}.json")
     return Path(frappe.get_site_path("private", "koda_sessions", name))
 
 
@@ -288,6 +298,157 @@ def _repair_directive(state: dict, history: dict) -> str:
         text += IMPORT_RECOVERY
     return (text + "\n\nFix these in the current files, run the affected checks again, then return the JSON "
                    "completion report.")
+
+
+def _fresh_repair(state: dict) -> bool:
+    """Whether this pass repairs a finding (fresh conversation) rather than continuing unfinished work."""
+    notes = str(state.get("review_notes") or "")
+    return bool(notes.strip() and not state.get("turn_exhausted")
+                and not notes.startswith(graph.CONTINUE_NOTES))
+
+
+def _repair_key(state: dict) -> str:
+    """Tells an interrupted pass of this repair (continue it) from the next repair (start again)."""
+    raw = f"{state.get('review_attempts', 0)}\n{state.get('review_notes') or ''}"
+    return hashlib.sha1(raw.encode("utf-8", errors="surrogateescape")).hexdigest()[:16]
+
+
+def _severe_text(notes: str) -> str | None:
+    """The P0/P1 issues and the evidence of the criteria they leave unmet, from a JSON verdict.
+
+    A verdict is one line of JSON, so scanning lines for "P1" would match every file it names.
+    None when the notes hold no verdict object.
+    """
+    start = notes.find("{")
+    if start < 0:
+        return None
+    try:
+        verdict, _ = json.JSONDecoder().raw_decode(notes[start:])
+    except ValueError:
+        return None
+    if not isinstance(verdict, dict) or not isinstance(verdict.get("issues"), list):
+        return None
+    # Stored notes carry issues as "[P1] Criterion 4: ..." strings; the model's raw verdict as objects.
+    severe = [issue for issue in verdict["issues"]
+              if (isinstance(issue, str) and issue.lstrip().startswith(("[P0]", "[P1]")))
+              or (isinstance(issue, dict) and str(issue.get("severity", "")).upper() in {"P0", "P1"})]
+    # An issue need not name its file (AGENT-0036's did not); its unmet criterion's evidence does.
+    unmet = [entry for entry in verdict.get("evidence") or []
+             if isinstance(entry, dict) and entry.get("status") in {"unmet", "unverified"}]
+    return "\n".join(issue if isinstance(issue, str) else str(issue.get("issue") or "") for issue in severe) + "\n" + (
+        "\n".join(str(entry.get("evidence") or "") for entry in unmet))
+
+
+def _check_failures(notes: str) -> str:
+    """The failed mechanical checks ("[FAIL] ...") and the tests still failing after their repairs."""
+    # The review appends the test warnings after everything else; a test's detail can span lines.
+    head, heading, tests = notes.partition("\nTests still failing")
+    failed = "\n".join(line for line in head.splitlines() if line.lstrip().startswith("[FAIL]"))
+    return failed + ("\n" + heading.lstrip("\n") + tests if heading else "")
+
+
+def _repair_for(notes: str) -> str:
+    """What a repair pass fixed, readably: a verdict is one line of JSON, so its first P0/P1 issue."""
+    severe = _severe_text(notes) or ""
+    return next((line for line in severe.splitlines() if line.strip()),
+                (notes.strip().splitlines() or [""])[0])[:200]
+
+
+def _findings_first(baseline: dict, notes: str) -> dict:
+    """The baseline with the files the findings name first, so the evidence budget goes to them.
+
+    Files named on a P0/P1 line or a failed check come before files named only as evidence for
+    criteria that passed.
+    """
+    def names(path, text):
+        return bool(path) and (path in text or path.rsplit("/", 1)[-1] in text)
+
+    severe = _severe_text(notes)
+    if severe is None:
+        severe = "\n".join(line for line in notes.splitlines() if "P0" in line or "P1" in line)
+    severe += "\n" + _check_failures(notes)
+    ranked = ([path for path in baseline if names(path, severe)]
+              + [path for path in baseline if names(path, notes) and not names(path, severe)])
+    return {**{path: baseline[path] for path in ranked},
+            **{path: content for path, content in baseline.items() if path not in ranked}}
+
+
+def _earlier_repairs(previous: dict) -> list[str]:
+    """One line per tool call of the repair passes before this one, oldest dropped first."""
+    if not previous.get("task_prompt"):
+        return []
+    lines = list(previous.get("earlier_repairs") or [])
+    lines.append(f"-- pass for: {previous.get('repair_for') or 'an earlier finding'}")
+    lines.extend(previous.get("compacted") or [])
+    lines.extend(line for entry in previous.get("rounds") or [] for line in entry.get("summary", []))
+    while lines and sum(len(line) + 1 for line in lines) > EARLIER_REPAIR_CHARS:
+        lines.pop(0)
+    return lines
+
+
+def _repair_findings(state: dict) -> str:
+    """The findings and, from the second strategy on, the change of strategy, in full every time:
+    unlike the implementation conversation, a fresh one holds none of the earlier ones."""
+    notes = str(state.get("review_notes") or "")
+    text = "## FINDINGS TO REPAIR\n" + notes
+    level = int(state.get("repair_strategy_level") or 0)
+    if level:
+        text += STRATEGY_CHANGE.format(level=level, limit=graph.MAX_REPAIR_STRATEGIES)
+    if IMPORT_HINT in notes:
+        text += IMPORT_RECOVERY
+    return text
+
+
+def _repair_opening(state: dict, criteria: list[str], evidence: str, earlier: list[str]) -> str:
+    """A repair's first message, after the system prompt and the shared request context (the
+    request, the approved plan's context and the investigation findings, as the review gets them)."""
+    tasks = json.dumps((state.get("plan_object") or {}).get("tasks") or [], ensure_ascii=False, indent=1)
+    parts = [
+        ("## REPAIR PASS\nYou implemented the approved plan in an earlier conversation, and an independent "
+         "review of the result found the defects below. This conversation starts fresh: your earlier tool "
+         "results are not here. The files on disk are current, and the change evidence below shows every file "
+         "the work changed (new files whole and numbered while they fit). Read only what an edit needs (an edit "
+         "needs a read of its file in this pass), fix each finding at its cause, and leave working code alone."),
+        "## APPROVED PLAN TASKS\n" + graph._bounded_text(tasks, 16000),
+        "## ACCEPTANCE CRITERIA\n" + "\n".join(f"{i}. {c}" for i, c in enumerate(criteria, 1)),
+        "## YOUR LAST COMPLETION REPORT\n" + json.dumps(state.get("task_completion") or {}, ensure_ascii=False),
+    ]
+    if earlier:
+        parts.append("## EARLIER REPAIR PASSES (one line per tool call; their result did not pass review)\n"
+                     + "\n".join(earlier))
+    parts.append("## CURRENT CHANGE EVIDENCE\n" + evidence)
+    parts.append(_repair_findings(state) + "\n\nFix these in the current files, run the affected checks "
+                                           "again, then return the JSON completion report.")
+    # The implementation directive's rules, which a fresh conversation does not otherwise carry.
+    parts.append(VERIFICATION_RULES + "\n\n" + COMPLETION_REPORT_FORMAT)
+    return "\n\n".join(parts)
+
+
+def _repair_conversation(state: dict, main: dict, baseline: dict, criteria: list[str]) -> dict:
+    """This repair's own conversation: the interrupted one on a resume, else a new compact one."""
+    request_name = state.get("request_name", "")
+    key = _repair_key(state)
+    previous = load(request_name, REPAIR)
+    if state.get("resuming") and previous.get("repair_key") == key:
+        return previous
+    notes = str(state.get("review_notes") or "")
+    _, evidence = graph.change_evidence(_findings_first(graph._without_redacted(state, baseline), notes),
+                                        lambda p: graph._read_current(state, p),
+                                        limit=REPAIR_EVIDENCE_CHARS)
+    earlier = _earlier_repairs(previous)
+    history = {"task_prompt": _repair_opening(state, criteria, evidence, earlier), "approved": True,
+               "repair_key": key, "repair_for": _repair_for(notes), "earlier_repairs": earlier}
+    # Round labels and grown output caps carry on from the implementation.
+    history.update({k: main[k] for k in ("rounds_done", "round_cap_tokens", "final_cap_tokens") if k in main})
+    return history
+
+
+def _repair_record(state: dict, completion: dict) -> str:
+    """What the implementation conversation learns of a repair that ran in its own conversation."""
+    return ("## REPAIR PASS (ran in its own conversation)\nThe review found:\n"
+            + graph._bounded_text(str(state.get("review_notes") or ""), 2000)
+            + "\nThe repair reported: " + graph._bounded_text(json.dumps(completion or {}, ensure_ascii=False), 2000)
+            + "\nThe files on disk include its edits: read a file again before relying on an earlier copy above.")
 
 
 def _compact_investigation(history: dict) -> None:
