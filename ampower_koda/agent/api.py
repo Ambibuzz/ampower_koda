@@ -990,14 +990,25 @@ def _safe_repo_path(repo_root: str, file_path: str) -> str:
     return full
 
 
-def _write_repo_file(repo_root: str, file_path: str, content: str) -> str:
-    """Write content to a repo-relative path; return absolute path written."""
+def _sha256(data: bytes | None) -> str | None:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
+def _write_repo_file(repo_root: str, file_path: str, content: str, expected: bytes | None = None,
+                     check_expected: bool = False) -> str:
+    """Atomically write content to a repo-relative path; return absolute path written.
+
+    With check_expected, the write is refused (ValueError) unless the file still
+    holds `expected` (None: absent) when it is replaced.
+    """
+    from ampower_koda.agent.atomic import atomic_write, read_bytes
+
     full = _safe_repo_path(repo_root, file_path)
-    parent = os.path.dirname(full)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(full, "w", encoding="utf-8") as f:
-        f.write(content)
+    if not check_expected:
+        expected = read_bytes(full)
+    atomic_write(full, content.encode("utf-8"), expected=expected)
     return full
 
 
@@ -1313,21 +1324,30 @@ def get_file_content(request_name: str, file_path: str):
     if pattern:
         frappe.throw(_("{0} matches the redaction pattern {1} and cannot be opened.").format(file_path, pattern))
 
-    with open(full, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
+    with open(full, "rb") as f:
+        raw = f.read()
+    # Decoded as text mode did (universal newlines); the digest is of the bytes on disk.
+    content = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
 
     return {
         "path": file_path,
         "full_path": full,
         "content": content,
         "language": _detect_editor_language(file_path),
+        "sha256": _sha256(raw),
     }
 
 
 @frappe.whitelist()
 @_whitelist_logged
-def save_file_content(request_name: str, file_path: str, content: str):
-    """Save edited file content from the IDE to the agent branch working tree."""
+def save_file_content(request_name: str, file_path: str, content: str, expected_sha256: str = None):
+    """Save edited file content from the IDE to the agent branch working tree.
+
+    expected_sha256 is the digest get_file_content returned. When given, the
+    save is refused with status "conflict" if the file changed on disk since
+    (another tab, an external editor, the agent); the response carries the
+    current digest so the IDE can offer to overwrite deliberately.
+    """
     if not request_name:
         frappe.throw(_("Request name is required."))
     if not file_path:
@@ -1343,8 +1363,24 @@ def save_file_content(request_name: str, file_path: str, content: str):
     _require_request_branch(doc)
     app_name = (doc.target_app_name or "").strip()
 
+    from ampower_koda.agent.atomic import read_bytes
+
     repo_root = get_repo_root(app_name)
-    full_path = _write_repo_file(repo_root, file_path, content)
+    full = _safe_repo_path(repo_root, file_path)
+    current = read_bytes(full)
+    conflict = {
+        "status": "conflict",
+        "message": _("{0} changed on disk after it was opened; not saved.").format(file_path),
+        "path": file_path,
+        "full_path": full,
+    }
+    if expected_sha256 and _sha256(current) != expected_sha256:
+        return {**conflict, "sha256": _sha256(current)}
+    try:
+        # Compare-and-swap: atomic_write re-checks the bytes just before replacing.
+        full_path = _write_repo_file(repo_root, file_path, content, expected=current, check_expected=True)
+    except ValueError:
+        return {**conflict, "sha256": _sha256(read_bytes(full))}
 
     patch_diff = _generate_patch_diff(app_name)
     frappe.db.set_value(DOCTYPE_NAME, request_name, "patch_diff", patch_diff[:100000])
@@ -1355,6 +1391,7 @@ def save_file_content(request_name: str, file_path: str, content: str):
         "message": _("Saved {0} bytes to disk.").format(len(content)),
         "path": file_path,
         "full_path": full_path,
+        "sha256": _sha256(content.encode("utf-8")),
     }
 
 

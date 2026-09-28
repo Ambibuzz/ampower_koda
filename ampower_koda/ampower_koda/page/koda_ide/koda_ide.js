@@ -953,7 +953,8 @@ function do_open_file(file_path, $shell, ide) {
         return;
     }
 
-    const loadAndShow = function (content, language, full_path) {
+    const loadAndShow = function (content, language, full_path, sha256) {
+        sync_editor_buffer(ide);  // keep edits typed into the previous file while this one loaded
         ide.files[file_path] = ide.files[file_path] || {};
         const cached = ide.files[file_path];
         if (cached.content !== undefined && cached.dirty) {
@@ -964,6 +965,7 @@ function do_open_file(file_path, $shell, ide) {
             cached.dirty = false;
             cached.language = language;
             cached.full_path = full_path || cached.full_path;
+            if (sha256 !== undefined) cached.sha256 = sha256;
             set_editor_content(ide, content, language);
         }
         ide.editorPath = file_path;
@@ -1127,11 +1129,39 @@ function close_tab(file_path, $shell, ide) {
 
 function save_active_file($shell, ide) {
     const path = ide.activePath;
-    if (!path || !ide.files[path] || !ide.files[path].dirty) return;
+    // While another file is still loading, the editor holds the previous file.
+    if (!path || path !== ide.editorPath || ide.readOnly) return;
+    save_file(path, $shell, ide);
+}
 
-    const content = ide.editor.getValue();
+// Save one open file. The server compares expected_sha256 (the digest of the
+// bytes this tab last loaded or saved) with the disk and refuses a stale save.
+function save_file(path, $shell, ide) {
+    // Derive dirty state from the editor itself: the change handler is debounced.
+    if (path === ide.editorPath) sync_editor_buffer(ide);
+    const file = ide.files[path];
+    if (!file || !file.dirty || file.saving) return;
+
+    const content = file.content;
+    const session = ide.session;
+    file.saving = true;
     $shell.find('.koda-btn-save').prop('disabled', true);
     set_status($shell, __('Saving to disk...'), path);
+
+    // The response may arrive after a tab switch, a tab close or a request change.
+    const still_open = function () {
+        return ide.session === session && ide.files[path] === file;
+    };
+    const refresh_file_state = function () {
+        if (path === ide.editorPath) {
+            sync_editor_buffer(ide);
+        } else {
+            file.dirty = file.content !== file.original;
+            if (file.dirty) ide.dirtyPaths.add(path); else ide.dirtyPaths.delete(path);
+        }
+        update_tabs($shell, ide);
+        update_save_button($shell, ide);
+    };
 
     frappe.call({
         method: 'ampower_koda.agent.api.save_file_content',
@@ -1139,55 +1169,71 @@ function save_active_file($shell, ide) {
             request_name: ide.request_name,
             file_path: path,
             content: content,
+            expected_sha256: file.sha256 || '',
         },
         callback: function (r) {
-            if (r.message && r.message.status === 'ok') {
-                const full_path = r.message.full_path || path;
-                ide.files[path].original = content;
-                ide.files[path].dirty = false;
-                ide.files[path].full_path = full_path;
-                ide.dirtyPaths.delete(path);
-                append_terminal($shell, __('Saved to disk: ') + format_display_path(full_path));
-                frappe.show_alert({
-                    message: __('File saved to codebase'),
-                    indicator: 'green',
-                });
-                set_status($shell, __('Saved'), full_path);
-                update_breadcrumb($shell, path, full_path);
-                update_tabs($shell, ide);
+            file.saving = false;
+            const message = r.message || {};
+            if (message.status === 'conflict') {
+                if (ide.session !== session) return;
+                append_terminal($shell, __('Save refused: ') + (message.message || path));
+                if (!still_open()) return;
                 update_save_button($shell, ide);
-                load_file_diff(path, $shell, ide);
-                refresh_tree_badges($shell, ide);
-                // Re-read from disk so editor matches what is on the server
-                frappe.call({
-                    method: 'ampower_koda.agent.api.get_file_content',
-                    args: { request_name: ide.request_name, file_path: path },
-                    callback: function (reload) {
-                        if (!reload.message) return;
-                        ide.files[path].original = reload.message.content;
-                        ide.files[path].content = reload.message.content;
-                        ide.files[path].full_path = reload.message.full_path;
-                        set_editor_content(ide, reload.message.content, reload.message.language);
-                    },
-                });
+                set_status($shell, __('Not saved: file changed on disk'), path);
+                frappe.confirm(
+                    __('{0} changed on disk after you opened it (another tab, an external editor or the agent). Overwrite the disk version with your edits?', [frappe.utils.escape_html(path)]),
+                    function () {
+                        if (!still_open()) return;
+                        file.sha256 = message.sha256 || '';
+                        save_file(path, $shell, ide);
+                    }
+                );
+                return;
             }
+            if (message.status !== 'ok') {
+                if (still_open()) update_save_button($shell, ide);
+                return;
+            }
+
+            // Only the submitted text is saved; edits typed since stay dirty.
+            const full_path = message.full_path || path;
+            file.original = content;
+            file.sha256 = message.sha256;
+            file.full_path = full_path;
+            if (ide.session !== session) return;
+            append_terminal($shell, __('Saved to disk: ') + format_display_path(full_path));
+            frappe.show_alert({
+                message: __('File saved to codebase'),
+                indicator: 'green',
+            });
+            if (!still_open()) return;
+            refresh_file_state();
+            if (ide.activePath === path) {
+                set_status($shell, file.dirty ? __('Saved; newer edits are unsaved') : __('Saved'), full_path);
+                update_breadcrumb($shell, path, full_path);
+                load_file_diff(path, $shell, ide);
+            }
+            refresh_tree_badges($shell, ide);
         },
         error: function (xhr) {
-            const msg = (xhr.responseJSON && xhr.responseJSON._server_messages)
+            file.saving = false;
+            if (ide.session !== session) return;
+            const msg = (xhr && xhr.responseJSON && xhr.responseJSON._server_messages)
                 ? JSON.parse(xhr.responseJSON._server_messages).map(function (m) {
                     return JSON.parse(m).message;
                 }).join(' ')
-                : (xhr.message || path);
+                : ((xhr && xhr.message) || path);
             append_terminal($shell, __('Save failed: ') + msg);
-            update_save_button($shell, ide);
+            if (still_open()) update_save_button($shell, ide);
         },
     });
 }
 
 function update_save_button($shell, ide) {
     const path = ide.activePath;
-    const dirty = path && ide.files[path] && ide.files[path].dirty;
-    $shell.find('.koda-btn-save').prop('disabled', !dirty);
+    const file = path && path === ide.editorPath && ide.files[path];
+    const enabled = file && file.dirty && !file.saving && !ide.readOnly;
+    $shell.find('.koda-btn-save').prop('disabled', !enabled);
 }
 
 function update_breadcrumb($shell, rel_path, full_path) {
