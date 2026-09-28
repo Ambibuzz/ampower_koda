@@ -36,6 +36,40 @@ def merge_config(
     return config
 
 
+def merge_config_by_key(
+    override: Mapping[str, Any] | None,
+    *,
+    base: CoreConfig | None = None,
+) -> tuple[CoreConfig, tuple[ConfigError, ...]]:
+    """Apply ``override`` one key at a time, skipping the keys that are invalid.
+
+    For a file a person edits by hand: one typo must cost that key, not revert
+    every other key to its default. Each skipped key's error is returned so the
+    caller can say which key and why. Validation is per field, so applying keys
+    one by one accepts exactly what applying them together would.
+    """
+    config = base if base is not None else config_defaults()
+    errors: list[ConfigError] = []
+    for leaf in _leaves(override or {}):
+        try:
+            config = merge_config(leaf, base=config)
+        except ConfigError as exc:
+            if all(str(exc) != str(seen) for seen in errors):
+                errors.append(exc)
+    return config, tuple(errors)
+
+
+def _leaves(override: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Split a nested override into single-key overrides, one per leaf value."""
+    leaves: list[dict[str, Any]] = []
+    for key, value in override.items():
+        if isinstance(value, Mapping) and value:
+            leaves.extend({key: leaf} for leaf in _leaves(value))
+        else:
+            leaves.append({key: value})
+    return leaves
+
+
 def _apply(node: T, override: Mapping[str, Any], *, prefix: str) -> T:
     """Return ``node`` with ``override`` applied, recursing into config groups."""
     if not is_dataclass(node):  # pragma: no cover
@@ -68,7 +102,11 @@ def _coerce(path: str, current: Any, value: Any) -> Any:
     if isinstance(current, tuple):
         if isinstance(value, str) or not isinstance(value, (list, tuple)):
             raise ConfigError(path, "expected a list")
-        return tuple(str(item) for item in value)
+        # Every list key holds patterns or names: ``7`` is a typo, not the string "7".
+        for item in value:
+            if not isinstance(item, str):
+                raise ConfigError(path, f"expected a list of strings, got {type(item).__name__} {item!r}")
+        return tuple(value)
 
     if isinstance(current, bool):
         if not isinstance(value, bool):

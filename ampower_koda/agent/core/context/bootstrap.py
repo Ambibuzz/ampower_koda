@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from ..config.merge import merge_config, parse_toml
+from ..config.load import CONFIG_PATH, resolve_config  # noqa: F401 - CONFIG_PATH re-exported
 from ..config.schema import CoreConfig
 from ..contracts.session import CoChangeMemory, RepoMemory, SessionContext
 from ..contracts.source import Overlay
-from ..errors import ConfigError, CoreError
 from ..history.cochange import build_cochange, empty_memory, git_log_arguments, parse_git_log
 from ..indexing.build import build_index
 from ..indexing.incremental import apply_overlays
@@ -19,8 +18,6 @@ from ..retrieval.engine import Retriever, build_retriever
 from ..workspace.discovery import discover
 from ..workspace.local import SystemClock
 from ..workspace.ports import Clock, Workspace
-
-CONFIG_PATH = ".koda/config.toml"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +52,7 @@ def build_context(
     clock = clock or SystemClock()
     notes: list[str] = []
 
-    config = _resolve_config(workspace, overrides, notes)
+    config = resolve_config(workspace, overrides, notes)
     if registry.unavailable:
         notes.append(
             "not indexed by symbol: "
@@ -101,28 +98,6 @@ def build_context(
         ),
         notes=tuple(notes),
     )
-
-
-def _resolve_config(
-    workspace: Workspace,
-    overrides: dict | None,
-    notes: list[str],
-) -> CoreConfig:
-    """Resolve ``defaults < .koda/config.toml < overrides``."""
-    from_file: dict | None = None
-    if workspace.stat(CONFIG_PATH) is not None:
-        try:
-            from_file = parse_toml(workspace.read_bytes(CONFIG_PATH).decode("utf-8"))
-        except (CoreError, UnicodeDecodeError) as exc:
-            notes.append(f"{CONFIG_PATH} ignored: {exc}")
-
-    try:
-        return merge_config(from_file, overrides)
-    except ConfigError:
-        if from_file is None:
-            raise
-        notes.append(f"{CONFIG_PATH} ignored: contains an invalid value")
-        return merge_config(overrides)
 
 
 def _read_memory(workspace: Workspace, config: CoreConfig, notes: list[str]) -> RepoMemory:

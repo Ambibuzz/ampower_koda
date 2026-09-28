@@ -52,7 +52,7 @@ from ampower_koda.agent.reranking import OpenRouterReranker
 from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
 from ampower_koda.agent.core.budget.request import estimate_messages
 from ampower_koda.agent.core.config.merge import merge_config
-from ampower_koda.agent.core.context.bootstrap import _resolve_config
+from ampower_koda.agent.core.config.load import resolve_config
 from ampower_koda.agent.core import (
     ROLE_PROMPT,
     LocalWorkspace,
@@ -877,7 +877,7 @@ def request_limits(app_name: str, model_id: str) -> tuple[int, int]:
     """Resolve the same window and input ceiling for planning and execution."""
     if app_name:
         workspace = LocalWorkspace(root_path=Path(_app_root(app_name)))
-        config = _resolve_config(workspace, _overrides(model_id), [])
+        config = resolve_config(workspace, _overrides(model_id), [])
     else:
         config = merge_config(_overrides(model_id))
     return config.context.window_tokens, config.context.input_tokens
