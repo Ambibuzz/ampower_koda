@@ -112,9 +112,14 @@ class RerankConfig:
     min_score: float = 0.1
     """A model-specific relevance floor, not a probability of correctness."""
 
+    brief_model: str = "cohere/rerank-4-pro"
+    """The starting-points brief: one call over file cards, one over their definitions."""
+
     def validate(self) -> None:
         if not self.model.strip():
             raise ConfigError("rerank.model", "cannot be empty")
+        if not self.brief_model.strip():
+            raise ConfigError("rerank.brief_model", "cannot be empty")
         for name, low, high in (("candidates", 1, 100), ("per_file", 1, 10),
                                 ("query_chars", 256, 8000), ("document_chars", 256, 8000)):
             if not low <= getattr(self, name) <= high:

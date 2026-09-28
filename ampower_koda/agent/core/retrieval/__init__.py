@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .bm25 import LexicalIndex, build_lexical_index, is_prose, score
 from .confidence import margin_of
-from .engine import Retriever, build_retriever, search
+from .engine import Retriever, brief, build_retriever, search
 from .fusion import FusedHit, fuse, leg_trust
 from .legs import Seed, graph_leg, history_leg, seeds_from, structural_leg
 from .query import QueryPlan, QueryView, plan_query
@@ -35,6 +35,7 @@ __all__ = [
     "plan_query",
     "rerank",
     "score",
+    "brief",
     "search",
     "seeds_from",
     "stem",

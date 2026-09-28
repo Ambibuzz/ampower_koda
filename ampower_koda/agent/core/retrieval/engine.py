@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -29,9 +30,10 @@ from . import select
 from .bm25 import LexicalIndex, ScoredDocument, build_lexical_index, score
 from .confidence import hit_coverage, margin_of
 from .excerpts import best_chunks
+from .files import Brief, build_file_index, starting_points
 from .fusion import fuse
 from .legs import graph_leg, history_leg, related_leg, seeds_from, structural_leg
-from .query import QueryPlan, merged_weight, named_paths, plan_query
+from .query import QueryPlan, merged_weight, named_paths, plain_query, plan_query
 from .rerank import rerank
 from .tokenize import tokenize
 
@@ -52,6 +54,11 @@ class Retriever:
     config: RetrievalConfig = field(default_factory=RetrievalConfig)
     rerank_config: RerankConfig = field(default_factory=RerankConfig)
     reranker: Reranker | None = None
+
+    built: dict = field(default_factory=dict, compare=False, repr=False)
+    """Indexes built on first use and shared by every copy of this retriever: the
+    whole-file index costs seconds on a large app and only the brief needs it.
+    Filled under ``_BUILD_LOCK``, so concurrent first callers build it once."""
 
     mirrors: MirrorSet = field(default_factory=MirrorSet)
 
@@ -272,3 +279,22 @@ def _spread_bonus(index: LexicalIndex, name: str) -> float:
 
     spread = max(1, index.document_frequency.get(name.lower(), 1))
     return log(1.0 + max(index.counted, 1) / spread)
+
+
+_BUILD_LOCK = threading.Lock()
+
+
+def brief(retriever: Retriever, message: str, *, reranker: Reranker | None = None) -> Brief:
+    """Where to start on ``message``: files and definitions, chosen before any model call.
+
+    ``reranker`` is passed explicitly: the brief may use a stronger model than
+    the chunk search, and the retriever's own reranker is left untouched.
+    """
+    query = plain_query(message)
+    if not query:
+        return Brief()
+    with _BUILD_LOCK:
+        files = retriever.built.get("files")
+        if files is None:
+            files = retriever.built["files"] = build_file_index(retriever.index)
+    return starting_points(retriever.index, files, query, reranker=reranker, mirrors=retriever.mirrors)

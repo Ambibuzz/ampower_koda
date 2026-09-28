@@ -48,7 +48,7 @@ from .graph import CodeGraph, build_graph
 from .ledger import distil_into, record, record_read, rehydrate, render_ledger
 from .loop import TurnMeters
 from .prompt import assemble, build_prefix
-from .retrieval import Retriever, build_retriever, search
+from .retrieval import Retriever, brief, build_retriever, search
 from .tokens import estimate_tokens
 from .tools import TOOL_NAMES
 from .tools.run import NullHost, run_tool
@@ -110,6 +110,7 @@ __all__ = [
     "build_context",
     "build_graph",
     "build_prefix",
+    "brief",
     "build_retriever",
     "compact_for_request",
     "config_defaults",
