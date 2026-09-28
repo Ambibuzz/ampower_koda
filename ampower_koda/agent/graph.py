@@ -2281,9 +2281,13 @@ the words, or something different); missing; or contradicted. Name the task id t
 and in one sentence say what is wrong. Do not add requirements the words do not state. An ambiguous
 clause the plan reads reasonably, and records in its assumptions, is covered, unless the assumptions
 name another reading that keeps more of what already exists: the plan should build that one, so the
-clause is narrowed. Then add one entry per task that changes existing code or behavior no clause asks
-to change, with status "added" and the task's title as the quote; work a requested change needs (its
-own wiring, registration or tests) is not added."""
+clause is narrowed. A control or limit the plan keeps from the thing being copied (a depth, page size,
+date range or filter) does not narrow a clause the user can still reach through that control, for
+example by raising the depth or expanding a node: mark narrowed only what the plan cannot deliver at all.
+Then add one entry per task that changes existing code or behavior no clause asks to change, with status
+"added" and the task's title as the quote; work a requested change needs (its own wiring, registration
+or tests) is not added, and neither are the loading, error, empty and keyboard states any new page
+needs."""
 
 
 def _plan_text(text: str) -> str:
@@ -2326,7 +2330,9 @@ def _plan_coverage_gaps(plan: dict, user_message: str, *, llm, provider: str, bu
             continue
         if clause.get("status") == "covered" or len(quote) < 8 or quote not in request:
             continue
-        gaps.append(f"The plan {clause.get('status')} the request's words \"{words}\""
+        verb = {"narrowed": "narrows", "missing": "misses",
+                "contradicted": "contradicts"}.get(clause.get("status"), "does not cover")
+        gaps.append(f"The plan {verb} the request's words \"{words}\""
                     f"{' (' + task + ')' if task else ''}: {problem} "
                     "Edit the plan so it does what these words ask, or state in assumptions why this reading is right.")
     return gaps, total_tokens

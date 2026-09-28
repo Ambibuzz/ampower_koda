@@ -125,7 +125,9 @@ class PlanSink:
             if gaps:
                 return ("SUBMIT_FAILED: an independent check of the plan against the request found:\n- "
                         + "\n- ".join(gaps)
-                        + "\nRevise the plan, or state in assumptions why your reading is right, and submit again.")
+                        + "\nThe checker saw only the request and the plan, not the code. Revise the plan where "
+                        "it drops what the user asked for; where it already delivers it (for example through "
+                        "a control kept from the reference), say so in assumptions and submit it unchanged.")
         self.plan, self.findings = plan, str(findings or "").strip()
         return f"PLAN_ACCEPTED: {len(plan['tasks'])} task(s) sent to the user for approval. Stop here."
 
