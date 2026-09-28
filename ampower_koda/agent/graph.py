@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
 # LangGraph workflows: Planning (Understand -> Plan) and Execution (Implement -> Review).
-# A local syntax check gates the implement pass; review validates clean code/Frappe
-# standards before bench and deploy run in executor.py.
+# Completion checks gate dependency progress; final integration reviews the full plan
+# before bench and deploy run in executor.py.
 
 import json
 import os
@@ -25,7 +25,11 @@ from ampower_koda.agent.plan_contract import (
     plan_to_markdown,
     validate_plan,
 )
-from ampower_koda.agent.checks import run_health_checks, needs_llm_review
+from ampower_koda.agent.checks import run_health_checks, run_task_checks, CheckResult
+from ampower_koda.agent.execution_contract import (
+    load_plan, read_snapshot, change_evidence, review_verdict, review_decision, completion_report, revision,
+)
+from ampower_koda.agent.execution_evidence import source_context, SourceMemory
 from ampower_koda.agent.prompts import (
     get_system_prompt,
     get_understand_system_prompt,
@@ -38,10 +42,17 @@ from ampower_koda.agent.prompts import (
 
 
 MAX_TOOL_ROUNDS_EXECUTION = 18
-MAX_TOOL_ROUNDS_REVIEW = 4        # local checks already ran; keep model review surgical
-MAX_TOOL_ROUNDS_SYNTAX_FIX = 6    # focused "fix the syntax errors" pass
-MAX_SYNTAX_FIX_ATTEMPTS = 2       # how many times to re-invoke to fix remaining syntax errors
-MAX_REVIEW_ATTEMPTS = 2           # implement + review retries before failing
+MAX_TOOL_ROUNDS_REPAIR = 8        # a retry continues from current source with a remaining-work list
+MAX_TOOL_ROUNDS_REVIEW = 6
+MAX_TOOL_ROUNDS_REVIEW_RECOVERY = 4  # continues the first pass's history, so these are new reads only
+MAX_REVIEW_ATTEMPTS = 2           # per task and for final integration
+BASE_EXECUTION_CALL_BUDGET = 18
+# A task must be able to afford one full implementation turn and one repair
+# turn, each with its forced final call. The old value of 10 left a one-task
+# plan 11 rounds for the first attempt and none for the retry.
+PER_TASK_CALL_BUDGET = (MAX_TOOL_ROUNDS_EXECUTION + 1) + (MAX_TOOL_ROUNDS_REPAIR + 1)
+FINAL_REVIEW_RESERVE = 16  # review (7), evidence recovery (5), repair/re-review minimum (4)
+REPAIR_REVIEW_RESERVE = 3
 WRITE_TOOLS = {"replace_lines", "insert_lines", "edit_file", "write_file"}
 REPLAYABLE_TOOLS = {
     "find_files", "list_directory", "read_file", "search_code",
@@ -128,38 +139,8 @@ def _llm_response_text(response) -> str:
     return _message_content_to_str(getattr(response, "content", ""))
 
 
-def _parse_review_verdict(text: str) -> tuple[bool, str]:
-    """Parse the review verdict as structured JSON, with a soft-pass fallback.
-
-    Preferred format: {"review_passed": true/false, "issues": ["...", ...]}
-
-    If the model didn't produce valid JSON, this is treated as a formatting
-    slip, not a real failure — by the time review_node calls this, the
-    mechanical health checks have already passed, so an unparseable verdict
-    is far more likely to be "forgot the format" than "found a real problem".
-    A genuine failure must be an *explicit* review_passed: false.
-    """
-    notes = (text or "").strip()
-    payload = _extract_review_json(notes)
-
-    if payload is not None and isinstance(payload.get("review_passed"), bool):
-        passed = payload["review_passed"]
-        issues = payload.get("issues") or []
-        if passed:
-            return True, notes
-        if isinstance(issues, list) and issues:
-            formatted = "\n".join(f"- {issue}" for issue in issues if str(issue).strip())
-            return False, formatted or notes
-        return False, notes or "Review reported issues without details."
-
-    # No parseable, well-formed verdict. Mechanical checks already passed
-    # before this was ever called — don't fail a real run over a formatting
-    # slip. Soft pass, but say plainly that the verdict was unparseable so
-    # it's visible in review_notes rather than silently swallowed.
-    return True, (
-        "Verdict could not be parsed as structured JSON; treated as a soft "
-        f"pass since mechanical checks already passed. Raw response: {notes[:300]}"
-    )
+def _parse_review_verdict(text: str, criteria: list[str] | None = None) -> tuple[bool, str]:
+    return review_verdict(_extract_review_json(text or ""), criteria or [])
 
 
 def _extract_review_json(text: str) -> dict | None:
@@ -192,33 +173,6 @@ def _extract_review_json(text: str) -> dict | None:
             return parsed
     return None
     
-
-def _syntax_check_edits(app_name: str, edits: list[dict]) -> tuple[bool, str]:
-    """Validate edited .py/.js locally so broken syntax never reaches bench."""
-    paths = [e.get("path", "") for e in (edits or []) if e.get("path")]
-    code_paths = [p for p in paths if p.endswith((".py", ".js"))]
-    if not code_paths:
-        return True, ""
-
-    failures = []
-    summary_lines = []
-    for path in code_paths:
-        result = agent_tools.validate_code(app_name, path)
-        # A path that doesn't resolve to a real file is not a syntax error — it's
-        # usually a phantom path parsed from the model's summary text. Skip it.
-        if "Not a file" in result:
-            continue
-        first_line = (result or "").split("\n", 1)[0][:240]
-        summary_lines.append(f"- {path}: {first_line}")
-        # Only genuine syntax problems should block the run.
-        if "SYNTAX_ERROR" in result:
-            failures.append(result)
-
-    summary = "\n".join(summary_lines)
-    if failures:
-        return False, "\n\n".join(failures)
-    return True, summary
-
 
 # ---------------------------------------------------------------------------
 # LLM factory — supports OpenAI, OpenRouter, Gemini and Claude
@@ -490,14 +444,29 @@ def _persist_token_usage(request_name: str, total_tokens: int):
         )
 
 
-def _make_tools(app_name: str, read_only: bool = False):
+def _make_tools(app_name: str, read_only: bool = False, *, allowed_paths=None, before=None):
     """Build LangChain tools bound to a specific app_name."""
+
+    observed = {}
+
+    def capture_write(path, *, fresh_read=False):
+        full = agent_tools._resolve_path(app_name, path)
+        # _resolve_path resolves symlinks; measure against the resolved root too,
+        # or a junctioned app root turns every approved path into "../../...".
+        canonical = os.path.relpath(full, os.path.realpath(agent_tools._app_root(app_name))).replace("\\", "/")
+        if allowed_paths is not None and canonical not in allowed_paths:
+            raise ValueError(f"Unapproved write path: {path}. Report the plan blocker; do not expand scope.")
+        current = read_snapshot(full)
+        if fresh_read and current is not None and (full not in observed or observed[full] != current):
+            raise ValueError(f"Read {path} again before editing: line anchors or file content may be stale.")
+        if before is not None and canonical not in before:
+            before[canonical] = current
 
     @tool
     def find_files(pattern: str = "", max_depth: int = 6) -> str:
         """Recursively list the app directory tree using a glob-style pattern.
         Returns an indented tree view. max_depth defaults to 6.
-        Call this FIRST to map the codebase structure before reading individual files."""
+        Use only when the supplied task context does not identify the files you need."""
         return agent_tools.find_files(app_name, pattern, max_depth)
 
     @tool
@@ -512,7 +481,12 @@ def _make_tools(app_name: str, read_only: bool = False):
         - If start_line and end_line are both > 0, reads only that range (1-indexed, inclusive).
         - Otherwise reads the full file.
         ALWAYS use this to see exact line numbers before editing."""
-        return agent_tools.read_file(app_name, path, start_line, end_line)
+        full = agent_tools._resolve_path(app_name, path)
+        snapshot = read_snapshot(full)
+        result = agent_tools.read_file(app_name, path, start_line, end_line)
+        if snapshot is not None:
+            observed[full] = snapshot
+        return result
 
     @tool
     def search_code(pattern: str, path: str = "") -> str:
@@ -542,24 +516,28 @@ def _make_tools(app_name: str, read_only: bool = False):
         @tool
         def write_file(path: str, content: str) -> str:
             """Write or overwrite a file at the given relative path. Parent directories are created if needed."""
+            capture_write(path, fresh_read=True)
             return agent_tools.write_file(app_name, path, content)
 
         @tool
         def edit_file(path: str, old_string: str, new_string: str) -> str:
             """Replace FIRST occurrence of old_string with new_string in file.
-            Requires EXACT match including whitespace. For large files, prefer replace_lines."""
+            Requires a unique EXACT match including whitespace. Read the current file first."""
+            capture_write(path)
             return agent_tools.edit_file(app_name, path, old_string, new_string)
 
         @tool
         def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
             """Replace lines start_line through end_line (1-indexed, inclusive) with new_content.
             The most reliable tool for editing. Use read_file first to identify the exact line range."""
+            capture_write(path, fresh_read=True)
             return agent_tools.replace_lines(app_name, path, start_line, end_line, new_content)
 
         @tool
         def insert_lines(path: str, after_line: int, new_content: str) -> str:
             """Insert new_content AFTER the specified 1-indexed line number.
             Use after_line=0 to insert at the beginning of the file."""
+            capture_write(path, fresh_read=True)
             return agent_tools.insert_lines(app_name, path, after_line, new_content)
 
         out.extend([write_file, edit_file, replace_lines, insert_lines])
@@ -578,10 +556,16 @@ def _compact_round_summary(round_entry: dict) -> list[str]:
 def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                            request_name: str = "", max_rounds: int = 20,
                            state: dict = None, provider: str = "OpenAI",
-                           require_writes: bool = False) -> tuple[str, list[str], int]:
+                           require_writes: bool = False, progress: dict | None = None,
+                           history: dict | None = None) -> tuple[str, list[str], int, int, bool]:
     """
     Run a tool-calling loop, publishing every tool call and LLM response via realtime.
-    Returns (final_text, list_of_edited_file_paths, total_tokens_used).
+    Returns (text, edited_paths, tokens, model_calls, exhausted).
+
+    ``history`` is an optional mutable dict that carries the retained rounds,
+    compacted summaries, duplicate-call bookkeeping and source memory from one
+    loop into the next. A reviewer recovery pass continues from what the first
+    pass already read instead of re-fetching it; round numbers keep counting.
 
     Context control (token savings without quality loss):
       - The stable system prompt is a separate, cache-friendly message.
@@ -592,10 +576,8 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     A "round" is one assistant tool-call message plus all of its tool results;
     rounds are trimmed atomically so no tool_call_id is ever left dangling.
 
-    When require_writes is set (implementation phase), the loop nudges the model
-    to stop exploring and actually edit files if it reads for too many rounds
-    without writing, or tries to finish without having made any edit. This
-    prevents the "read forever, never write" failure that yields no file changes.
+    Implementation receives one focus reminder after a long read-only streak.
+    No-op completion claims are left to the independent reviewer to assess.
 
     If max_rounds is reached without the LLM stopping, one final llm.invoke() is
     fired WITHOUT tools bound to force a plain-text conclusion.
@@ -615,28 +597,33 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     system_msg = _build_system_message(provider, system_prompt, model_id)
     task_msg = _build_task_message(provider, task_prompt, model_id)
 
-    rounds: list[dict] = []      # each: {"number", "ai", "tools", "summary"}
-    compacted: list[str] = []    # summary lines for dropped (older) rounds
+    if history is None:
+        history = {}
+    rounds: list[dict] = history.setdefault("rounds", [])      # each: {"number", "ai", "tools", "summary"}
+    compacted: list[str] = history.setdefault("compacted", [])  # summary lines for dropped (older) rounds
     injected: list = []          # directive nudges appended after the latest round
     edited_paths: list[str] = []
-    seen_calls: dict[str, int] = {}
-    seen_results: dict[str, int] = {}
+    if state and state.get("execution_tasks"):
+        source_memory = history.get("source_memory") or SourceMemory(lambda path: _read_current(state, path))
+        history["source_memory"] = source_memory
+    else:
+        source_memory = None
+    seen_calls: dict[str, int] = history.setdefault("seen_calls", {})
+    seen_results: dict[str, int] = history.setdefault("seen_results", {})
+    round_base = int(history.get("rounds_done", 0))  # rounds already numbered by earlier loops
     total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
     usage_missing_logged = False  # warn once per loop, not once per round
 
     wrote_anything = False
     read_only_streak = 0
     write_nudges = 0
-    MAX_WRITE_NUDGES = 3
-    READ_STREAK_LIMIT = 3
+    MAX_WRITE_NUDGES = 1
+    READ_STREAK_LIMIT = 5
     NUDGE_TEXT = (
-        "STOP exploring. You have read enough — the files you need are already "
-        "identified by the approved plan and the reads above. "
-        "Do NOT call read_file, search_code, list_directory, get_file_outline or "
-        "read_doctype_schema again unless an edit actually fails. Make the planned "
-        "changes NOW: call replace_lines, insert_lines, edit_file or write_file to "
-        "apply real edits, then validate_code on each changed .py/.js file. Your "
-        "next message MUST include an edit tool call."
+        "Work toward the active task's acceptance criteria. Read any missing context "
+        "needed for a correct edit, then apply and validate a focused change. "
+        "If the task is blocked or already satisfied, explain the evidence instead "
+        "of making an unnecessary edit. Do not guess anchors or field names."
     )
 
     def inject_nudge(text: str) -> None:
@@ -652,6 +639,10 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 "These tools already ran; re-read a file only if you need details not captured here.\n"
                 + "\n".join(compacted)
             )))
+        if source_memory:
+            evidence = source_memory.render({r["number"] for r in rounds})
+            if evidence:
+                msgs.append(HumanMessage(content="## Retained source evidence (current revision)\n" + evidence))
         for r in rounds:
             msgs.append(r["ai"])
             msgs.extend(r["tools"])
@@ -720,42 +711,38 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 tokens_total=total_tokens,
                 provider=provider,
             )
+        if progress is not None:
+            progress["tokens"] = total_tokens
 
     for round_num in range(max_rounds):
+        label = round_base + round_num + 1
         maybe_trim()
         messages = build_messages()
-        context_chars = (
-            len(system_prompt) + len(task_prompt) + estimate_chars()
-            + sum(len(line) + 1 for line in compacted)
-        )
+        context_chars = sum(message_chars(m) for m in messages)
+        if progress is not None:
+            progress["calls"] = round_num + 1
         response = _invoke_limited(llm_with_tools, messages, MODEL_ROUND_OUTPUT_TOKENS)
-        account_tokens(response, round_num + 1, context_chars)
+        account_tokens(response, label, context_chars)
 
         response_text = _llm_response_text(response)
         if response_text:
             _publish_agent_log(request_name, "llm_response",
                 preview=response_text[:4000],
-                round=round_num + 1,
+                round=label,
             )
 
         if not getattr(response, "tool_calls", None):
-            # Model wants to finish. In the implement phase, don't let it stop
-            # without ever editing a file — push it to actually write.
-            if require_writes and not wrote_anything and write_nudges < MAX_WRITE_NUDGES:
-                write_nudges += 1
-                inject_nudge(NUDGE_TEXT)
-                _publish_agent_log(request_name, "write_nudge",
-                    round=round_num + 1, attempt=write_nudges, trigger="no_tool_calls")
-                continue
-            return response_text, edited_paths, total_tokens
+            # No-op claims are assessed by review; never force an unnecessary edit.
+            history["rounds_done"] = label
+            return response_text, edited_paths, total_tokens, round_num + 1, False
 
-        round_entry = {"number": round_num + 1, "ai": response, "tools": [], "summary": []}
+        round_entry = {"number": label, "ai": response, "tools": [], "summary": []}
         round_had_write = False
         for tc in response.tool_calls:
             _publish_agent_log(request_name, "tool_call",
                 tool_name=tc["name"],
                 tool_args={k: (str(v)[:200] if len(str(v)) > 200 else v) for k, v in tc.get("args", {}).items()},
-                round=round_num + 1,
+                round=label,
             )
 
             name = tc["name"]
@@ -773,7 +760,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 )
                 _publish_agent_log(
                     request_name, "duplicate_tool_call",
-                    tool_name=name, original_round=prior_round, round=round_num + 1,
+                    tool_name=name, original_round=prior_round, round=label,
                 )
             elif fn:
                 try:
@@ -786,7 +773,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                                 "use the earlier result and move on.]"
                             )
                         else:
-                            seen_results[result] = round_num + 1
+                            seen_results[result] = label
                     if len(result) > MAX_TOOL_RESULT_CHARS:
                         result = (
                             result[:MAX_TOOL_RESULT_CHARS]
@@ -803,15 +790,19 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 result = f"Unknown tool: {name}"
 
             if name in REPLAYABLE_TOOLS and not duplicate_call:
-                seen_calls[call_key] = round_num + 1
+                seen_calls[call_key] = label
 
+            if source_memory and name == "read_file" and not duplicate_call:
+                source_memory.record(arguments, result, label)
             if name in WRITE_TOOLS:
-                if not result.startswith("Tool error:") and not result.startswith("Error:"):
+                if source_memory:
+                    source_memory.invalidate()
+                # A failed write can still have partially changed the file.
+                seen_calls.clear()
+                seen_results.clear()
+                if result.startswith(("WRITE_OK:", "EDIT_OK:")):
                     round_had_write = True
                     wrote_anything = True
-                    # Every cached read/search is stale after a mutation.
-                    seen_calls.clear()
-                    seen_results.clear()
                     path_arg = arguments.get("path", "")
                     if path_arg and path_arg not in edited_paths:
                         edited_paths.append(path_arg)
@@ -819,7 +810,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             _publish_agent_log(request_name, "tool_result",
                 tool_name=name,
                 result_preview=result[:500],
-                round=round_num + 1,
+                round=label,
             )
             round_entry["tools"].append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
@@ -827,7 +818,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 f"{k}={str(v)[:60]}" for k, v in list(arguments.items())[:3]
             )
             round_entry["summary"].append(
-                f"[r{round_num + 1}] {name}({arg_preview}) -> {result[:COMPACT_RESULT_PREVIEW]}"
+                f"[r{label}] {name}({arg_preview}) -> {result[:COMPACT_RESULT_PREVIEW]}"
             )
 
         rounds.append(round_entry)
@@ -845,40 +836,79 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             read_only_streak = 0
             inject_nudge(NUDGE_TEXT)
             _publish_agent_log(request_name, "write_nudge",
-                round=round_num + 1, attempt=write_nudges, trigger="read_streak")
+                round=label, attempt=write_nudges, trigger="read_streak")
 
     maybe_trim()
-    final_context_chars = (
-        len(system_prompt) + len(task_prompt) + estimate_chars()
-        + sum(len(line) + 1 for line in compacted)
-    )
-    final = _invoke_limited(llm, build_messages(), MODEL_FINAL_OUTPUT_TOKENS)
-    account_tokens(final, max_rounds + 1, final_context_chars)
-    return _llm_response_text(final), edited_paths, total_tokens
+    final_messages = build_messages()
+    # Tools are unbound for this call. Without saying so, a model that still
+    # wants to work writes its next tool calls as prose, and the turn ends with
+    # garbage instead of a report the retry can act on.
+    final_messages.append(HumanMessage(content=(
+        "STOP: the call limit for this turn is reached and tools are no longer available. "
+        "Do not write any further tool calls. Return the required final report now. "
+        'If work remains, use status "blocked" and list exactly what is unfinished and '
+        "which edits were already applied, so the next attempt can continue from current source."
+    )))
+    final_context_chars = sum(message_chars(m) for m in final_messages)
+    if progress is not None:
+        progress["calls"] = max_rounds + 1
+    final = _invoke_limited(llm, final_messages, MODEL_FINAL_OUTPUT_TOKENS)
+    account_tokens(final, round_base + max_rounds + 1, final_context_chars)
+    history["rounds_done"] = round_base + max_rounds + 1
+    return _llm_response_text(final), edited_paths, total_tokens, max_rounds + 1, True
 
 
 # ---------------------------------------------------------------------------
 # Agent turn helper
 # ---------------------------------------------------------------------------
 
-def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool, max_rounds: int = 20) -> dict:
-    """Run one agent turn for the given phase. Returns state updates."""
+def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool, max_rounds: int = 20,
+                    history: dict | None = None) -> dict:
+    """Run one agent turn for the given phase. Returns state updates.
+
+    ``history`` lets a follow-on turn (reviewer recovery) continue from the
+    retained tool rounds of the previous one instead of starting cold.
+    """
+    before = {}
+    progress = {"tokens": state.get("tokens_used", 0), "calls": 0}
     try:
+        if len(prompt) > MAX_TASK_PROMPT_CHARS:
+            return {"error": "Execution context exceeds the prompt limit; shorten the task contract or custom prompt. No criteria were silently discarded."}
         app_name = state.get("target_app_name", "")
         provider = state.get("ai_provider", "OpenAI")
         model = state.get("ai_model", "gpt-4o-mini")
         request_name = state.get("request_name", "")
 
-        tools = _make_tools(app_name, read_only=read_only_tools)
+        remaining = state.get("tool_rounds_limit", 1000) - state.get("tool_rounds_used", 0)
+        if not read_only_tools and state.get("execution_tasks"):
+            if state.get("integration_mode"):
+                remaining -= REPAIR_REVIEW_RESERVE
+            else:
+                pending = max(1, len(state["execution_tasks"]) - state.get("task_index", 0))
+                remaining = (remaining - FINAL_REVIEW_RESERVE) // pending
+        elif read_only_tools and state.get("execution_tasks") and not state.get("integration_mode") and not state.get("is_follow_up"):
+            # A no-op task still needs independent verification, but cannot use
+            # final integration's allocation or the minimum for future tasks.
+            future_tasks = max(0, len(state["execution_tasks"]) - state.get("task_index", 0) - 1)
+            remaining -= FINAL_REVIEW_RESERVE + 2 * future_tasks
+        if remaining < 2:
+            return {"error": "Execution call budget exhausted before verification completed."}
+        max_rounds = min(max_rounds, remaining - 1)
+        tools = _make_tools(
+            app_name, read_only=read_only_tools,
+            allowed_paths=state.get("allowed_write_paths"), before=before,
+        )
         llm = _get_llm(provider=provider, model=model)
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
-        content, tool_edited_paths, total_tokens = _run_tool_calling_loop(
+        content, tool_edited_paths, total_tokens, rounds_used, exhausted = _run_tool_calling_loop(
             llm, tools, system_prompt, prompt,
             request_name=request_name,
             max_rounds=max_rounds,
             state=state,
             provider=provider,
             require_writes=not read_only_tools,
+            progress=progress,
+            history=history,
         )
         content = _message_content_to_str(content)
         max_output = MAX_PHASE_OUTPUT_CHARS
@@ -889,6 +919,9 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             "current_stage": phase,
             "intermediate_steps": steps,
             "tokens_used": total_tokens,
+            "tool_rounds_used": state.get("tool_rounds_used", 0) + rounds_used,
+            "turn_exhausted": exhausted,
+            "_write_baseline": before,
         }
         if tool_edited_paths:
             result["_tool_edited_paths"] = tool_edited_paths
@@ -904,6 +937,9 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
         return {
             "current_stage": phase,
             "intermediate_steps": steps,
+            "_write_baseline": before,
+            "tokens_used": progress["tokens"],
+            "tool_rounds_used": state.get("tool_rounds_used", 0) + progress["calls"],
             "error": str(e),
         }
 
@@ -1134,7 +1170,7 @@ def plan_node(state: dict) -> dict:
             f"{len(tasks)} task(s) validated; paths and dependency graph verified",
         )
 
-        # Derive the editable plan consumed by the current executor.
+        # Markdown is a display projection; execution consumes plan_object.
         plan = plan_to_markdown(plan_object)
 
         steps = list(state.get("intermediate_steps") or []) + [
@@ -1169,242 +1205,352 @@ def plan_node(state: dict) -> dict:
 # Graph nodes — Execution phase
 # ---------------------------------------------------------------------------
 
-def implement_node(state: dict) -> dict:
-    """Apply the approved plan by editing and creating files with write tools.
+def prepare_execution_node(state: dict) -> dict:
+    """Freeze the validated contract once, before any task writes."""
+    try:
+        if state.get("is_follow_up"):
+            plan = load_plan(state.get("plan_object"))
+            tasks = [{
+                "id": "FOLLOW_UP", "title": "Follow-up patch",
+                "goal": state.get("follow_up_message", ""),
+                "description": "Patch the reported issue without rebuilding the original plan.",
+                "files": state.get("prior_changed_paths") or [], "context_refs": [],
+                "acceptance_criteria": [state.get("follow_up_message") or "Fix the reported issue"],
+                "depends_on": [],
+            }]
+        else:
+            plan = load_plan(state.get("plan_object"), path_exists=lambda p: _app_file_exists(state["target_app_name"], p))
+            tasks = plan["tasks"]
+        return {
+            "plan_object": plan, "execution_tasks": tasks, "task_index": 0,
+            "task_results": [], "task_baseline": {}, "execution_baseline": {},
+            "task_completion": {}, "turn_exhausted": False,
+            "review_attempts": 0, "review_notes": "", "review_passed": False,
+            "integration_mode": False, "tool_rounds_used": 0,
+            "tool_rounds_limit": BASE_EXECUTION_CALL_BUDGET + PER_TASK_CALL_BUDGET * len(tasks),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
 
-    Runs an implementation pass, then a local syntax check on the edited
-    .py/.js files so broken code never reaches bench. A review stage can
-    send corrections back into a follow-up implement pass.
-    """
+
+def _execution_context(state: dict) -> tuple[dict, list[str], list[str] | None]:
+    tasks = state["execution_tasks"]
+    if state.get("integration_mode"):
+        active = {"id": "INTEGRATION", "tasks": tasks}
+        criteria = [f"{t['id']}: {c}" for t in tasks for c in t["acceptance_criteria"]]
+        paths = list(dict.fromkeys(p for t in tasks for p in t["files"]))
+    else:
+        active = tasks[state["task_index"]]
+        criteria = active["acceptance_criteria"]
+        paths = active["files"]
+    return active, criteria, None if state.get("is_follow_up") else paths
+
+
+def _read_current(state: dict, path: str):
+    return read_snapshot(agent_tools._resolve_path(state["target_app_name"], path))
+
+
+def _persist_task_results(state: dict):
+    """Persist audit results, not a claim that filesystem writes are replayable."""
+    if state.get("request_name"):
+        frappe.db.set_value(DOCTYPE_NAME, state["request_name"], "execution_results", json.dumps({
+            "tasks": state.get("task_results", []),
+            "final_review_passed": bool((state.get("integration_mode") or state.get("is_follow_up")) and state.get("review_passed")),
+            "review_notes": state.get("review_notes", ""),
+            "model_calls": state.get("tool_rounds_used", 0),
+            "error": state.get("error", ""),
+        }, ensure_ascii=True))
+        frappe.db.commit()
+
+
+def implement_node(state: dict) -> dict:
+    """Implement one ready task, or repair concrete integration findings."""
     if state.get("error"):
         return {"error": state["error"]}
-    is_follow_up = bool(state.get("is_follow_up"))
-    attempt = (state.get("review_attempts") or 0) + 1
-    logs = _log_stage(
-        state, "Implementing", "started",
-        "Applying follow-up patch" if is_follow_up else f"Applying code changes (attempt {attempt})"
-    )
-
-    app_name = state.get("target_app_name", "")
-    plan_text = _message_content_to_str(state.get("plan", ""))
-    understanding_text = _message_content_to_str(state.get("understanding_summary", ""))
-
-    if is_follow_up:
-        follow_up_message = _message_content_to_str(state.get("follow_up_message", ""))
-        prior_paths = list(state.get("prior_changed_paths") or [])
-        implementation_memory = _message_content_to_str(state.get("implementation_memory", ""))
-        context_paths = list(dict.fromkeys(prior_paths + _extract_file_paths(follow_up_message)))
-        file_contents = _file_manifest(context_paths)
-        prior_files = "\n".join(f"- {p}" for p in context_paths) if context_paths else "- (none recorded)"
-        logs = _log_stage(
-            {**state, "stage_log": logs}, "Implementing", "progress",
-            f"Follow-up context: {len(context_paths)} target files identified"
-        )
-        base_prompt = get_follow_up_implement_prompt(
-            follow_up_message,
-            plan_text,
-            _bounded_text(implementation_memory, MAX_UNDERSTANDING_CONTEXT_CHARS),
-            prior_files,
-            file_contents,
+    active, criteria, allowed = _execution_context(state)
+    dependencies = {d.casefold() for d in active.get("depends_on", [])}
+    completed = [r for r in state.get("task_results", []) if r["task_id"].casefold() in dependencies]
+    ready = {r["task_id"].casefold() for r in completed if r.get("status") in {"implemented", "passed"}}
+    if dependencies - ready:
+        return {"error": "Incomplete dependency: " + ", ".join(sorted(dependencies - ready))}
+    if state.get("integration_mode"):
+        completed = [r for r in state.get("task_results", []) if r["task_id"] != "INTEGRATION"]
+    completed = [{**r, "changed_since_completion": any(
+        revision(_read_current(state, c["path"])) != c["after"] for c in r.get("changes", [])
+    )} for r in completed]
+    logs = _log_stage(state, "Implementing", "started", f"{active['id']}: attempt {state.get('review_attempts', 0) + 1}")
+    task_before = dict(state.get("task_baseline") or {})
+    for path in allowed or []:
+        if path not in task_before:
+            task_before[path] = _read_current(state, path)
+    plan = state["plan_object"]
+    if state.get("is_follow_up"):
+        prompt = get_follow_up_implement_prompt(
+            state.get("follow_up_message", ""), json.dumps(plan, ensure_ascii=True),
+            # The snapshot accumulates across follow-ups up to 50k; unbounded it
+            # trips MAX_TASK_PROMPT_CHARS and fails every later follow-up.
+            _bounded_text(state.get("implementation_memory", ""), MAX_UNDERSTANDING_CONTEXT_CHARS),
+            "\n".join(state.get("prior_changed_paths") or []),
+            _file_manifest(state.get("prior_changed_paths") or []),
             request_name=state.get("request_name"),
         )
     else:
-        all_text = plan_text + "\n" + understanding_text
-        file_paths = _extract_file_paths(all_text)
-        file_contents = _file_manifest(file_paths)
-        logs = _log_stage(
-            {**state, "stage_log": logs}, "Implementing", "progress",
-            f"Identified {len(file_paths)} target files: {', '.join(file_paths[:5])}"
-        )
-        base_prompt = get_implement_prompt(
-            plan_text,
-            _bounded_text(understanding_text, MAX_UNDERSTANDING_CONTEXT_CHARS),
-            state.get("user_message", ""),
-            file_contents,
+        # Custom implementation instructions still apply, but receive only the active task.
+        prompt = get_implement_prompt(
+            json.dumps(active, ensure_ascii=True),
+            _bounded_text(state.get("understanding_summary", ""), MAX_UNDERSTANDING_CONTEXT_CHARS),
+            state.get("user_message", ""), _file_manifest(allowed or []),
             request_name=state.get("request_name"),
         )
-        review_notes = (state.get("review_notes") or "").strip()
-        if attempt > 1 and review_notes:
-            base_prompt += f"""
-
-## PRIOR REVIEW FINDINGS — FIX THESE NOW
-The last test stage failed. Fix every issue listed below before doing anything else.
-Focus on the exact files and problems described; do not add new features.
-
-{review_notes}
-"""
-
-    updates = _run_agent_turn(state, "Implementing", base_prompt, read_only_tools=False, max_rounds=MAX_TOOL_ROUNDS_EXECUTION)
-    if updates.get("error"):
-        logs = _log_stage({**state, "stage_log": logs}, "Implementing", "failed", updates["error"][:200])
-        updates["stage_log"] = logs
-        return updates
-
-    tool_edited = updates.pop("_tool_edited_paths", [])
+    prompt += "\n\n## EXECUTION CONTRACT (authoritative)\n" + json.dumps({
+        "overview": plan.get("overview", ""), "scope": plan.get("scope", {}),
+        "active_task": active, "dependency_results": completed,
+        "acceptance_criteria": criteria,
+    }, ensure_ascii=True)
+    prompt += (
+        "\nImplement only the active task. Read its context_refs from the CURRENT files; "
+        "line numbers may have shifted. Dependency reports are implementation claims, not proof. "
+        "Do not execute other tasks. If approved scope is insufficient, report the blocker. "
+        "Preserve the dependency behavior across files and languages; verify shared input/output examples. "
+        "Do not claim runtime tests ran when only static checks are available."
+    )
+    dependency_ids = {r["task_id"].casefold() for r in completed}
+    dependency_paths = list(dict.fromkeys(p for task in state["execution_tasks"]
+        if task["id"].casefold() in dependency_ids for p in task["files"]))
+    if dependency_paths:
+        prompt += "\n\n## CURRENT DEPENDENCY SOURCE\n" + source_context(
+            dependency_paths, lambda p: _read_current(state, p), state.get("execution_baseline"), limit=8000)
+    prompt += (
+        '\nReturn ONLY a JSON completion report: {"status":"complete","summary":"Actual changes",'
+        '"behavior":["path:symbol, rule and concrete input/output example for dependents"],'
+        '"verification":["Checks actually performed, with outcomes"],"unverified":["Remaining uncertainty"]}. '
+        'Use status "blocked" if scope or missing information prevents completion. '
+        'List all unresolved work; do not claim complete after a forced call-limit summary. '
+        'Verification and unverified may be empty arrays; behavior must describe the completed contract. '
+        'This JSON format overrides any summary-format instructions above.'
+    )
+    if state.get("integration_mode"):
+        prompt += "\nThis is an integration repair: fix only the findings below; do not rebuild completed tasks."
+    if state.get("review_notes"):
+        prompt += "\n\n## FINDINGS TO REPAIR\n" + state["review_notes"]
+    updates = _run_agent_turn(
+        {**state, "allowed_write_paths": allowed}, "Implementing", prompt,
+        read_only_tools=False,
+        max_rounds=MAX_TOOL_ROUNDS_REPAIR if state.get("review_attempts") else MAX_TOOL_ROUNDS_EXECUTION,
+    )
+    before = updates.pop("_write_baseline", {})
+    updates.pop("_tool_edited_paths", None)
+    global_before = dict(state.get("execution_baseline") or {})
+    for path, content in before.items():
+        task_before.setdefault(path, content)
+        global_before.setdefault(path, content)
+    # Include approved files even for no-op tasks; the reviewer must verify them.
+    for path, content in task_before.items():
+        global_before.setdefault(path, content)
+    edits, _ = change_evidence(global_before, lambda p: _read_current(state, p))
     steps = updates.get("intermediate_steps") or []
-    last_out = _message_content_to_str(steps[-1].get("output", "") if steps else "")
-    # Only keep summary-mentioned paths that actually exist on disk — the model
-    # often names files it merely considered, which would otherwise be recorded
-    # as phantom edits and break validation ("Not a file").
-    text_paths = [p for p in _extract_file_paths(last_out) if _app_file_exists(app_name, p)]
-
-    all_paths = list(dict.fromkeys(tool_edited + text_paths))
-
-    edits = list(state.get("edits_made") or [])
-    for p in all_paths:
-        if not any(e.get("path") == p for e in edits):
-            edits.append({"path": p, "summary": "Modified"})
-    if not all_paths:
-        edits.append({"summary": last_out[:300]})
-    updates["edits_made"] = edits
-    updates["change_summary"] = _extract_change_summary(last_out)
-
-    logs = _log_stage(
-        {**state, "stage_log": logs}, "Implementing", "progress",
-        f"Files edited: {', '.join(all_paths[:8]) if all_paths else 'see summary'}"
-    )
-
-    # Local syntax gate. If real syntax errors exist, try to auto-fix them by
-    # feeding the exact errors back to the model, then re-check — instead of
-    # failing the whole run on the first broken edit.
-    syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
-    fix_state = {
-        **state,
-        "tokens_used": updates.get("tokens_used", state.get("tokens_used", 0)),
-        "intermediate_steps": updates.get("intermediate_steps") or [],
-        "stage_log": logs,
-    }
-    attempt = 0
-    while not syntax_ok and attempt < MAX_SYNTAX_FIX_ATTEMPTS:
-        attempt += 1
-        logs = _log_stage(
-            {**state, "stage_log": logs}, "Implementing", "progress",
-            f"Auto-fixing syntax errors (attempt {attempt})"
-        )
-        fix_state["stage_log"] = logs
-        fix_prompt = (
-            "One or more files you just edited have SYNTAX ERRORS. Fix ONLY these "
-            "errors now. For each affected file: read it to see the current state, "
-            "correct the syntax with replace_lines/insert_lines/edit_file, then call "
-            "validate_code on it to confirm it passes. Do NOT change unrelated code "
-            "and do NOT create any new files.\n\n"
-            f"## SYNTAX ERRORS TO FIX\n{syntax_report}"
-        )
-        fix_updates = _run_agent_turn(
-            fix_state, "Implementing", fix_prompt,
-            read_only_tools=False, max_rounds=MAX_TOOL_ROUNDS_SYNTAX_FIX,
-        )
-        # Carry forward token/step accounting whatever the outcome.
-        fix_state["tokens_used"] = fix_updates.get("tokens_used", fix_state["tokens_used"])
-        fix_state["intermediate_steps"] = fix_updates.get("intermediate_steps") or fix_state["intermediate_steps"]
-        updates["tokens_used"] = fix_state["tokens_used"]
-        updates["intermediate_steps"] = fix_state["intermediate_steps"]
-        if fix_updates.get("error"):
-            break
-        for p in fix_updates.pop("_tool_edited_paths", []):
-            if not any(e.get("path") == p for e in edits):
-                edits.append({"path": p, "summary": "Modified (syntax fix)"})
-        updates["edits_made"] = edits
-        syntax_ok, syntax_report = _syntax_check_edits(app_name, edits)
-
-    if not syntax_ok:
-        logs = _log_stage(
-            {**state, "stage_log": logs}, "Implementing", "failed",
-            f"Syntax check failed: {syntax_report[:150]}"
-        )
-        updates["error"] = (
-            "Implementation produced invalid syntax that could not be auto-fixed:\n"
-            f"{syntax_report[:1000]}"
-        )
-        updates["stage_log"] = logs
-        return updates
-
-    logs = _log_stage(
-        {**state, "stage_log": logs}, "Implementing", "completed",
-        "Changes applied and syntax validated"
-        + (f" (auto-fixed on attempt {attempt})" if attempt else "")
-    )
-    updates["stage_log"] = logs
+    output = steps[-1].get("output", "") if steps else ""
+    completion = completion_report(output)
+    updates.update({
+        "task_baseline": task_before, "execution_baseline": global_before,
+        "edits_made": edits,
+        "task_completion": completion,
+        "task_summary": completion.get("summary", _bounded_text(output, 4000)),
+        "stage_log": _log_stage({**state, "stage_log": logs}, "Implementing", "completed" if not updates.get("error") else "failed",
+                                f"{active['id']}: {len(edits)} total changed file(s); review pending"),
+    })
     return updates
 
 
 def review_node(state: dict) -> dict:
-    """Test the implementation for clean code and Frappe standards."""
+    """Gate completed tasks; independently review no-ops and final integration."""
     if state.get("error"):
+        _persist_task_results(state)
         return {"error": state["error"]}
-    logs = _log_stage(state, "Reviewing", "started", "Testing implementation quality")
-    edits = state.get("edits_made", [])
-    app_name = state.get("target_app_name", "")
-    base_branch = state.get("base_branch", "")
-    branch_name = state.get("branch_name", "")
-    attempt = (state.get("review_attempts") or 0) + 1
-
-    health = run_health_checks(app_name, edits)
-
-    if not health.passed:
-        # A real, mechanical failure — no ambiguity, no need for an LLM
-        # opinion. Same retry/error semantics as before.
-        report = health.summary()
-        updates = {
-            "review_passed": False,
-            "review_notes": report[:1000],
-            "review_attempts": attempt,
-        }
-        logs = _log_stage(
-            {**state, "stage_log": logs}, "Reviewing", "completed",
-            f"Testing FAILED (health check): {report[:120]}"
-        )
-        if attempt >= MAX_REVIEW_ATTEMPTS:
-            updates["error"] = f"Health checks failed after {attempt} test attempt(s)."
-        updates["stage_log"] = logs
-        return updates
-
-    decision = needs_llm_review(app_name, base_branch, branch_name, edits)
-    if not decision.needs_llm:
-        # Checks passed, and the change is small/low-risk enough that a
-        # model's judgment isn't worth the tokens for this run.
-        updates = {
-            "review_passed": True,
-            "review_notes": f"Mechanical checks passed; LLM review skipped ({decision.reason}).",
-            "review_attempts": attempt,
-        }
-        logs = _log_stage(
-            {**state, "stage_log": logs}, "Reviewing", "completed",
-            f"Testing PASSED (mechanical only — {decision.reason})"
-        )
-        updates["stage_log"] = logs
-        return updates
-
-    # Checks passed, but size/risk says this is worth a model's attention —
-    # run the existing LLM review, informed by what's already been verified
-    # so it doesn't spend rounds re-checking syntax/JSON/imports/wiring.
-    prompt = get_review_prompt(edits, state.get("user_message", ""), request_name=state.get("request_name"))
-    short_report = "\n".join(health.summary().splitlines()[:6])
-    prompt += (
-        "\n\n## LOCAL HEALTH CHECKS (already passed)\n"
-        f"{short_report}\n"
-        f"## WHY THIS NEEDS REVIEW\n{decision.reason}\n"
-        "Do not re-verify syntax, JSON validity, imports, or wiring — focus on logic and quality."
+    active, criteria, allowed = _execution_context(state)
+    integration = bool(state.get("integration_mode"))
+    logs = _log_stage(state, "Reviewing", "started", f"Reviewing {active['id']}")
+    baseline = state.get("execution_baseline") if integration else state.get("task_baseline")
+    changes, diff = change_evidence(baseline or {}, lambda p: _read_current(state, p))
+    paths = list(dict.fromkeys((allowed or []) + [e["path"] for e in changes]))
+    reviewed_content = {p: _read_current(state, p) for p in paths}
+    # Task-local checks must not reject temporarily incomplete cross-task wiring.
+    if integration or state.get("is_follow_up"):
+        health = run_health_checks(state["target_app_name"], [{"path": p} for p in paths])
+    else:
+        health = run_task_checks(state["target_app_name"], paths)
+    health.results.extend(
+        CheckResult(f"exists:{p}", False, "Approved task file is missing")
+        for p in paths if not _app_file_exists(state["target_app_name"], p)
     )
-    updates = _run_agent_turn(state, "Reviewing", prompt, read_only_tools=True, max_rounds=MAX_TOOL_ROUNDS_REVIEW)
-    if updates.get("error"):
-        logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "failed", updates["error"][:200])
-        updates["stage_log"] = logs
-        return updates
-
-    steps = updates.get("intermediate_steps") or []
-    last_out = _message_content_to_str(steps[-1].get("output", "") if steps else "")
-    passed, notes = _parse_review_verdict(last_out)
-    updates["review_passed"] = passed
-    updates["review_notes"] = notes[:1200]
-    updates["review_attempts"] = attempt
-
-    result_msg = "Testing PASSED" if passed else f"Testing FAILED: {notes[:100]}"
-    logs = _log_stage({**state, "stage_log": logs}, "Reviewing", "completed", result_msg)
-    if not passed and attempt >= MAX_REVIEW_ATTEMPTS:
-        updates["error"] = f"Review failed after {attempt} attempt(s)."
-    updates["stage_log"] = logs
+    attempt = state.get("review_attempts", 0) + 1
+    updates = {}
+    completion = completion_report(json.dumps(state.get("task_completion") or {}))
+    gate_only = False
+    if not health.passed:
+        passed, notes = False, health.summary()
+    elif state.get("turn_exhausted"):
+        passed, notes = False, "Implementation reached its call limit without finishing. Inspect current changes and complete the active task."
+        # A blocked report from the forced final call says what is left; hand
+        # it to the retry instead of making it rediscover the state.
+        remaining = [completion.get("summary", "")] + list(completion.get("unverified") or [])
+        remaining = [item for item in remaining if isinstance(item, str) and item.strip()]
+        if completion.get("status") == "blocked" and remaining:
+            notes += " Reported remaining work: " + " | ".join(remaining)[:1500]
+    elif (not integration or state.get("review_attempts", 0) > 0) and completion.get("status") != "complete":
+        passed, notes = False, "Implementation did not return a valid complete JSON report. Finish the task and report its behavior and verification."
+        if completion.get("status") == "blocked":
+            notes = "Implementation blocked: " + completion["summary"]
+            updates["error"] = notes
+    elif not integration and not state.get("is_follow_up") and changes:
+        # Completion + mechanical checks gate dependency progress. Semantic
+        # correctness is deliberately deferred, never recorded as reviewed.
+        gate_only = True
+        passed, notes = True, "Task completion and static checks passed; semantic review pending final integration."
+    else:
+        prompt = get_review_prompt(
+            [{"path": p} for p in paths], state.get("follow_up_message") or state.get("user_message", ""),
+            request_name=state.get("request_name"),
+        )
+        prompt += "\n\n## REVIEW CONTRACT (authoritative)\n" + json.dumps({
+            "phase": "final integration" if integration else "task review (including no-op verification)",
+            "active_task": active,
+            "criteria": [{"criterion": i, "requirement": c} for i, c in enumerate(criteria, 1)],
+            "implementation_claims": state.get("task_results", []) if integration else [completion],
+            "remaining_tasks": [] if integration else [
+                {key: task[key] for key in ("id", "goal", "files", "acceptance_criteria", "depends_on")}
+                for task in state["execution_tasks"][state["task_index"] + 1:]
+            ],
+        }, ensure_ascii=True)
+        prompt += "\n\n## ACTUAL CHANGES\n" + diff
+        prompt += "\n\n## CURRENT SOURCE EVIDENCE\n" + source_context(paths, reviewed_content.get, baseline)
+        prompt += "\n\n## STATIC CHECKS\n" + health.summary()
+        prompt += (
+            "\nInspect current source and relevant dependencies to assess every criterion. "
+            "A task review covers this task's obligations; wiring assigned to a remaining task "
+            "is checked at integration. Final integration must inspect interactions and recheck "
+            "earlier criteria against final source. Trace connected behavior through callers, "
+            "document lifecycle/persistence, queries and consumers where relevant; isolated function "
+            "checks do not establish the connected result. Compare shared algorithms and concrete "
+            "input/output examples across languages. Do not invent requirements outside the approved scope. "
+            "Static checks do not prove runtime behavior. Evidence must cite current paths/symbols "
+            "and distinguish source inspection from executed tests. Implementation claims are not proof. "
+            "Truncated excerpts or missing context are requests to use your read-only tools, not code defects. "
+            "You cannot run a browser, a server or a test suite here. Criteria about runtime, UI or "
+            "interaction behavior are judged by tracing the source path that produces that behavior: "
+            'mark them "satisfied" or "unmet" from that trace and say in the evidence text that the runtime '
+            "was not exercised. Never fail a criterion only because no live test or screenshot was supplied. "
+            'Return ONLY JSON: {"review_passed":true,"issues":[],"evidence":'
+            '[{"criterion":1,"status":"satisfied","evidence":"path:symbol and concrete evidence"}]}. '
+            'Include exactly one entry per numbered criterion. Use status "unmet" with actionable issues '
+            'for an observed defect. Use "unverified" only for current source your read-only tools can '
+            "still fetch and you have not read yet; it is never the answer for behavior that cannot be "
+            "executed in this environment. Either requires review_passed false. First fetch missing "
+            "source with tools. Do not ask implementation to change code merely because you lack evidence."
+        )
+        decision, notes = "invalid", ""
+        prior_unmet = set()
+        # The recovery pass continues the first pass's retained tool rounds, so
+        # its smaller round budget is spent on reads that have not happened yet.
+        history: dict = {}
+        for recovery in range(2):
+            updates = _run_agent_turn(
+                {**state, **updates}, "Reviewing", prompt, read_only_tools=True,
+                max_rounds=MAX_TOOL_ROUNDS_REVIEW if recovery == 0 else MAX_TOOL_ROUNDS_REVIEW_RECOVERY,
+                history=history,
+            )
+            updates.pop("_write_baseline", None)
+            updates.pop("_tool_edited_paths", None)
+            steps = updates.get("intermediate_steps") or []
+            output = steps[-1].get("output", "") if steps else ""
+            payload = _extract_review_json(output)
+            decision, notes = review_decision(payload, criteria)
+            if prior_unmet and decision != "invalid":
+                now_satisfied = {e["criterion"] for e in payload["evidence"] if e["status"] == "satisfied"}
+                resolved = payload.get("resolved_findings", [])
+                valid_resolutions = isinstance(resolved, list) and all(
+                    isinstance(item, dict) and type(item.get("criterion")) is int
+                    and isinstance(item.get("explanation"), str) and item["explanation"].strip()
+                    for item in resolved
+                )
+                resolved_ids = {item["criterion"] for item in resolved} if valid_resolutions else set()
+                if (prior_unmet & now_satisfied) - resolved_ids:
+                    decision, notes = "invalid", "Invalid review result: earlier concrete findings need explicit resolution evidence."
+            if updates.get("turn_exhausted") and not updates.get("error") and decision in {"pass", "repair"}:
+                # The forced no-tools final call still produced a complete,
+                # well-formed verdict. Reaching the round cap is not a reason
+                # to discard it; only an incomplete or invalid verdict is.
+                updates["turn_exhausted"] = False
+                _publish_agent_log(state.get("request_name", ""), "review_verdict_after_cap",
+                                   decision=decision, recovery=recovery)
+            if updates.get("error") or updates.get("turn_exhausted"):
+                notes = updates.get("error") or "Reviewer exhausted its call limit; verification is incomplete."
+                updates["error"] = notes
+                decision = "needs_evidence"
+                break
+            if decision not in {"invalid", "needs_evidence"}:
+                break
+            if recovery == 0:
+                entries = payload.get("evidence", []) if isinstance(payload, dict) else []
+                # A malformed envelope may still contain a valid concrete finding.
+                prior_unmet = {e["criterion"] for e in entries if isinstance(e, dict)
+                    and type(e.get("criterion")) is int and 1 <= e["criterion"] <= len(criteria)
+                    and e.get("status") == "unmet"} if isinstance(entries, list) else set()
+                prompt += (
+                    "\n\n## REVIEWER RECOVERY\n"
+                    "Your previous verdict needs evidence or format correction. The tool results from "
+                    "your first pass are retained in this conversation; do not re-read them. Use read-only "
+                    "tools only for current source you have not fetched yet, preserve all concrete findings, "
+                    "then return the complete verdict. Runtime, UI or interaction criteria are judged from "
+                    "the source trace, never left unverified for lack of a live test. "
+                    "Do not send missing evidence to implementation. "
+                    'If any earlier unmet criterion becomes satisfied, include resolved_findings '
+                    '[{"criterion":1,"explanation":"Current source evidence resolving the earlier finding"}]. '
+                    "Every concrete finding must remain or be explicitly resolved.\n"
+                    + output
+                )
+        passed = decision == "pass" and not updates.get("error")
+        if decision in {"invalid", "needs_evidence"} and not updates.get("error"):
+            updates["error"] = "Reviewer could not resolve " + (
+                "missing evidence" if decision == "needs_evidence" else "invalid verdict format"
+            ) + " after a read-only recovery attempt."
+    if passed and any(_read_current(state, p) != content for p, content in reviewed_content.items()):
+        passed, notes = False, "Files changed during review. Verify current source again before accepting this task."
+        updates["error"] = notes
+    updates.update({"review_passed": passed, "review_notes": notes, "review_attempts": attempt})
+    if not passed and attempt >= MAX_REVIEW_ATTEMPTS and not updates.get("error"):
+        updates["error"] = f"{active['id']} failed review after {attempt} attempts: {notes[:1000]}"
+    results = list(state.get("task_results") or [])
+    result = {
+        "task_id": active["id"], "status": ("implemented" if gate_only else "passed") if passed else "failed",
+        "attempts": attempt, "summary": state.get("task_summary", ""),
+        "behavior": completion.get("behavior", []),
+        "verification": completion.get("verification", []),
+        "unverified": completion.get("unverified", []),
+        "changes": changes, "review": notes,
+    }
+    results = [r for r in results if r["task_id"] != active["id"]] + [result]
+    updates["task_results"] = results
+    updates["change_summary"] = "\n\n".join(f"{r['task_id']}: {r['summary']}" for r in results if r.get("summary"))
+    updates["stage_log"] = _log_stage({**state, "stage_log": logs}, "Reviewing", "completed",
+                                       f"{active['id']}: {'implemented; final review pending' if gate_only else ('passed' if passed else 'failed')}")
+    _persist_task_results({**state, **updates})
     return updates
+
+
+def advance_task_node(state: dict) -> dict:
+    active = state["execution_tasks"][state["task_index"]]
+    completed = any(r.get("task_id") == active["id"] and r.get("status") in {"implemented", "passed"}
+                    for r in state.get("task_results", []))
+    if state.get("error") or state.get("turn_exhausted") or not state.get("review_passed") or not completed:
+        return {"error": state.get("error") or "Cannot advance an unfinished task.", "review_passed": False}
+    index = state["task_index"] + 1
+    integration = index >= len(state["execution_tasks"])
+    return {
+        "task_index": index, "integration_mode": integration,
+        "task_baseline": {}, "review_attempts": 0, "review_notes": "",
+        "review_passed": False, "turn_exhausted": False, "task_summary": "", "task_completion": {},
+    }
 
 
 def _get_bench_env() -> dict:
@@ -1436,11 +1582,11 @@ def _get_bench_env() -> dict:
 def should_retry_implement(state: dict) -> str:
     if state.get("error"):
         return "done"
-    if state.get("review_passed"):
+    if not state.get("review_passed"):
+        return "implement"
+    if state.get("integration_mode") or state.get("is_follow_up"):
         return "done"
-    if (state.get("review_attempts") or 0) >= MAX_REVIEW_ATTEMPTS:
-        return "done"
-    return "implement"
+    return "advance"
 
 
 # ---------------------------------------------------------------------------
@@ -1464,19 +1610,19 @@ def build_planning_graph():
 
 
 def build_execution_graph():
-    """
-    Constructs the state machine for the Implementation Phase.
-    Flow: Implement Changes → Review/Testing → (Retry if needed).
-    """
+    """Sequential implementation/gates, bounded repair, final semantic review."""
     workflow = StateGraph(AgentState)
+    workflow.add_node("prepare", prepare_execution_node)
     workflow.add_node("implement", implement_node)
     workflow.add_node("review", review_node)
-
-    workflow.set_entry_point("implement")
+    workflow.add_node("advance", advance_task_node)
+    workflow.set_entry_point("prepare")
+    workflow.add_edge("prepare", "implement")
     workflow.add_edge("implement", "review")
     workflow.add_conditional_edges("review", should_retry_implement, {
-        "implement": "implement",
-        "done": END,
+        "implement": "implement", "advance": "advance", "done": END,
     })
-
+    workflow.add_conditional_edges("advance", lambda s: "review" if s["integration_mode"] else "implement", {
+        "review": "review", "implement": "implement",
+    })
     return workflow.compile()

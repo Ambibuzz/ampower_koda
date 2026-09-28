@@ -5,11 +5,14 @@ import json
 import os
 import subprocess
 from functools import wraps
+from pathlib import Path
 
 import frappe
 from frappe import _
 
 from ampower_koda.agent.errors import log_agent_error
+from ampower_koda.agent.execution_contract import load_plan
+from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdown
 from ampower_koda.agent.executor import (
     _generate_patch_diff,
     _update_status,
@@ -27,7 +30,8 @@ from ampower_koda.agent.git_ops import (
     list_changed_files,
     run_git,
 )
-from ampower_koda.agent.graph import _get_bench_env
+from ampower_koda.agent.graph import _app_file_exists, _get_bench_env
+from ampower_koda.agent import tools as agent_tools
 
 DOCTYPE_NAME = "Agent Request"
 
@@ -35,6 +39,11 @@ DOCTYPE_NAME = "Agent Request"
 RESTARTABLE_STATUSES = (
     "Queued", "Failed", "Cancelled", "Completed",
     "Awaiting Approval", "Awaiting Push Approval",
+)
+
+# Statuses from which the saved structured plan may be edited or (re)executed.
+PLAN_EXECUTABLE_STATUSES = (
+    "Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval",
 )
 
 # Statuses where the agent is actively working, so manual actions must wait.
@@ -171,6 +180,9 @@ def start_agent(request_name: str):
         "error_log": "",
         "stage_log": "",
         "agent_plan": "",
+        "plan_json": "",
+        "approved_plan_json": "",
+        "execution_results": "",
         "bench_log": "",
         "patch_diff": "",
         "conversation_log": "",
@@ -217,6 +229,10 @@ def submit_follow_up(request_name: str, follow_up_message: str):
     if not (doc.branch_name or "").strip():
         frappe.throw(_("Follow-up fix needs an existing branch on this request."))
 
+    try:
+        load_plan(doc.get("approved_plan_json"))
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
     _validate_provider_key(doc)
 
     follow_up = (follow_up_message or "").strip()
@@ -246,6 +262,21 @@ def submit_follow_up(request_name: str, follow_up_message: str):
     return {"status": "ok", "message": _("Follow-up patch started on existing branch (plan preserved).")}
 
 
+def _approve_structured_plan(doc, value=None):
+    """Persist a canonical approval snapshot; Markdown can never override it."""
+    doc.check_permission("write")
+    try:
+        plan = load_plan(doc.get("plan_json") if value is None else value)
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+    frappe.db.set_value(DOCTYPE_NAME, doc.name, {
+        "plan_json": json.dumps(plan, ensure_ascii=True),
+        "approved_plan_json": json.dumps(plan, ensure_ascii=True),
+        "agent_plan": plan_to_markdown(plan),
+        "execution_results": "",
+    })
+
+
 @frappe.whitelist()
 @_whitelist_logged
 def execute_existing_plan(request_name: str):
@@ -257,15 +288,13 @@ def execute_existing_plan(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    if not (doc.agent_plan or "").strip():
-        frappe.throw(_("No plan found for this request."))
 
     # Implementation can only start if we are at the approval stage or have finished a previous run.
-    allowed = ("Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval")
-    if doc.status not in allowed:
+    if doc.status not in PLAN_EXECUTABLE_STATUSES:
         frappe.throw(_("Cannot execute plan. Agent status is {0}.").format(doc.status))
 
     _validate_provider_key(doc)
+    _approve_structured_plan(doc)
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, {
         "status": "Implementing",
@@ -287,10 +316,10 @@ def execute_existing_plan(request_name: str):
 
 @frappe.whitelist()
 @_whitelist_logged
-def approve_plan(request_name: str, edited_plan: str = None):
+def approve_plan(request_name: str, plan_json: str = None):
     """
     Confirms the plan and begins the implementation phase.
-    You can optionally provide an edited version of the plan if you made manual adjustments.
+    You can optionally provide edited structured JSON before approval.
     """
     if not request_name:
         frappe.throw(_("Request name is required."))
@@ -299,12 +328,8 @@ def approve_plan(request_name: str, edited_plan: str = None):
     if doc.status != "Awaiting Approval":
         frappe.throw(_("Cannot approve plan. Agent status is {0}.").format(doc.status))
 
-    plan_to_run = (edited_plan or doc.agent_plan or "").strip()
-    if not plan_to_run:
-        frappe.throw(_("No plan found for this request."))
-
-    if edited_plan is not None and edited_plan.strip():
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", edited_plan.strip()[:50000])
+    _validate_provider_key(doc)
+    _approve_structured_plan(doc, plan_json)
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, {
         "status": "Implementing",
@@ -343,6 +368,179 @@ def reject_plan(request_name: str):
     }, user=doc.owner)
 
     return {"status": "ok", "message": _("Plan rejected.")}
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def suggest_task_context(request_name: str, query: str):
+    """Rank code spans for a task the user is drafting, with the retriever the
+    planner used and no model call.
+
+    Indexing a large app takes tens of seconds, so the work runs as a job and the
+    result arrives on the ``agent_task_suggestions`` realtime event carrying the
+    returned token, which the form matches to its open dialog.
+    """
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    if not (query or "").strip():
+        frappe.throw(_("Describe the task first."))
+    token = frappe.generate_hash(length=12)
+    # Same queue as planning: the worker that just indexed the app for the plan
+    # still holds that session, and a search on it is milliseconds, not a rebuild.
+    frappe.enqueue(
+        "ampower_koda.agent.executor.run_context_suggestion",
+        queue="default",
+        timeout=600,
+        request_name=request_name,
+        query=query.strip()[:2000],
+        token=token,
+        user=frappe.session.user,
+    )
+    return {"status": "ok", "token": token}
+
+
+def _peer_file(app_name: str, new_path: str) -> str:
+    """Nearest existing file with the same extension: same folder, then upward.
+
+    A new file's pattern is its closest sibling — the same rule the plan prompt
+    gives the model — so a task written by someone who cannot name one still
+    hands the implementer something to copy.
+    """
+    root = Path(agent_tools._app_root(app_name))
+    new_file = Path(new_path)
+    directory = root / new_file.parent
+    while True:
+        if directory.is_dir():
+            peers = sorted(
+                p for p in directory.rglob(f"*{new_file.suffix}")
+                if p.is_file() and p.name != "__init__.py" and p != root / new_file
+            )
+            if peers:
+                return peers[0].relative_to(root).as_posix()
+        if directory == root or root not in directory.parents:
+            return ""
+        directory = directory.parent
+
+
+def _default_context_refs(app_name: str, files: list[str]) -> list[dict]:
+    """Whole-file refs: the file itself when it exists, else a peer to copy from."""
+    refs: dict[str, str] = {}
+    for path in files:
+        if _app_file_exists(app_name, path):
+            refs.setdefault(path, "Task target file")
+        elif peer := _peer_file(app_name, path):
+            refs.setdefault(peer, f"Existing peer file supplying the pattern for {path}")
+    return [{"path": p, "start": 0, "end": 0, "symbol": "", "why": why} for p, why in refs.items()]
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def save_plan_task(request_name: str, task: str):
+    """Add or replace one task in the structured plan.
+
+    The whole plan is re-validated, including dependency order and that MODIFY
+    paths exist, so a hand-written task can never reach approval in a shape the
+    executor would reject.
+    """
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    if doc.status not in PLAN_EXECUTABLE_STATUSES:
+        frappe.throw(_("Tasks cannot be edited while the agent is busy (status: {0}).").format(doc.status))
+
+    try:
+        plan = load_plan(doc.get("plan_json"))
+        incoming = task if isinstance(task, dict) else json.loads(task or "")
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+    except (TypeError, ValueError):
+        frappe.throw(_("Task must be a JSON object."))
+    if not isinstance(incoming, dict):
+        frappe.throw(_("Task must be a JSON object."))
+
+    tasks = list(plan["tasks"])
+    task_id = (incoming.get("id") or "").strip()
+    if not task_id:
+        task_id = f"TODO {1 + max((int(t['id'].split()[1]) for t in tasks), default=0)}"
+    incoming = {**incoming, "id": task_id}
+    if not incoming.get("context_refs"):
+        incoming["context_refs"] = _default_context_refs(doc.target_app_name, incoming.get("files") or [])
+    position = next((i for i, t in enumerate(tasks) if t["id"] == task_id), None)
+    if position is None:
+        tasks.append(incoming)
+    else:
+        tasks[position] = incoming
+
+    try:
+        plan = load_plan(
+            {**plan, "tasks": tasks},
+            path_exists=lambda path: _app_file_exists(doc.target_app_name, path),
+        )
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        "plan_json": json.dumps(plan, ensure_ascii=True),
+        "agent_plan": plan_to_markdown(plan),
+    })
+    return {"status": "ok", "task_id": task_id, "plan": plan}
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def remove_plan_task(request_name: str, task_id: str):
+    """Remove one task from the structured plan.
+
+    Task ids must stay the contiguous sequence TODO 1..N, so every later task is
+    renumbered and every ``depends_on`` reference is rewritten to match. Tasks
+    that depended on the removed one simply lose that dependency; the whole plan
+    is then re-validated, so a shared-file ordering the removed task provided is
+    reported to the user rather than silently lost.
+    """
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    if doc.status not in PLAN_EXECUTABLE_STATUSES:
+        frappe.throw(_("Tasks cannot be edited while the agent is busy (status: {0}).").format(doc.status))
+
+    try:
+        plan = load_plan(doc.get("plan_json"))
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+
+    tasks = list(plan["tasks"])
+    wanted = (task_id or "").strip().casefold()
+    position = next((i for i, t in enumerate(tasks) if t["id"].casefold() == wanted), None)
+    if position is None:
+        frappe.throw(_("Task {0} is not in the plan.").format(task_id))
+    if len(tasks) == 1:
+        frappe.throw(_("A plan needs at least one task. Edit this task or reject the plan instead."))
+
+    removed = tasks.pop(position)
+    renamed = {t["id"].casefold(): f"TODO {index + 1}" for index, t in enumerate(tasks)}
+    dependents = []
+    for task in tasks:
+        kept = [d for d in task["depends_on"] if d.casefold() != wanted]
+        if len(kept) != len(task["depends_on"]):
+            dependents.append(task["id"])
+        task["depends_on"] = [renamed.get(d.casefold(), d) for d in kept]
+        task["id"] = renamed[task["id"].casefold()]
+
+    try:
+        plan = load_plan(
+            {**plan, "tasks": tasks},
+            path_exists=lambda path: _app_file_exists(doc.target_app_name, path),
+        )
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        "plan_json": json.dumps(plan, ensure_ascii=True),
+        "agent_plan": plan_to_markdown(plan),
+    })
+    return {
+        "status": "ok", "removed": removed["id"],
+        "dependents_updated": [renamed[d.casefold()] for d in dependents],
+        "plan": plan,
+    }
 
 
 @frappe.whitelist()
@@ -575,6 +773,22 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
         "status": "ok" if not failed else "error",
         "failed": failed,
         "log": bench_log,
+    }
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def get_model_defaults():
+    """Provider and model configured in Agent Settings, for the request form.
+
+    The form's suggestion list is a static catalogue; without this a model saved
+    in Settings is never offered on a request, and a request's own default comes
+    from that catalogue instead of from Settings. No secrets are returned.
+    """
+    settings = frappe.get_single("Agent Settings")
+    return {
+        "provider": (settings.default_ai_provider or "OpenAI").strip(),
+        "model": (settings.default_ai_model or "").strip(),
     }
 
 

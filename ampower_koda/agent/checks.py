@@ -1,9 +1,8 @@
 """Real, mechanical Frappe health checks — run before any LLM review.
 
-Four checks, each independent and each returning a plain pass/fail plus a
-short human-readable reason. If every check passes, review_node decides
-whether the change is small/safe enough to skip the LLM call too — see
-``needs_llm_review`` below.
+Task checks cover syntax and JSON. Final integration also checks imports and
+wiring, once all dependent tasks have been implemented. Mechanical checks do
+not replace review against the approved acceptance criteria.
 
 This module never raises on a single bad file — one broken edit should not
 crash the whole check pass. Every checker catches its own exceptions and
@@ -17,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 
 import frappe
 
@@ -83,6 +83,11 @@ def run_health_checks(app_name: str, edits: list[dict]) -> HealthReport:
     results.extend(_import_checks(app_name, paths))
     results.extend(_wiring_checks(app_name, paths))
     return HealthReport(results)
+
+
+def run_task_checks(app_name: str, paths: list[str]) -> HealthReport:
+    """Check an intermediate task without requiring later tasks' wiring."""
+    return HealthReport(_syntax_checks(app_name, paths) + _json_checks(app_name, paths))
 
 
 # ---------------------------------------------------------------------------
@@ -172,13 +177,17 @@ def _import_checks(app_name: str, paths: list[str]) -> list[CheckResult]:
         if module_name is None:
             continue
 
-        proc = subprocess.run(
-            ["python3", "-c", f"import {module_name}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            cwd=frappe.get_bench_path() if hasattr(frappe, "get_bench_path") else None,
-        )
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", f"import {module_name}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd=frappe.get_bench_path() if hasattr(frappe, "get_bench_path") else None,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            results.append(CheckResult(f"import:{path}", False, str(exc)))
+            continue
         if proc.returncode == 0:
             results.append(CheckResult(f"import:{path}", True))
         else:
@@ -189,12 +198,12 @@ def _import_checks(app_name: str, paths: list[str]) -> list[CheckResult]:
 
 
 def _module_name_for(app_name: str, relative_path: str) -> str | None:
-    """Turn ``app/module/file.py`` into ``app.module.file`` for ``import``."""
+    """Tool paths are relative to the app package, so prefix that package."""
     if not relative_path.endswith(".py"):
         return None
     without_ext = relative_path[: -len(".py")]
-    parts = [p for p in without_ext.split("/") if p]
-    if not parts:
+    parts = [app_name, *without_ext.replace("\\", "/").split("/")]
+    if not all(p.isidentifier() for p in parts):
         return None
     return ".".join(parts)
 
@@ -238,18 +247,36 @@ def _wiring_checks(app_name: str, paths: list[str]) -> list[CheckResult]:
 
 
 def _whitelisted(dotted_method: str) -> tuple[bool, str]:
-    """Confirm ``dotted_method`` exists and is @frappe.whitelist()-decorated."""
+    """Inspect current source, without importing cached or site-dependent code."""
     try:
         module_name, _, func_name = dotted_method.rpartition(".")
         if not module_name:
             return False, "not a fully-qualified method path"
-        module = frappe.get_attr(module_name) if hasattr(frappe, "get_attr") else __import__(module_name, fromlist=["_"])
-        func = getattr(module, func_name, None)
-        if func is None:
+        parts = module_name.split(".")
+        if not all(p.isidentifier() for p in [*parts, func_name]):
+            return False, "invalid Python method path"
+        relative = "/".join(parts[1:])
+        full = _resolve_path(parts[0], relative + ".py") if relative else ""
+        if not full or not os.path.isfile(full):
+            full = _resolve_path(parts[0], (relative + "/" if relative else "") + "__init__.py")
+        with open(full, encoding="utf-8") as source:
+            tree = ast.parse(source.read())
+        frappe_aliases, whitelist_aliases = set(), set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                frappe_aliases.update(a.asname or a.name for a in node.names if a.name == "frappe")
+            elif isinstance(node, ast.ImportFrom) and node.module == "frappe":
+                whitelist_aliases.update(a.asname or a.name for a in node.names if a.name == "whitelist")
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name]
+        if not functions:
             return False, "method not found"
-        if not getattr(func, "whitelisted", False):
-            return False, "found but not @frappe.whitelist()"
-        return True, ""
+        for decorator in functions[-1].decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            if isinstance(target, ast.Name) and target.id in whitelist_aliases:
+                return True, "whitelist decorator found in current source"
+            if isinstance(target, ast.Attribute) and target.attr == "whitelist" and isinstance(target.value, ast.Name) and target.value.id in frappe_aliases:
+                return True, "whitelist decorator found in current source"
+        return False, "could not verify a frappe.whitelist decorator in current source"
     except Exception as e:  # a bad import here is itself a wiring failure, not a crash
         return False, f"could not resolve: {e}"
 

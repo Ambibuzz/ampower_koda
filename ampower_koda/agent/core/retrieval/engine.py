@@ -143,8 +143,13 @@ def _lexical_leg(
             merged[result.position] = merged.get(result.position, 0.0) + contribution
 
     if _looks_weak(retriever.lexical, plan, primary):
+        # Expansion hands back raw BM25 scores, in the tens; the merge above
+        # is in view weights, around one. Scale by the best direct score so a
+        # chunk found only through a symbol's name can add to, but never
+        # outvote, the chunks the query itself matched.
+        scale = primary[0].score if primary else 1.0
         for position, value in _expand(retriever, plan).items():
-            merged[position] = merged.get(position, 0.0) + value
+            merged[position] = merged.get(position, 0.0) + value / scale
 
     ordered = sorted(merged.items(), key=lambda item: (-item[1], item[0]))[:SOURCE_LIMIT]
     hits = tuple(
