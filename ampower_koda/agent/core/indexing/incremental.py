@@ -28,15 +28,16 @@ def apply_overlays(
     applied: list[str] = []
 
     for overlay in _resolve_collisions(overlays):
-        source = SourceFile(
-            path=overlay.path,
-            text=overlay.text,
-            source_hash=source_hash(overlay.text.encode("utf-8")),
-            stat=None,
-        )
         try:
+            # A lone surrogate from an editor buffer cannot be encoded: skipped like a parse failure.
+            source = SourceFile(
+                path=overlay.path,
+                text=overlay.text,
+                source_hash=source_hash(overlay.text.encode("utf-8")),
+                stat=None,
+            )
             index = with_file(index, analyze(source, registry))
-        except ParseError:
+        except (ParseError, UnicodeEncodeError):
             continue
         applied.append(overlay.path)
 
