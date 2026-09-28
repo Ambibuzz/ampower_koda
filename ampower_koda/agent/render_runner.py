@@ -9,6 +9,7 @@ A report built this way let a model find 88-96% of seeded UI bugs, against 67% f
 alone (compare-outputs/browser-lab/FINDINGS.md).
 """
 
+import difflib
 import re
 MAX_STEPS = 20
 DIFF_LINES = 25
@@ -302,5 +303,190 @@ LEAF_CELL = re.compile(r'^\s*- (?:cell|columnheader|gridcell|rowheader)(?: "[^"]
 UNSELECTED_OPTION = re.compile(r'^\s*- option "[^"]*"$')
 NUMBER = re.compile(r"^[^\d\-]{0,4}-?\d[\d,]*(?:\.\d+)?$")
 DATE = re.compile(r"^(\d{2})-(\d{2})-(\d{4})$")
+
+
+def compact(snapshot):
+    """Drop what a row's own name already says (its plain cells) and a drop-down's unselected options."""
+    return "\n".join(line for line in snapshot.splitlines()
+                     if not LEAF_CELL.match(line) and not UNSELECTED_OPTION.match(line))
+
+
+def diff_lines(before, after):
+    old, new = compact(before).splitlines(), compact(after).splitlines()
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        if tag != "equal":
+            removed = ["  - " + line.strip() for line in old[i1:i2]]
+            if len(removed) > REMOVED_SHOWN + 1:
+                # What left was printed when it arrived; closing a panel need not re-print it.
+                removed = removed[:REMOVED_SHOWN] + [f"  - … {len(removed) - REMOVED_SHOWN} more removed lines"]
+            out += removed + ["  + " + line.strip() for line in new[j1:j2]]
+    if len(out) > DIFF_LINES:
+        out = out[:DIFF_LINES] + [f"  … {len(out) - DIFF_LINES} more changed lines"]
+    return out
+
+
+def quote(text, limit=50):
+    return repr(text if len(text) <= limit else text[:limit] + "…")
+
+
+def column_value(text):
+    date = DATE.match(text)
+    if date:
+        return int(date.group(3) + date.group(2) + date.group(1))
+    return float(re.sub(r"[^\d.\-]", "", text)) if NUMBER.match(text) else None
+
+
+def table_readout(before, after):
+    """For each table a step changed: its row count and the order of every numeric or date column."""
+    lines = []
+    for index, table in enumerate(after):
+        old = before[index] if index < len(before) else None
+        if old == table:
+            continue
+        rows = [r for r in table["rows"] if len(r) > 1]
+        was = f" (was {len(old['rows'])})" if old and len(old["rows"]) != len(table["rows"]) else ""
+        orders = []
+        for column, name in enumerate(table["head"]):
+            values = [column_value(r[column]) for r in rows if column < len(r)]
+            if len(values) < 2 or any(v is None for v in values):
+                continue
+            order = ("ascending" if values == sorted(values) else
+                     "descending" if values == sorted(values, reverse=True) else "unsorted")
+            orders.append(f"{name or 'column ' + str(column + 1)} {order}")
+        lines.append(f"  table {index + 1}: {len(table['rows'])} rows{was}" + (f"; {', '.join(orders)}" if orders else ""))
+    return lines
+
+
+def motion_lines(trace, seen, load=False):
+    """What happened while the page settled, beyond its end state. ``seen`` holds endless animations
+    already reported in this check, which are not repeated. During load, loading text is expected to
+    come and go, and content moves while it first renders: only later shifts are reported."""
+    if not trace:
+        return []
+    out, samples = [], trace.get("samples") or []
+    if load:
+        rendered = next((s["t"] for s in samples if len(s["lines"]) > 5), 0)
+        trace = dict(trace, shifts=[s for s in trace.get("shifts") or [] if s["t"] > rendered + 300])
+    if len(samples) > 2 and not load:
+        first, last = set(samples[0]["lines"]), set(samples[-1]["lines"])
+        brief, gone = {}, {}
+        for i in range(1, len(samples) - 1):
+            now, start, end = set(samples[i]["lines"]), samples[i]["t"], samples[i + 1]["t"]
+            for line in now - first - last:
+                brief.setdefault(line, [start, end])[1] = end
+            for line in (first & last) - now:
+                gone.setdefault(line, [start, end])[1] = end
+        if brief:
+            out.append("  shown only briefly (not before the step, not after it): "
+                       + "; ".join(f"{quote(k)} {a}-{b}ms" for k, (a, b) in list(brief.items())[:6]))
+        if gone:
+            out.append("  briefly disappeared, then came back: "
+                       + "; ".join(f"{quote(k)} {a}-{b}ms" for k, (a, b) in list(gone.items())[:6]))
+    if len(samples) > 1:
+        events = []
+        for previous, current in zip(samples, samples[1:]):
+            removed = [line for line in previous["lines"] if line not in current["lines"]]
+            added = [line for line in current["lines"] if line not in previous["lines"]]
+            parts = [f"-{quote(line, 30)}" for line in removed[:3]] + [f"+{quote(line, 30)}" for line in added[:3]]
+            more = len(removed) + len(added) - len(parts)
+            events.append(f"{current['t']}ms " + " ".join(parts) + (f" (+{more} more)" if more > 0 else ""))
+        if len(events) > 8:
+            events = events[:4] + [f"… {len(events) - 8} more changes"] + events[-4:]
+        out.append("  text over time: " + " | ".join(events))
+    repeat = lambda anim: anim.get("infinite") and anim["target"] + anim["name"] in seen
+    for anim in [a for a in trace.get("anims") or [] if not repeat(a)][:6]:
+        (x0, y0), (x1, y1) = anim["first"], anim.get("last") or anim["first"]
+        move = ""
+        if abs(x1 - x0) > 20 or abs(y1 - y0) > 20:
+            move = f", moved from x={x0},y={y0} to x={x1},y={y1}"
+            if abs(x1 - x0) > abs(y1 - y0):
+                move += " (entering from the left)" if x1 > x0 else " (moving to the left)"
+        opacity = anim.get("opacity") or []
+        fade = f", opacity {opacity[0]}→{opacity[-1]}" if len(opacity) > 1 and opacity[0] != opacity[-1] else ""
+        out.append(f"  animated: {anim['target']} {anim['name']} {anim['duration']}ms"
+                   + (" repeating forever" if anim.get("infinite") else "") + move + fade)
+    for anim in [a for a in trace.get("still") or [] if not repeat(a)][:4]:
+        out.append(f"  STILL ANIMATING after the page settled: {anim['target']} {anim['name']}"
+                   + (" (repeats forever)" if anim.get("infinite") else ""))
+    for anim in (trace.get("still") or []) + (trace.get("anims") or []):
+        if anim.get("infinite"):
+            seen.add(anim["target"] + anim["name"])
+    for shift in (trace.get("shifts") or [])[:4]:
+        moved = "; ".join(f"{s['label']} moved {'down' if s['dy'] > 0 else 'up'} {abs(s['dy'])}px"
+                          if abs(s["dy"]) >= abs(s["dx"]) else f"{s['label']} moved sideways {s['dx']}px"
+                          for s in shift.get("sources") or [])
+        out.append(f"  LAYOUT SHIFT {shift['value']:.3f} at {shift['t']}ms: {moved}")
+    return out
+
+
+def turning_points(values):
+    """The values where the direction of change reverses, with the ends."""
+    points, direction = [values[0]], 0
+    for previous, value in zip(values, values[1:]):
+        step = (value > previous) - (value < previous)
+        if step and direction and step != direction:
+            points.append(previous)
+        direction = step or direction
+    return points + [values[-1]]
+
+
+def smooth_lines(data):
+    """Freezes (no frame drawn, and which script was busy) and, per element that moved or resized:
+    how far, over how long, where it stalled and whether it reversed."""
+    if not data:
+        return []
+    out = []
+    for start, gap in (data.get("gaps") or [])[:4]:
+        busy = [l for l in data.get("loafs") or [] if l["t"] < start + gap + 50 and l["t"] + l["d"] > start - 50]
+        who = "; ".join(f"{s['fn'] or 'anonymous'}{' in ' + s['src'] if s['src'] else ''} {s['d']}ms"
+                        for l in busy for s in l["scripts"][:2])
+        out.append(f"  PAGE FROZE: no frame drawn for {gap}ms from {start}ms after the action"
+                   + (f" (busy in {who})" if who else ""))
+    for track in (data.get("tracks") or [])[:6]:
+        points = track["points"]
+        # Height first: expanding and collapsing are the common motions, and a hidden element's width
+        # dropping to 0 would otherwise hide what its height did.
+        shown = [p for p in points if p[3] or p[4]] or points
+        name, index, values = next(((n, i, [p[i] for p in (points if n == "height" else shown)])
+                                    for n, i in (("height", 4), ("width", 3), ("y", 2), ("x", 1))
+                                    if max(p[i] for p in points) - min(p[i] for p in points) >= 10), (None, 0, []))
+        if not name:
+            continue
+        first, last = values[0], values[-1]
+        parts = [f"{track['label']} {name} {first}→{last}px, moving from {points[0][0]}ms to {points[-1][0]}ms "
+                 f"({points[-1][0] - points[0][0]}ms)"]
+        for a, b in zip(points, points[1:]):
+            gap, value = b[0] - a[0], a[index]
+            if gap >= 250 and min(first, last) < value < max(first, last):
+                share = round(100 * (value - first) / (last - first)) if last != first else 0
+                parts.append(f"STALLED {gap}ms at {value}px ({share}% of the way) from {a[0]}ms")
+        turns = turning_points(values)
+        if len(turns) > 2:
+            parts.append("REVERSED direction: " + "→".join(str(v) for v in turns) + "px")
+        out.append("  motion: " + ", ".join(parts))
+    return out
+
+
+def reach_line(found, width):
+    def sample(labels):
+        return ", ".join(repr(label) for label in labels[:8]) + (" …" if len(labels) > 8 else "")
+    notes = []
+    if found["clipped"]:
+        notes.append(f"CUT OFF at {width}px: {len(found['clipped'])} labels are cut by a container that hides its "
+                     f"overflow, so the user can neither see nor scroll to them: {sample(found['clipped'])}")
+    if found["scroll"]:
+        notes.append(f"{len(found['scroll'])} labels are off to the side inside a scrollable area (reachable by "
+                     f"scrolling it): {sample(found['scroll'])}")
+    if found["page"]:
+        notes.append(f"{len(found['page'])} labels are right of the {width}px viewport"
+                     + (" (the page scrolls sideways)" if found["pageScroll"] else "") + f": {sample(found['page'])}")
+    return "reach: " + ("; ".join(notes) if notes else f"everything visible fits the {width}px width")
+
+
+def expects(step):
+    """The step's expects: one text or object, or a list of them."""
+    expect = step.get("expect")
+    return [e for e in expect if e] if isinstance(expect, list) else [expect] if expect else []
 
 
