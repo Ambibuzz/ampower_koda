@@ -30,7 +30,13 @@
         "kb_connection_section",
         "kb_base_url",
         "kb_api_key",
-        "kb_api_secret"
+        "kb_api_secret",
+        "hd_tab",
+        "hd_connection_section",
+        "hd_connection_mode",
+        "hd_base_url",
+        "hd_api_key",
+        "hd_api_secret"
     ],
     "fields": [
         {
@@ -204,6 +210,42 @@
             "fieldname": "kb_api_secret",
             "fieldtype": "Password",
             "label": "KB API Secret"
+        },
+        {
+            "fieldname": "hd_tab",
+            "fieldtype": "Tab Break",
+            "label": "Helpdesk"
+        },
+        {
+            "fieldname": "hd_connection_section",
+            "fieldtype": "Section Break",
+            "label": "Connection"
+        },
+        {
+            "fieldname": "hd_connection_mode",
+            "fieldtype": "Select",
+            "label": "Connection Mode",
+            "options": "Same Site\nSame Bench\nRemote",
+            "default": "Same Site"
+        },
+        {
+            "fieldname": "hd_base_url",
+            "fieldtype": "Data",
+            "label": "HD Base URL",
+            "description": "Required for Same Bench and Remote. e.g. https://helpdesk.ambibuzz.com — no trailing slash.",
+            "depends_on": "eval:doc.hd_connection_mode != 'Same Site'"
+        },
+        {
+            "fieldname": "hd_api_key",
+            "fieldtype": "Data",
+            "label": "HD API Key",
+            "depends_on": "eval:doc.hd_connection_mode != 'Same Site'"
+        },
+        {
+            "fieldname": "hd_api_secret",
+            "fieldtype": "Password",
+            "label": "HD API Secret",
+            "depends_on": "eval:doc.hd_connection_mode != 'Same Site'"
         }
     ],
     "issingle": 1,

@@ -22,14 +22,16 @@ import frappe
 from frappe import _
 
 from ampower_koda.agent import kb_client
+from ampower_koda.agent import hd_client
 from ampower_koda.agent.kb_client import KBNotFoundError
+from ampower_koda.agent.hd_client import HDNotFoundError
 from ampower_koda.agent.api import start_agent
 
 DOCTYPE_NAME = "Agent Request"
 
 TICKET_TYPE_TO_REQUEST_TYPE = {
     "bug": "Bug Fix",
-    "newfeature": "Feature Request",
+    "newfeature": "ERPNext-flavored",
 }
 
 READY_INDEXING_STATUSES = {"Indexed", "Document Generated"}
@@ -142,7 +144,8 @@ def _get_git_credential():
 
 def _finalize_agent_request(subject: str, description: str, request_type: str,
                              comment_for_developer: str, target_app_name: str,
-                             github_repo_url: str, base_branch: str) -> dict:
+                             github_repo_url: str, base_branch: str,
+                             source_hd_ticket: str = None) -> dict:
     github_username, github_email, github_token = _get_git_credential()
 
     description_html = frappe.utils.escape_html(description).replace("\n", "<br>")
@@ -166,6 +169,7 @@ def _finalize_agent_request(subject: str, description: str, request_type: str,
         "git_user_email": github_email,
         "ai_provider": settings.default_ai_provider,
         "ai_model": settings.default_ai_model,
+        "source_hd_ticket": source_hd_ticket or "",
     }).insert(ignore_permissions=True)
     frappe.db.commit()
 
@@ -179,7 +183,7 @@ def _finalize_agent_request(subject: str, description: str, request_type: str,
 
 
 @frappe.whitelist()
-def execute_from_ticket(subject: str, description: str):
+def execute_from_ticket(subject: str, description: str, source_hd_ticket: str = None):
     subject = (subject or "").strip()
     description = (description or "").strip()
     if not subject:
@@ -209,6 +213,7 @@ def execute_from_ticket(subject: str, description: str):
             "request_type": request_type,
             "reply_to_ticket": reply_to_ticket,
             "comment_for_developer": comment_for_developer,
+            "source_hd_ticket": source_hd_ticket,
         }
 
     cached = _get_cached_repo(repository)
@@ -220,22 +225,38 @@ def execute_from_ticket(subject: str, description: str):
             "reply_to_ticket": reply_to_ticket,
             "comment_for_developer": comment_for_developer,
             "suggested_app_name": repository,
+            "source_hd_ticket": source_hd_ticket,
         }
 
     git_url, branch = cached
     outcome = _finalize_agent_request(
         subject, description, request_type, comment_for_developer,
-        repository, git_url, branch,
+        repository, git_url, branch, source_hd_ticket,
     )
     outcome["ticket_type"] = ticket_type
     outcome["reply_to_ticket"] = reply_to_ticket
     return outcome
 
+@frappe.whitelist()
+def fetch_ticket_for_intake(hd_ticket: str):
+    """Called by the intake page on load when it's opened with ?hd_ticket=<id>.
+    Returns the ticket's subject/description so the page can auto-fill,
+    instead of the person copy-pasting them by hand.
+    """
+    hd_ticket = (hd_ticket or "").strip()
+    if not hd_ticket:
+        frappe.throw(_("hd_ticket is required."))
+
+    try:
+        return hd_client.fetch_hd_ticket(hd_ticket)
+    except HDNotFoundError:
+        frappe.throw(_("Could not find HD Ticket '{0}'.").format(hd_ticket))
+
 
 @frappe.whitelist()
 def resolve_unknown_repo(subject: str, description: str, request_type: str,
                           comment_for_developer: str, app_name: str,
-                          repo_url: str, branch: str):
+                          repo_url: str, branch: str, source_hd_ticket: str = None):
     subject = (subject or "").strip()
     description = (description or "").strip()
     app_name = (app_name or "").strip()
@@ -260,7 +281,7 @@ def resolve_unknown_repo(subject: str, description: str, request_type: str,
     if already_ready:
         return _finalize_agent_request(
             subject, description, request_type, comment_for_developer,
-            app_name, repo_url, branch,
+            app_name, repo_url, branch, source_hd_ticket,
         )
 
     if not repo_status:
@@ -283,6 +304,7 @@ def resolve_unknown_repo(subject: str, description: str, request_type: str,
         repo_url=repo_url,
         branch=branch,
         user=frappe.session.user,
+        source_hd_ticket=source_hd_ticket,
     )
 
     return {
@@ -294,7 +316,8 @@ def resolve_unknown_repo(subject: str, description: str, request_type: str,
 
 def wait_for_indexing_and_start(subject: str, description: str, request_type: str,
                                   comment_for_developer: str, app_name: str,
-                                  repo_url: str, branch: str, user: str):
+                                  repo_url: str, branch: str, user: str,
+                                  source_hd_ticket: str = None):
     frappe.set_user(user)
 
     elapsed = 0
@@ -326,7 +349,7 @@ def wait_for_indexing_and_start(subject: str, description: str, request_type: st
 
             outcome = _finalize_agent_request(
                 subject, description, request_type, comment_for_developer,
-                app_name, repo_url, branch,
+                app_name, repo_url, branch, source_hd_ticket,
             )
             _notify_user(
                 user, "success",

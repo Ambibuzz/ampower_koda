@@ -1,0 +1,94 @@
+# Copyright (c) 2026, Ambibuzz Technologies LLP and contributors
+"""Client for fetching an HD Ticket's subject/description, branching by
+Agent Settings.hd_connection_mode:
+
+  Same Site  -- Helpdesk and Koda share one site; read the doc directly,
+                no HTTP involved.
+  Same Bench -- Helpdesk is a different site on the same bench; reached
+                over HTTP with an API key/secret, same as Remote.
+  Remote     -- Helpdesk is on a different server entirely; identical
+                code path to Same Bench, just a different hd_base_url.
+
+HD Ticket.description is a Text Editor field (raw HTML). This module always
+returns plain text -- HTML is stripped here, once, so every caller (KB's
+user_prompt, Agent Request.user_message) gets consistent plain text.
+"""
+
+import re
+
+import frappe
+import requests
+from frappe import _
+from html import unescape
+
+
+class HDNotFoundError(Exception):
+    """Raised when the given HD Ticket doesn't exist."""
+
+
+def _strip_html(html: str) -> str:
+    if not html:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return unescape(text).strip()
+
+
+def _get_hd_config():
+    settings = frappe.get_single("Agent Settings")
+    mode = settings.hd_connection_mode or "Same Site"
+    base_url = (settings.hd_base_url or "").rstrip("/")
+    api_key = (settings.hd_api_key or "").strip()
+    api_secret = settings.get_password("hd_api_secret") if settings.hd_api_secret else ""
+    return mode, base_url, api_key, api_secret
+
+
+def fetch_hd_ticket(ticket_id: str) -> dict:
+    """Returns {"subject": str, "description": str} for the given HD Ticket
+    name, with description already stripped to plain text.
+
+    Raises HDNotFoundError if the ticket doesn't exist.
+    """
+    mode, base_url, api_key, api_secret = _get_hd_config()
+
+    if mode == "Same Site":
+        if not frappe.db.exists("HD Ticket", ticket_id):
+            raise HDNotFoundError(ticket_id)
+        doc = frappe.get_doc("HD Ticket", ticket_id)
+        subject, description = doc.subject, doc.description
+    else:
+        if not (base_url and api_key and api_secret):
+            frappe.throw(
+                _("Helpdesk connection is not configured. Set HD Base URL, "
+                  "API Key and API Secret in Agent Settings.")
+            )
+
+        url = f"{base_url}/api/resource/HD Ticket/{ticket_id}"
+        headers = {"Authorization": f"token {api_key}:{api_secret}"}
+
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            frappe.throw(_("Could not reach Helpdesk: {0}").format(e))
+
+        if response.status_code == 404:
+            raise HDNotFoundError(ticket_id)
+        if response.status_code != 200:
+            frappe.throw(
+                _("Helpdesk returned an error ({0}): {1}").format(
+                    response.status_code, response.text[:500]
+                )
+            )
+
+        try:
+            data = response.json().get("data") or {}
+        except ValueError:
+            frappe.throw(_("Helpdesk returned a non-JSON response."))
+
+        subject, description = data.get("subject"), data.get("description")
+
+    return {
+        "subject": subject or "",
+        "description": _strip_html(description or ""),
+    }

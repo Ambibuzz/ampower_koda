@@ -1,4 +1,4 @@
-frappe.pages['hd-ticket-intake'].on_page_load = function(wrapper) {
+frappe.pages['hd-ticket-intake'].on_page_load = function (wrapper) {
     var page = frappe.ui.make_app_page({
         parent: wrapper,
         title: 'HD Ticket Intake',
@@ -92,6 +92,24 @@ frappe.pages['hd-ticket-intake'].on_page_load = function(wrapper) {
 
     $(page.body).html(style + content);
 
+    var route_ticket = frappe.get_route()[1];
+    if (route_ticket) {
+        page.wrapper.find('#hd-ticket-subject, #hd-ticket-description').prop('disabled', true);
+        frappe.call({
+            method: 'ampower_koda.agent.hd_ticket_intake.fetch_ticket_for_intake',
+            args: { hd_ticket: route_ticket },
+            callback: function (r) {
+                page.wrapper.find('#hd-ticket-subject, #hd-ticket-description').prop('disabled', false);
+                if (!r.message) return;
+                page.wrapper.find('#hd-ticket-subject').val(r.message.subject);
+                page.wrapper.find('#hd-ticket-description').val(r.message.description);
+            },
+            error: function () {
+                page.wrapper.find('#hd-ticket-subject, #hd-ticket-description').prop('disabled', false);
+            }
+        });
+    }
+
     function set_loading(btn, is_loading, label) {
         btn.prop('disabled', is_loading).text(is_loading ? 'Running...' : label);
     }
@@ -119,8 +137,8 @@ frappe.pages['hd-ticket-intake'].on_page_load = function(wrapper) {
 
         frappe.call({
             method: 'ampower_koda.agent.hd_ticket_intake.execute_from_ticket',
-            args: { subject: subject, description: description },
-            callback: function(r) {
+            args: { subject: subject, description: description, source_hd_ticket: route_ticket },
+            callback: function (r) {
                 set_loading(btn, false, 'Execute agent');
                 if (!r.message) return;
                 var data = r.message;
@@ -150,27 +168,27 @@ frappe.pages['hd-ticket-intake'].on_page_load = function(wrapper) {
                     show_result('hdti-badge-warn', 'needs repo', frappe.utils.escape_html(data.reply_to_ticket || ''));
                 }
             },
-            error: function() { set_loading(btn, false, 'Execute agent'); }
+            error: function () { set_loading(btn, false, 'Execute agent'); }
         });
     }
 
     page.wrapper.find('#hd-ticket-execute').on('click', do_execute);
 
-    page.wrapper.find('#hd-ticket-subject, #hd-ticket-description').on('keydown', function(e) {
+    page.wrapper.find('#hd-ticket-subject, #hd-ticket-description').on('keydown', function (e) {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
             e.preventDefault();
             do_execute();
         }
     });
 
-    page.wrapper.find('#hd-ticket-clear').on('click', function() {
+    page.wrapper.find('#hd-ticket-clear').on('click', function () {
         page.wrapper.find('#hd-ticket-subject').val('');
         page.wrapper.find('#hd-ticket-description').val('');
         page.wrapper.find('#hd-ticket-unknown-repo').hide();
         page.wrapper.find('#hd-ticket-result-card').hide();
     });
 
-    page.wrapper.find('#hd-ticket-continue').on('click', function() {
+    page.wrapper.find('#hd-ticket-continue').on('click', function () {
         var pending = page._pending_kb;
         if (!pending) return;
 
@@ -196,8 +214,9 @@ frappe.pages['hd-ticket-intake'].on_page_load = function(wrapper) {
                 app_name: app_name,
                 repo_url: repo_url,
                 branch: branch,
+                source_hd_ticket: pending.source_hd_ticket,
             },
-            callback: function(r) {
+            callback: function (r) {
                 set_loading(btn, false, 'Continue');
                 if (!r.message) return;
                 var data = r.message;
@@ -211,7 +230,7 @@ frappe.pages['hd-ticket-intake'].on_page_load = function(wrapper) {
                 }
                 page.wrapper.find('#hd-ticket-unknown-repo').hide();
             },
-            error: function() { set_loading(btn, false, 'Continue'); }
+            error: function () { set_loading(btn, false, 'Continue'); }
         });
     });
 };
