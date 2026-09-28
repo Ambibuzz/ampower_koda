@@ -3,7 +3,6 @@
 
 import json
 import os
-import subprocess
 from functools import wraps
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdo
 from ampower_koda.agent.executor import (
     _generate_patch_diff,
     _update_status,
+    bench_branch_refusal,
     normalize_bench_selection,
     restore_execution_state,
     validate_target_app,
@@ -32,7 +32,7 @@ from ampower_koda.agent.git_ops import (
     list_changed_files,
     run_git,
 )
-from ampower_koda.agent.graph import _app_file_exists, _get_bench_env
+from ampower_koda.agent.graph import _app_file_exists
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent.run_control import enqueue_job, stop_job
 
@@ -735,7 +735,13 @@ def get_default_bench_commands(request_name: str):
 @frappe.whitelist()
 @_whitelist_logged
 def run_selected_bench_commands(request_name: str, commands: str = None):
-    """Run user-selected bench commands. commands is a JSON array of command strings."""
+    """Queue user-selected bench commands. commands is a JSON array of command strings.
+
+    Returns as soon as the job is queued: a migrate or build can outlast a web
+    request, and a service restart would stop the process serving it. Each
+    command's receipt is appended to the bench log by the job, and progress
+    arrives through the usual status updates. An empty array runs nothing.
+    """
     if not request_name:
         frappe.throw(_("Request name is required."))
 
@@ -743,68 +749,39 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
     doc.check_permission("write")
     if doc.status in BUSY_STATUSES:
         frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
+    if doc.status == "Queued" and (doc.rq_job_id or "").strip():
+        # A queued agent job owns the request; queuing this one would supersede it.
+        frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
+    _require_bench_branch(doc)
 
-    cmds = []
-    if commands:
-        try:
-            cmds = json.loads(commands)
-        except (ValueError, TypeError):
-            frappe.throw(_("Invalid commands format."))
-
-    if not cmds or not isinstance(cmds, list):
+    try:
+        cmds = normalize_bench_selection(commands)
+    except ValueError as exc:
+        frappe.throw(str(exc))
+    if cmds is None:
         frappe.throw(_("No commands provided."))
+    if not cmds:
+        _append_bench_log(request_name, "No bench commands selected: nothing was run.")
+        return {"status": "skipped", "message": _("No bench commands selected: nothing was run.")}
 
-    bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
-    bench_root = os.path.normpath(bench_root)
-    bench_env = _get_bench_env()
+    previous_status = doc.status
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Building")
+    frappe.db.commit()
+    job = enqueue_job(
+        "ampower_koda.agent.executor.run_selected_bench_commands",
+        queue="default",
+        # Room for every command's own 900 s limit, so a long list is not cut off midway.
+        timeout=max(1800, 960 * len(cmds)),
+        request_name=request_name,
+        commands=cmds,
+        previous_status=previous_status,
+    )
 
-    output_parts = []
-    failed = []
-    for cmd in cmds:
-        if not isinstance(cmd, str) or not cmd.strip():
-            continue
-        try:
-            result = subprocess.run(
-                cmd.strip().split(),
-                cwd=bench_root,
-                capture_output=True,
-                text=True,
-                timeout=900,
-                env=bench_env,
-            )
-            out = (result.stdout or "") + (result.stderr or "")
-            status_str = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
-            output_parts.append(f"$ {cmd}\n{status_str}\n{out.strip()}\n")
-            if result.returncode != 0:
-                failed.append(f"{cmd} (exit {result.returncode})")
-        except subprocess.TimeoutExpired:
-            output_parts.append(f"$ {cmd}\nTIMEOUT after 900s\n")
-            failed.append(f"{cmd} (timeout)")
-            log_agent_error(
-                "Agent API: run_selected_bench_commands timeout",
-                f"request={request_name}\ncmd={cmd}",
-            )
-        except Exception as e:
-            output_parts.append(f"$ {cmd}\nERROR: {e}\n")
-            failed.append(f"{cmd} ({e})")
-            log_agent_error(
-                "Agent API: run_selected_bench_commands",
-                f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
-            )
-
-    bench_log = "\n".join(output_parts)
-    # Appended, not assigned. This used to replace the field, so the checkout
-    # that precedes it in the form's own flow was overwritten by the commands it
-    # led to, and a second run erased the first.
-    _append_bench_log(request_name, bench_log)
-
-    # "ok" used to mean "the endpoint reached the end", not "the commands
-    # worked" — a failing `bench migrate` returned ok and the form showed a
-    # green alert. The exit codes were already known here and simply not read.
     return {
-        "status": "ok" if not failed else "error",
-        "failed": failed,
-        "log": bench_log,
+        "status": "queued",
+        "job_id": getattr(job, "id", None),
+        "commands": cmds,
+        "message": _("Queued {0} bench command(s); results are added to the bench log.").format(len(cmds)),
     }
 
 
@@ -1140,6 +1117,23 @@ def _require_request_branch(doc) -> str:
                   state["current_branch"] or _("(unknown)"), branch_name)
         )
     return branch_name
+
+
+def _require_bench_branch(doc) -> str:
+    """Throw unless the checkout is the request's branch or its base branch (no checkout).
+
+    Manual bench commands build and migrate whatever is checked out. The IDE
+    runs them for the request's branch, and the form after "Checkout Base
+    Branch"; any other branch is another request's or the user's work.
+    """
+    app_name = (doc.target_app_name or "").strip()
+    if not app_name:
+        frappe.throw(_("Target app is not set on this request."))
+    base_branch = (doc.base_branch or "main").strip()
+    refused = bench_branch_refusal(app_name, doc.branch_name, allowed=(base_branch,))
+    if refused:
+        frappe.throw(refused)
+    return get_current_branch(app_name)
 
 
 def _has_pushable_changes(doc) -> bool:

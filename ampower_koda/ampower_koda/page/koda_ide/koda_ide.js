@@ -1062,7 +1062,7 @@ function open_deploy_dialog(ide, $shell) {
                         return;
                     }
                     dialog.hide();
-                    append_terminal($shell, __('Running deploy commands...'));
+                    follow_bench_job(ide, $shell);
                     frappe.call({
                         method: 'ampower_koda.agent.api.run_selected_bench_commands',
                         args: {
@@ -1071,13 +1071,41 @@ function open_deploy_dialog(ide, $shell) {
                         },
                         freeze: true,
                         callback: function (res) {
-                            append_terminal($shell, (res.message && res.message.log) || __('Deploy finished.'));
+                            // Queued, not finished: per-command results arrive
+                            // through the realtime events followed above.
+                            const msg = (res.message && res.message.message) || __('Deploy queued.');
+                            append_terminal($shell, frappe.utils.escape_html(msg));
                         },
                     });
                 },
             });
             dialog.show();
         },
+    });
+}
+
+// Print the queued deploy job's progress in the terminal. Registered once per
+// IDE: the job, and a service restart reporting after it, publish the same
+// realtime events the request form shows.
+function follow_bench_job(ide, $shell) {
+    if (ide._bench_follow) return;
+    ide._bench_follow = true;
+    const esc = frappe.utils.escape_html;
+    let last_cmd = '';
+    frappe.realtime.on('agent_log', function (data) {
+        if (!data || data.request_name !== ide.request_name) return;
+        if (data.type === 'bench_command') {
+            last_cmd = data.command || '';
+        } else if (data.type === 'bench_result') {
+            const running = data.output_preview === 'Running...';
+            const head = running ? '$ ' + last_cmd : (data.success ? 'OK: ' : 'FAILED: ') + last_cmd;
+            const tail = !running && data.output_preview ? '\n' + data.output_preview : '';
+            append_terminal($shell, esc(head + tail));
+        }
+    });
+    frappe.realtime.on('agent_progress', function (data) {
+        if (!data || data.request_name !== ide.request_name || !data.message) return;
+        append_terminal($shell, esc(data.message));
     });
 }
 
@@ -1141,7 +1169,8 @@ function refresh_tree_badges($shell, ide) {
 function append_terminal($shell, text) {
     const $body = $shell.find('.koda-terminal-body');
     const ts = frappe.datetime.now_datetime();
-    $body.append(`[${ts}] ${text}\n`);
+    // A text node: command output, errors and paths are shown literally, never parsed as HTML.
+    $body.append(document.createTextNode(`[${ts}] ${text}\n`));
     $body.scrollTop($body[0].scrollHeight);
 }
 

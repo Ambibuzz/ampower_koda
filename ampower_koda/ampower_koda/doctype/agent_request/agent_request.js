@@ -1022,31 +1022,15 @@ function show_post_checkout_bench_dialog(frm) {
                             commands: JSON.stringify(selected)
                         },
                         freeze: true,
-                        freeze_message: __('Running bench commands...'),
+                        freeze_message: __('Queuing bench commands...'),
                         callback: function (r2) {
                             if (!r2.message) { return; }
-                            // The output is shown whether or not the commands
-                            // worked. This used to render only on status 'ok',
-                            // so a run that failed showed nothing at all — the
-                            // one case where the log is worth reading.
-                            var failed = r2.message.failed || [];
-                            var header = failed.length
-                                ? '<p style="margin-bottom:8px;"><b>'
-                                    + __('{0} command(s) failed:', [failed.length])
-                                    + '</b><br>'
-                                    + frappe.utils.escape_html(failed.join('\n')).replace(/\n/g, '<br>')
-                                    + '</p>'
-                                : '';
-                            frappe.msgprint({
-                                title: failed.length
-                                    ? __('Bench Commands Failed')
-                                    : __('Bench Commands Output'),
-                                message: header
-                                    + '<pre style="max-height:400px;overflow:auto;font-size:12px;white-space:pre-wrap;">'
-                                    + frappe.utils.escape_html(r2.message.log || '(no output)')
-                                    + '</pre>',
-                                indicator: failed.length ? 'red' : 'green',
-                                wide: true
+                            // The commands run in a background job. The request
+                            // shows Building meanwhile, so status polling and the
+                            // live log follow it; receipts land in the bench log.
+                            frappe.show_alert({
+                                message: r2.message.message || __('Bench commands queued.'),
+                                indicator: 'blue'
                             });
                             frm.reload_doc();
                         }
