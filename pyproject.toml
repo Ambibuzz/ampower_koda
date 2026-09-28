@@ -15,7 +15,12 @@ dependencies = [
     "langchain-anthropic>=0.3.0",
     "tree-sitter>=0.23.0",
     "tree-sitter-language-pack>=0.7.0",
+    "tomli>=2.0; python_version < \"3.11\"",
 ]
+
+[project.optional-dependencies]
+# check_page (browser verification); also run: playwright install chromium
+browser = ["playwright>=1.40"]
 
 [build-system]
 requires = ["flit_core >=3.4,<4"]

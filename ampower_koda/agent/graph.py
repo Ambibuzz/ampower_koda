@@ -23,6 +23,7 @@ from ampower_koda.agent import koda_core
 from ampower_koda.agent import checkpoint
 from ampower_koda.agent import recovery
 from ampower_koda.agent import verification
+from ampower_koda.agent import render_check
 from ampower_koda.agent import python_diagnostics
 from ampower_koda.agent.advisor import Advisor, directive as advisor_directive
 from ampower_koda.agent import repair_budget
@@ -98,9 +99,10 @@ TOOL_FAILURE_PREFIXES = (
     "Error:", "Tool error:", "Unknown tool:", "Not a file:", "Not a directory:", "Not a file or directory:",
     "DocType schema not found", "VALIDATION_ERROR", "VALIDATION_FAILED", "READ_FAILED",
     "WRITE_FAILED", "EDIT_FAILED", "COPY_FAILED", "RENAME_FAILED", "DELETE_FAILED",
-    "TESTS_FAILED", "SYNTAX_ERROR",
+    "TESTS_FAILED", "SYNTAX_ERROR", "JAVASCRIPT_ERROR",
     "VALIDATION_UNAVAILABLE", "CALL_FAILED", "RUNTIME_UNAVAILABLE",
     "FIND_FAILED", "SEARCH_FAILED", "SUBMIT_FAILED", "EXPLORE_FAILED", "EXPLORE_UNAVAILABLE",
+    "RENDER_FAILED", "RENDER_UNAVAILABLE",
 )
 #: Tools whose failures say what to fix in the arguments, not a cause in the code.
 CAUSE_GUARD_EXEMPT = {"submit_plan", "explore"}
@@ -125,7 +127,7 @@ MAX_TOOL_RESULT_CHARS = 8000
 MAX_READ_RESULT_CHARS = 80000
 # Searches and outlines bound themselves and say what they left out; the generic
 # cap would cut them without saying so.
-SELF_BOUNDED_TOOLS = {"read_file", "search_code", "get_file_outline"}
+SELF_BOUNDED_TOOLS = {"read_file", "search_code", "get_file_outline", "check_page"}
 FIND_CODE_HITS = 8
 FIND_CODE_EXCERPT_CHARS = 160
 # A result fetched with a purpose is read by a bare model call and the conversation
@@ -1087,6 +1089,28 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         return verification.call_method(app_name, method, kwargs, env=_get_bench_env(),
                                         limit=READER_INPUT_CHARS if purpose.strip() else verification.MAX_CALL_OUTPUT)
 
+    def check_page_call(route: str, steps: list[dict] | str = "") -> str:
+        # An array, not JSON inside a JSON string: two escaped step lists in one trace broke on quoting.
+        # A string still parses for callers that send one.
+        parsed = steps if isinstance(steps, list) else []
+        if parsed and not all(isinstance(step, dict) for step in parsed):
+            return "RENDER_FAILED: steps must be a list of step objects."
+        if isinstance(steps, str) and steps.strip():
+            try:
+                parsed = json.loads(steps)
+            except ValueError as exc:
+                return f"RENDER_FAILED: steps is not valid JSON ({exc}); pass a JSON list of step objects."
+            if not isinstance(parsed, list) or not all(isinstance(step, dict) for step in parsed):
+                return "RENDER_FAILED: steps must be a JSON list of step objects."
+        # Planning and review must not change the live site: no Page JSON import or commit there.
+        return render_check.check_page(app_name, route, parsed, env=_get_bench_env(), register=not read_only)
+
+    # The same schema in every phase; the page's own server calls are what it exercises.
+    check_page = StructuredTool.from_function(
+        func=check_page_call, name="check_page", description=render_check.RENDER_TOOL_DESCRIPTION,
+        handle_validation_error=lambda exc: "RENDER_FAILED: route must be a string and steps a list of step "
+                                            f"objects ({str(exc).splitlines()[0]}).")
+
     def read_only_failure(prefix: str) -> str:
         if session is not None and session.get("plan_sink") is not None:
             return (f"{prefix}: Writes start after the user approves your plan. Keep investigating, "
@@ -1238,7 +1262,7 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         return agent_tools.delete_file(app_name, path, expected_sha256=revision(current))
 
     catalogue = [find_files, list_directory, read_file, search_code, find_code, read_doctype_schema,
-                 get_file_outline, validate_code, run_tests, call_method, write_file, copy_file,
+                 get_file_outline, validate_code, run_tests, call_method, check_page, write_file, copy_file,
                  edit_file, rename_file, delete_file]
     if session is None:
         return catalogue
@@ -3190,7 +3214,8 @@ def review_node(state: dict) -> dict:
                 "source lines or tool results for those paths. Preserve previously satisfied criteria, "
                 "verify the concrete prior finding is resolved, and inspect the changed regions for regressions. "
                 "Converge: a new finding in code this repair did not change is P2 unless it makes the request "
-                "fail outright (P0); do not deepen a criterion the previous pass accepted. "
+                "fail outright (P0); do not deepen a criterion the previous pass accepted, unless running "
+                "it (call_method on real records or check_page) shows its outcome is not delivered. "
                 "Use read-only tools only when this delta is truncated or a connected dependency is missing.\n\n"
                 "### PRIOR FINDING\n" + str(state.get("review_notes") or "")[:4000]
                 + "\n\n### CURRENT REPAIR DIFF\n" + repair_diff

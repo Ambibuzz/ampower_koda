@@ -115,7 +115,15 @@ features (DocTypes, Script Reports, Pages, APIs, hooks, client scripts) and make
   line numbers to go stale. Write new files whole with write_file.
 - Run what you build. call_method runs a function of this app against the live site (real records and
   schema; database writes are rolled back, and file writes, background jobs and email are discarded), so
-  check what a query or endpoint actually returns before and after changing it. run_tests runs the tests in .koda/tests; Python tests there run against the live site too.
+  check what a query or endpoint actually returns before and after changing it. Before designing a query,
+  look at the real rows and columns with a read probe (call_method frappe.db.sql with a SELECT, or
+  frappe.get_all). check_page opens a Desk page in a browser and reports errors, failed calls and what
+  it shows; it is how a page, form or client script is verified. run_tests runs the tests in .koda/tests;
+  Python tests there run against the live site too.
+- Desk page scripts of every Page share one global scope: a top-level let, const, class or function with
+  the same name as one in another page throws when both are opened in one session. Prefix the new page's
+  top-level names (or wrap the script in a block). A Page's route is /desk/<page_name> (/app/<page-name>
+  on older sites).
 - Batch independent calls in one response: reads, searches, and every edit you already know, including
   several edit_file calls to the same file (anchors are exact text, so each still applies after the
   others). Each response re-sends the whole conversation, so thirty one-edit responses cost thirty times
@@ -223,10 +231,13 @@ PLAN_RULES = """### Planning principles
 - `acceptance_criteria` contains the few observable outcomes (usually 2-5) the user
   would check to accept the task, each with a representative input/output example.
   The agent verifies them by running the code: call_method runs app functions against
-  the live site, and run_tests runs Python tests (against the live site) and Node tests.
+  the live site, check_page opens a page in a browser and drives its controls, and
+  run_tests runs Python tests (against the live site) and Node tests. For a page or
+  form, state what the user sees for each control value the request changes (each
+  direction, depth or filter), including which side of the view each end appears on.
   Do not add criteria for behavior the request did not ask for (a copy's kept reference
-  behavior counts as asked for), and do not require a
-  browser or production access the environment does not have. Reuse existing scenarios
+  behavior counts as asked for), and do not require production access the environment
+  does not have. Reuse existing scenarios
   that establish those outcomes; do not rewrite working fixtures to match a newly
   invented illustrative value. State each criterion as behavior, never as "test
   file X passes": tests are how the implementer proves a criterion, not the criterion.
@@ -336,7 +347,14 @@ VERIFICATION_RULES = (
     "results, then cover changed server logic with unittest test*.py under .koda/tests, run against the "
     "live site with writes rolled back. Tests call the real production code: read existing records or "
     "insert the ones a case needs inside the test, and patch only external services, never the module "
-    "under test (run_tests fails a test that does). Client JavaScript needs no test; add a Node "
+    "under test (run_tests fails a test that does). Verify client JavaScript with check_page: open the "
+    "page, drive each control the task changed on at least two real records (one run per record with all "
+    "of its steps, up to 20), and confirm the result is "
+    "visibly present, laid out as the plan says (its layout list gives each label's position), "
+    "readable at phone width (a {\"viewport\": [390, 844]} step), and that no step flashes wrong or empty "
+    "content, jumps or leaves an animation running (each step reports what happened while it settled); "
+    "fix everything one check shows in one "
+    "batch and confirm once. Add a Node "
     "*.test.cjs only for pure data-in/data-out functions, never by stubbing jQuery, frappe or the "
     "page's own methods. A test that passes is frozen: fix failures by repairing code and add a new test "
     "for new behavior; do not edit frozen verification configuration or regression tests."
@@ -427,7 +445,14 @@ def get_review_prompt(edits_made: list[dict], request_name: str = None) -> str:
 Review the task contract against the actual changes and current source. Look for
 what would make the request fail for its user: business logic, wrong data, permissions,
 client/server contracts, Frappe conventions. Run the changed code with call_method
-against the live site rather than reasoning about what it would return. Mechanical
+against the live site rather than reasoning about what it would return. For a page, form
+or client script, open it with check_page and drive every control the request changed:
+each value of it (every direction, several depths, the filters) on at least two real records
+that differ (use a read probe to find them), and compare what is shown with what the request
+asks, including where each end appears and whether a limit actually limits, and whether any step
+flashed stale or empty content or left something moving. Drive one record per check_page run: put
+all of its steps (every value of each control, the toggles, phone width) in that one run of up to 20
+steps, so two records take two runs; run again only to confirm a suspected defect. Mechanical
 checks and test receipts are provided separately; a green test that mocks the
 behavior under test is not evidence. Never claim an unexecuted behavior was tested.
 CURRENT CHANGE EVIDENCE is a diff of the changes; a new file appears whole with line numbers

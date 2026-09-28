@@ -141,6 +141,8 @@ def describe_call(name: str, args: dict) -> str:
         return f"{str(args.get('pattern', ''))[:60]!r} in {path or 'app'}"
     if name == "call_method":
         return str(args.get("method") or "")
+    if name == "check_page":
+        return str(args.get("route") or "")
     return path
 
 
