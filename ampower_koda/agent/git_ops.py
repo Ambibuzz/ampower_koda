@@ -302,6 +302,28 @@ def create_pull_request(
         return False, redact(str(e), (token,)), None, None
 
 
+def get_pull_request(repo_url: str, token: str, number: int) -> tuple[bool, dict | str]:
+    """Fetch one pull request from the GitHub API: (True, data) or (False, reason)."""
+    parsed = _parse_github_repo(repo_url or "")
+    if not (token and parsed and number):
+        return False, "GitHub token, repo URL or PR number not available"
+    owner, repo = parsed
+    try:
+        resp = http_requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{int(number)}",
+            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"},
+            timeout=30,
+        )
+        data = resp.json()
+        if resp.status_code == 200 and isinstance(data, dict):
+            return True, data
+        return False, str(data.get("message", resp.text) if isinstance(data, dict) else resp.text)
+    except Exception as e:
+        log_agent_error("Agent Git: get pull request",
+                        redact(f"repo={repo_url}\n{e}\n{frappe.get_traceback()}", (token,)))
+        return False, redact(str(e), (token,))
+
+
 def generate_branch_name(request_name: str, branch_prefix: str = "ai-agent/", app_name: str = "") -> str:
     """
     Generates a unique and safe Git branch name based on the request.

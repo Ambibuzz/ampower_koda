@@ -21,6 +21,7 @@ from ampower_koda.agent.git_ops import (
     KODA_CLEAN_EXCLUDES,
     branch_exists,
     generate_branch_name,
+    get_pull_request,
     get_repo_root,
     get_current_branch,
     ignored_regression_tests,
@@ -518,9 +519,11 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
                     f"Failed to create working branch: {msg}",
                     error_log=f"create_branch failed: {msg}")
                 return
+            # A new branch has no pull request yet: an earlier run's PR belongs
+            # to its own branch and must not be reported as updated by this one.
             _update_status(request_name, user, "Implementing",
                 f"Created branch '{branch_name}'. Starting implementation...",
-                branch_name=branch_name)
+                branch_name=branch_name, pr_url="", pr_number=0)
 
         prior_changed_paths = _prior_changed_paths(doc) if is_follow_up_mode else []
         implementation_memory = (
@@ -990,6 +993,12 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
         # A follow-up after the PR was opened only pushes: the open PR picks up the new
         # commits, and asking GitHub for a second one fails with "already exists".
         existing_pr = (doc.pr_url or "").strip()
+        stale_pr = _stale_pull_request(doc, config, branch_name) if existing_pr else ""
+        if stale_pr:
+            # Closed, merged or for another branch/base: it is not updated by this
+            # push, so a new PR is created when requested.
+            _update_status(request_name, user, "Pushing", stale_pr, pr_url="", pr_number=0)
+            existing_pr = ""
         if existing_pr:
             do_pr = False
             if not do_push:
@@ -1014,7 +1023,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                     # There are existing commits worth pushing/PRing; keep going.
                     pass
                 else:
-                    status = "Completed" if (doc.pr_url or "").strip() else "Awaiting Push Approval"
+                    status = "Completed" if existing_pr else "Awaiting Push Approval"
                     _update_status(request_name, user, status, "No changes to push.")
                     return
             else:
@@ -1085,6 +1094,33 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
 
 
 # Helpers
+
+def _stale_pull_request(doc, config: dict, branch_name: str) -> str:
+    """Why the request's recorded PR cannot be reused for ``branch_name``, or "".
+
+    Reused only while GitHub reports it open with this head and base. When
+    GitHub cannot be asked, the record is trusted: creating a second PR for the
+    same head would fail with "already exists".
+    """
+    number = doc.pr_number or 0
+    if not number:
+        found = re.search(r"/pull/(\d+)", doc.pr_url or "")
+        number = int(found.group(1)) if found else 0
+    ok, pr = get_pull_request(config["github_repo_url"], config["github_token"], number)
+    if not ok:
+        return ""
+    head = (pr.get("head") or {}).get("ref")
+    base = (pr.get("base") or {}).get("ref")
+    if pr.get("state") != "open":
+        reason = "merged" if pr.get("merged") or pr.get("merged_at") else pr.get("state") or "not open"
+    elif head != branch_name:
+        reason = f"for branch '{head}'"
+    elif base != config["base_branch"]:
+        reason = f"against '{base}'"
+    else:
+        return ""
+    return f"The recorded PR ({doc.pr_url}) is {reason}; it will not be reused for '{branch_name}'."
+
 
 def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: str) -> bool:
     """True if `branch_name` has commits that `base_branch` does not (local only)."""

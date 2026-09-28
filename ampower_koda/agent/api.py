@@ -168,6 +168,11 @@ def start_agent(request_name: str):
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "cost_estimate": 0,
+        # A fresh run works on a new branch, so the old branch's PR is not its PR.
+        # Follow-ups (submit_follow_up) keep all three.
+        "branch_name": "",
+        "pr_url": "",
+        "pr_number": 0,
         # files_changed is a JSON column with a json_valid() CHECK constraint —
         # "" is not valid JSON, so clear it with NULL (allowed) instead.
         "files_changed": None,
