@@ -11,7 +11,6 @@ from ..constants import (
     COCHANGE_MAX_FILES_PER_COMMIT,
     COCHANGE_MAX_NEIGHBOURS,
     DEFAULT_ARCHITECT_MODEL,
-    DEFAULT_REDACT_GLOBS,
     DEFAULT_SEARCH_LIMIT,
     DEFAULT_WINDOW_TOKENS,
     MAP_MAX_TOKENS,
@@ -159,9 +158,12 @@ class HistoryConfig:
 class SecurityConfig:
     """What never leaves the machine."""
 
-    redact_globs: tuple[str, ...] = DEFAULT_REDACT_GLOBS
-    """Matched before a file is read for parsing. A redacted file is skipped at
-    discovery and reported with reason ``redacted``, not silently absent."""
+    redact_globs: tuple[str, ...] = ()
+    """Appended to the built-in ``DEFAULT_REDACT_GLOBS``, never replacing them:
+    ``["*.pem"]`` once replaced them and made ``.env`` an ordinary indexed file.
+    Matched before a file is read for parsing. A redacted file is skipped at
+    discovery and reported with reason ``redacted``, not silently absent, and
+    the read tools refuse it."""
 
     def validate(self) -> None:
         if any(not glob.strip() for glob in self.redact_globs):

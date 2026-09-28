@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
@@ -15,6 +16,7 @@ from ..ledger.recall import rehydrate
 from ..retrieval.engine import Retriever, search
 from ..retrieval.excerpts import excerpt
 from ..workspace.ports import Workspace
+from ..workspace.redaction import redaction_matcher
 from .results import cap_chars, cap_rows
 
 SEARCH_HITS = 10
@@ -245,6 +247,11 @@ def _read(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG001
     if not path:
         return ToolOutcome(text="[error: read needs a path or a symbol]", ok=False)
 
+    pattern = _redacted(path, retriever, workspace)
+    if pattern is not None:
+        return ToolOutcome(text=f"[error: {path} matches the redaction pattern {pattern} "
+                                "(secrets are never read)]", ok=False)
+
     lines = split_lines(workspace.read_bytes(path).decode("utf-8", errors="replace"))
     start = max(1, int(arguments.get("start", 1) or 1))
     end = int(arguments.get("end", 0) or (start + READ_DEFAULT_LINES - 1))
@@ -291,6 +298,16 @@ def _read(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG001
         entry_text="" if partial else f"{path}:{start}-{shown_end}",
         truncated=partial or shown_end < len(lines),
     )
+
+
+def _redacted(path: str, retriever: Retriever, workspace: Workspace) -> str | None:
+    """The pattern that redacts ``path``, or ``None``. Redaction guards reads too,
+    not only the index: a file skipped as ``redacted`` could still be read by path."""
+    normalised = posixpath.normpath(path.replace("\\", "/"))
+    skipped = retriever.index.skipped.get(normalised)
+    if skipped is not None and skipped.reason == "redacted":
+        return skipped.detail.removeprefix("matched ")
+    return redaction_matcher(workspace)(normalised)
 
 
 def _grep(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG001
