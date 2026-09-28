@@ -1337,7 +1337,10 @@ function setup_status_polling(frm) {
     }
 
     var active = ['Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing'];
-    if (active.indexOf(frm.doc.status) === -1) return;
+    // A queued request with a job is followed until the job starts or ends, so
+    // a worker that fails before its first update is not shown as Queued forever.
+    var queued_job = frm.doc.status === 'Queued' && !!(frm.doc.rq_job_id || frm.doc.agent_run_id);
+    if (active.indexOf(frm.doc.status) === -1 && !queued_job) return;
 
     var poll_interval = (frm.doc.status === 'Building' || frm.doc.status === 'Pushing') ? 5000 : 10000;
 

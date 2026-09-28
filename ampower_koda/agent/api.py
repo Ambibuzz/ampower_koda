@@ -61,8 +61,12 @@ BENCH_LOG_MAX_CHARS = 50000
 
 
 def _reconcile_if_dead(doc) -> bool:
-    """Flip a busy request to Failed when its RQ job is no longer running."""
-    if doc.status not in BUSY_STATUSES:
+    """Flip a busy request to Failed when its RQ job is no longer running.
+
+    A Queued request with a job counts too: a job lost before it started would
+    otherwise leave the form polling a request that never starts.
+    """
+    if doc.status not in BUSY_STATUSES and doc.status != "Queued":
         return False
     if not (doc.rq_job_id or "").strip():
         return False
