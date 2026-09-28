@@ -271,6 +271,7 @@ def execute_existing_plan(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
 
     # Implementation can only start if we are at the approval stage or have finished a previous run.
     if doc.status not in PLAN_EXECUTABLE_STATUSES:
@@ -307,6 +308,7 @@ def approve_plan(request_name: str, plan_json: str = None):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status != "Awaiting Approval":
         frappe.throw(_("Cannot approve plan. Agent status is {0}.").format(doc.status))
 
@@ -568,6 +570,7 @@ def approve_bench(request_name: str, commands: str = None):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status != "Awaiting Bench Approval":
         frappe.throw(_("Cannot approve bench. Agent status is {0}.").format(doc.status))
 
@@ -616,6 +619,7 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status != "Awaiting Push Approval":
         frappe.throw(_("Cannot push. Agent status is {0}.").format(doc.status))
 
@@ -654,6 +658,7 @@ def checkout_base_branch(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     app_name = (doc.target_app_name or "").strip()
     base_branch = (doc.base_branch or "main").strip()
 
@@ -706,6 +711,7 @@ def get_default_bench_commands(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     app_name = (doc.target_app_name or "").strip()
     site_name = frappe.local.site
 
@@ -728,6 +734,7 @@ def run_selected_bench_commands(request_name: str, commands: str = None):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status in BUSY_STATUSES:
         frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
@@ -818,6 +825,7 @@ def get_agent_status(request_name: str):
     if not request_name:
         frappe.throw(_("Request name is required."))
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     _reconcile_if_dead(doc)
     return {
         "name": doc.name,
@@ -1000,6 +1008,7 @@ def get_change_tree(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     app_name = (doc.target_app_name or "").strip()
     if not app_name:
         frappe.throw(_("Target app is not set on this request."))
@@ -1049,6 +1058,7 @@ def get_file_diff(request_name: str, file_path: str):
         frappe.throw(_("File path is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     app_name = (doc.target_app_name or "").strip()
     if not app_name:
         frappe.throw(_("Target app is not set on this request."))
@@ -1154,6 +1164,7 @@ def get_file_content(request_name: str, file_path: str):
         frappe.throw(_("File path is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     _require_request_branch(doc)
     app_name = (doc.target_app_name or "").strip()
     if not app_name:
@@ -1187,6 +1198,7 @@ def save_file_content(request_name: str, file_path: str, content: str):
         frappe.throw(_("File content is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status in BUSY_STATUSES:
         frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
@@ -1216,6 +1228,7 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if not (doc.branch_name or "").strip():
         frappe.throw(_("No branch on this request."))
 
