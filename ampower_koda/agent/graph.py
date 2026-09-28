@@ -2985,6 +2985,9 @@ def review_node(state: dict) -> dict:
         test_health, receipts = verification.run_verification(
             state["target_app_name"], contract, env=_get_bench_env(), required=required,
         )
+        # The warning reflects these tests only: cleared here, set again below if they still fail
+        # after the repair cap. Earlier failures stay in the receipts of the reviews that saw them.
+        updates["tests_unresolved"] = ""
         health.results.extend(test_health.results)
         for receipt in receipts:
             receipt["source_revisions"] = {p: revision(content) for p, content in reviewed_content.items()}
