@@ -1264,7 +1264,13 @@ def _bounded_tool_result(name: str, arguments: dict, result: str) -> str:
             return (f'[{arguments.get("path", "")}] lines {start}-{end} of {total[1]}\n'
                     + complete.split('\n', 1)[1]
                     + f'\n[Output limit reached. Continue with read_file start_line={end + 1}; use a focused end_line.]')
-    return result[:limit] + '\n[Output limit reached; request a narrower path or source range.]'
+    # Keep both ends: a traceback's cause and a test run's verdict are at the tail.
+    head = result[:limit // 2].rsplit('\n', 1)[0]
+    tail = result[-(limit // 2):].split('\n', 1)[-1]
+    omitted = len(result) - len(head) - len(tail)
+    return (f'[{len(result):,} chars, {result.count(chr(10)) + 1:,} lines; the middle {omitted:,} chars are '
+            'omitted. Request a narrower path or source range for them.]\n'
+            + head + f'\n… [{omitted:,} chars omitted] …\n' + tail)
 
 
 def _compact_round_summary(round_entry: dict) -> list[str]:
@@ -1514,7 +1520,9 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         prune("context_limit", force=True)
         if size() <= cleanup_target(limit):
             return current()
-        target = min(cleanup_target(limit), limit // 2)
+        # A compaction resends the whole retained history uncached, so leave room
+        # for about two thirds of the limit before the next one.
+        target = min(cleanup_target(limit), limit // 3)
         cap_compacted()
         while len(rounds) > MIN_KEEP_ROUNDS and size() > target:
             compacted.extend(_compact_round_summary(rounds.pop(0)))
