@@ -938,6 +938,11 @@ def validate_code(app_name: str, path: str) -> str:
             try:
                 import ast
                 ast.parse(content)
+                # ast.parse accepts `return` outside a function, duplicate
+                # arguments, misplaced global/nonlocal etc.; the compiler does
+                # not. Compiled only, never executed. The full path lets the
+                # compiler read the offending line back for the excerpt.
+                compile(content, full, "exec", dont_inherit=True)
                 return f"VALID: {path} has no syntax errors."
             except SyntaxError as e:
                 return (
