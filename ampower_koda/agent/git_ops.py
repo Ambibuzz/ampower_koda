@@ -438,17 +438,29 @@ def checkout_base(app_name: str, base_branch: str = "main") -> tuple[bool, str]:
     """
     root = get_repo_root(app_name)
 
-    run_git(["reset", "--hard", "HEAD"], cwd=root)
-    run_git(["clean", "-fdx"], cwd=root)
+    ok, out = run_git(["reset", "--hard", "HEAD"], cwd=root)
+    if not ok:
+        return False, f"git reset --hard failed: {out}"
+    # No -x: ignored files (node_modules, a gitignored .env) are not changes to
+    # discard, and -x wiped them with every reset. .koda/ holds the app's Koda
+    # config and regression tests, which are not ignored but are not discarded either.
+    ok, out = run_git(["clean", "-fd", *KODA_CLEAN_EXCLUDES], cwd=root)
+    if not ok:
+        return False, f"git clean failed: {out}"
 
     current = get_current_branch(app_name)
     if current == base_branch:
-        run_git(["pull", "origin", base_branch], cwd=root)  
-        return True, f"Already on {base_branch}, pulled latest"
+        done = f"Already on {base_branch}"
+    else:
+        ok, out = run_git(["checkout", base_branch], cwd=root)
+        if not ok:
+            return False, f"checkout {base_branch} failed: {out}"
+        done = f"Checked out {base_branch}"
 
-    ok, out = run_git(["checkout", base_branch], cwd=root)
+    if not run_git(["remote", "get-url", "origin"], cwd=root)[0]:
+        return True, f"{done}; no 'origin' remote, so nothing was pulled"
+    # --ff-only: a diverged base fails here instead of leaving a merge or conflicts.
+    ok, out = run_git(["pull", "--ff-only", "origin", base_branch], cwd=root)
     if not ok:
-        return False, f"checkout {base_branch} failed: {out}"
-
-    run_git(["pull", "origin", base_branch], cwd=root)
-    return True, f"Checked out {base_branch}"
+        return False, f"{done}, but pulling origin/{base_branch} failed: {out}"
+    return True, f"{done}, pulled latest"

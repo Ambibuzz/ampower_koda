@@ -657,6 +657,9 @@ def checkout_base_branch(request_name: str):
 
     ok, msg = checkout_base(app_name, base_branch)
     if not ok:
+        # Recorded too: a failure can come after the reset already discarded work,
+        # and the form must not go on to bench commands on unsynchronized source.
+        _append_bench_log(request_name, f"$ git checkout {base_branch}\nFAILED\n{(msg or '').strip()}\n")
         frappe.throw(_("Failed to checkout base branch: {0}").format(msg))
 
     # Persisted, not just broadcast. This discards uncommitted work in the target
