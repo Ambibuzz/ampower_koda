@@ -1,7 +1,7 @@
 """A second reader of the implementation, on its own append-only conversation.
 
-It reads each round that changed files, so defects are fixed in the next call
-instead of after a full review pass. Its conversation only grows, so each call
+It reads the rounds that changed files, a few at a time, so defects are fixed during
+implementation instead of after a full review pass. Its conversation only grows, so each call
 reuses a cached prefix.
 """
 
@@ -13,6 +13,9 @@ import re
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 MAX_CALLS = 12          # per implementation pass
+# Write rounds read per call. Advising every round spent 16 calls on one run, 12 with no note;
+# reading three rounds together catches the same defects a little later for a third of the calls.
+ADVISE_EVERY = 3
 MAX_NOTES = 3
 DELTA_CHARS = 12_000    # of one round's changes
 BODY_CHARS = 4_000      # of one written body or edit
@@ -94,9 +97,11 @@ def directive(notes: list[dict]) -> str:
 
 
 class Advisor:
-    def __init__(self, llm, contract: str, *, max_calls: int = MAX_CALLS):
+    def __init__(self, llm, contract: str, *, max_calls: int = MAX_CALLS, every: int = ADVISE_EVERY):
         self.llm = llm
         self.max_calls = max_calls
+        self.every = max(1, every)
+        self.pending: list[str] = []
         self.calls = 0
         self.messages = [SystemMessage(content=SYSTEM), HumanMessage(content=contract)]
         self.given: set[str] = set()
@@ -108,8 +113,12 @@ class Advisor:
         delta = render_round(round_entry)
         if not delta:
             return [], None
+        self.pending.append(delta)
+        if len(self.pending) < self.every:
+            return [], None
         self.calls += 1
-        messages = [*self.messages, HumanMessage(content=delta)]
+        messages = [*self.messages, HumanMessage(content="\n\n".join(self.pending))]
+        self.pending = []
         reply = self.llm.invoke(messages)
         text = _text(reply.content)
         self.messages = [*messages, AIMessage(content=text)]
