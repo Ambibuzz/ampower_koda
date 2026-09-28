@@ -10,7 +10,10 @@ alone (compare-outputs/browser-lab/FINDINGS.md).
 """
 
 import difflib
+import json
+import os
 import re
+import sys
 MAX_STEPS = 20
 DIFF_LINES = 25
 REMOVED_SHOWN = 3  # removed lines listed per changed block before the rest are counted
@@ -488,5 +491,154 @@ def expects(step):
     """The step's expects: one text or object, or a list of them."""
     expect = step.get("expect")
     return [e for e in expect if e] if isinstance(expect, list) else [expect] if expect else []
+
+
+def plain(text):
+    return " ".join(str(text).split()).lower()
+
+
+def pick(candidates, text):
+    """The element an expect means by ``text``: one labelled exactly that before one that contains it."""
+    return next((c for c in candidates if plain(c[0]) == plain(text)), candidates[0] if candidates else None)
+
+
+def at(candidate):
+    return f"x={candidate[1]},y={candidate[2]}"
+
+
+def order_result(texts, axis, found):
+    """Whether the texts' centres increase along the axis, in the given order. ``found`` maps each text
+    to its visible matches as (label, x, y)."""
+    index = 1 if axis == "x" else 2
+    chosen = [(text, pick(found.get(text) or [], text)) for text in texts]
+    missing = [text for text, candidate in chosen if candidate is None]
+    if missing:
+        return False, "not visible: " + ", ".join(quote(text) for text in missing)
+    positions = ", ".join(f"{quote(text)} {axis}={candidate[index]}" for text, candidate in chosen)
+    for (a, first), (b, second) in zip(chosen, chosen[1:]):
+        if second[index] <= first[index]:
+            return False, f"{positions}; {quote(b)} is not {'right of' if axis == 'x' else 'below'} {quote(a)}"
+    return True, positions
+
+
+def inside(candidate, box, slack=1):
+    left, top, right, bottom = box
+    return left - slack <= candidate[1] <= right + slack and top - slack <= candidate[2] <= bottom + slack
+
+
+def region_name(region):
+    left, top, right, bottom = region["box"]
+    return f"{region['label']} (by {region['how']}) x={left}-{right} y={top}-{bottom}"
+
+
+def within_result(text, name, candidates, regions):
+    """Whether ``text`` is shown inside a region found by ``name``: some visible match has its centre in
+    one of the region's boxes."""
+    if not regions:
+        return False, f"no visible region matches {quote(name)} (by selector, aria label, role or heading)"
+    if not candidates:
+        return False, f"{quote(text)} is not visible"
+    for candidate in candidates:
+        for region in regions:
+            if inside(candidate, region["box"]):
+                return True, f"{quote(text)} at {at(candidate)} inside {region_name(region)}"
+    shown = "; ".join(at(c) for c in candidates[:3])
+    return False, f"{quote(text)} is at {shown}, outside " + "; ".join(region_name(r) for r in regions[:3])
+
+
+def absent_result(text, candidates):
+    if not candidates:
+        return True, ""
+    return False, f"{quote(text)} is visible at " + "; ".join(f"{at(c)} ({quote(c[0], 30)})" for c in candidates[:3])
+
+
+def count_result(counted, low, high):
+    n, how = counted["n"], counted["how"]
+    passed = n >= low and (high is None or n <= high)
+    wanted = f"at least {low}" + (f" and at most {high}" if high is not None else "")
+    return passed, f"{n} visible by {how}" + ("" if passed else f", wanted {wanted}")
+
+
+def expect_result(expect, visible_text, find):
+    """(passed, detail) for one expect. A text is looked for in the visible text as before; an object
+    asks the page through ``find(ask)``, which returns FIND_JS's answer or None if the page gave none."""
+    if isinstance(expect, dict) and "text" in expect and "within" not in expect:
+        expect = expect["text"]
+    if not isinstance(expect, dict):
+        seen = str(expect).lower() in visible_text().lower()
+        return seen, "" if seen else "not visible"
+    if "order" in expect:
+        texts = [str(t) for t in expect["order"]] if isinstance(expect["order"], list) else []
+        axis = expect.get("axis", "x")
+        if len(texts) < 2 or axis not in ("x", "y"):
+            return False, "order needs a list of at least two texts and an axis of \"x\" or \"y\""
+        found = find({"texts": texts})
+        return order_result(texts, axis, found["texts"]) if found else (False, "the page could not be read")
+    if "within" in expect:
+        text, name = str(expect["text"]), str(expect["within"])
+        found = find({"texts": [text], "region": name})
+        return (within_result(text, name, found["texts"][text], found["regions"]) if found
+                else (False, "the page could not be read"))
+    if "absent" in expect:
+        text = str(expect["absent"])
+        found = find({"texts": [text]})
+        return absent_result(text, found["texts"][text]) if found else (False, "the page could not be read")
+    if "count" in expect:
+        found = find({"count": str(expect["count"])})
+        high = expect.get("max")
+        return (count_result(found["count"], int(expect.get("min", 1)), None if high is None else int(high))
+                if found else (False, "the page could not be read"))
+    return False, "unknown expect; use a text or an object with order, text and within, absent, or count"
+
+
+def expect_line(expect, passed, detail):
+    shown = json.dumps(expect, ensure_ascii=False)
+    if passed:
+        return f"  expect {shown}: PASS" + (f" ({detail})" if detail else "")
+    return f"  expect {shown}: FAIL ({detail})"
+
+
+def body_summary(body, status):
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body[:200]
+    if status >= 400 or "exc" in data or "exception" in data:
+        text = str(data.get("exception") or data.get("exc") or "")
+        messages = data.get("_server_messages")
+        if messages:
+            try:
+                text += " " + " ".join(json.loads(m).get("message", "") for m in json.loads(messages))
+            except (TypeError, ValueError, AttributeError):
+                text += " " + str(messages)
+        text = text.replace("\\n", "\n")
+        found = re.findall(r"([A-Za-z_.]*(?:Error|Exception)\b[^\"\n]{0,200})", text)
+        return (found[-1] if found else text)[:400]
+    return json.dumps(data.get("message"), default=str, separators=(",", ":"))[:RESPONSE_CHARS]
+
+
+def sign_in(context, page, base, login, session_file):
+    """Reuse the last check's session: Frappe rate-limits one-time login keys per address."""
+    sid = None
+    try:
+        sid = json.load(open(session_file)).get("sid")
+    except (OSError, ValueError):
+        pass
+    if sid:
+        context.add_cookies([{"name": "sid", "value": sid, "url": base}])
+        probe = context.request.get(base + "/api/method/frappe.auth.get_logged_user")
+        if not (probe.ok and probe.json().get("message") == "Administrator"):
+            sid = None
+            context.clear_cookies()
+    if not sid:
+        signed = page.goto(login, wait_until="domcontentloaded")
+        if signed is not None and signed.status == 429:
+            print("KODA_RENDER_UNAVAILABLE the site rate-limited the sign-in; check again in a minute.", flush=True)
+            sys.exit(4)
+        sid = next((c["value"] for c in context.cookies() if c["name"] == "sid"), None)
+        if sid and sid != "Guest":
+            with open(session_file, "w") as handle:
+                json.dump({"sid": sid}, handle)
+            os.chmod(session_file, 0o600)
 
 
