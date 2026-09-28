@@ -198,7 +198,8 @@ PLAN_RULES = """### Planning principles
    reference contract is part of the task: the same parameters, response keys,
    data reach, interactions and states. The description names the reference file of each new
    file and says to start from a copy of it, then change only the CHANGE items. Acceptance
-   criteria cover the kept contract as well as the changes.
+   criteria cover the kept contract as well as the changes, including one real record that only
+   the kept data walk reaches (a record reached through the reference's links, not the start itself).
 
 ### Task fields
 - Use sequential ids: `TODO 1`, `TODO 2`, and so on.
@@ -265,10 +266,18 @@ approves the plan.
 - A copy or adaptation of an existing feature: that feature is the specification. Read it with a purpose
   such as "inventory the contract: endpoints, parameters, response keys, what the data walk connects,
   controls, states", then mark each part KEEP or CHANGE; a CHANGE quotes the request words that ask for
-  it, and "X except Y" narrows only Y. A CHANGE that shows a different kind of record in place of
+  it, and "X except Y" narrows only Y. The data walk is KEEP: which records it starts from, which
+  records it reaches through which links, and how far. When the request swaps one element of the
+  reference's chain for another ("A -> B" becomes "A -> C"), only B is replaced: the walk still reaches
+  further A records the way the reference does, and C is shown where B was, along that same walk. A new
+  kind of node or "different logic" does not narrow the walk; only request words that exclude part of
+  it do. A CHANGE that shows a different kind of record in place of
   another keeps the reference's node identity: each distinct record of the new kind is one node or row,
   as each distinct record of the old kind was. Implementation copies it with copy_file, so the plan
-  needs its contract, not its text.
+  needs its contract, not its text. When the request asks for the UI or UX to differ, name the new layout
+  and interaction in the plan concretely (what replaces the reference's canvas, controls and panel), and
+  for a graph or flow say which way it reads: which node is drawn where, and that each edge points from
+  source to destination.
 - explore(question) hands an app-wide question to a helper and returns its findings without filling
   this conversation.
 - Stop when you can name the exact change surface, the current behavior of every part it touches and
