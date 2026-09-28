@@ -1,6 +1,7 @@
-"""One append-only conversation per request: investigation, approval, implementation, repairs.
+"""One append-only conversation per request: investigation, approval, implementation, follow-ups.
 
-Each prompt is an exact prefix of the next, so the provider cache covers it.
+Each prompt is an exact prefix of the next, so the provider cache covers it. A repair after a
+review verdict is the exception: it runs in its own compact conversation (see ``_repair_opening``).
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ EXPLORE_REPORT_CHARS = 8000
 PERSISTED = ("compacted", "task_prompt", "rounds_done", "failed_calls", "failure_causes",
              "write_generation", "tool_progress_generation", "round_cap_tokens", "final_cap_tokens",
              "evidence_chars", "proposed_plan", "approved", "investigated", "follow_up",
-             "strategy_level_sent")
+             "strategy_level_sent", "repair_key", "repair_for", "earlier_repairs")
 
 PLANNING = "plan"
 IMPLEMENTATION = "work"
@@ -247,6 +248,7 @@ def plan_node(state: dict) -> dict:
         save(request_name, history, PLANNING)
         # An implementation of an older plan must never continue under this one.
         _path(request_name).unlink(missing_ok=True)
+        _path(request_name, REPAIR).unlink(missing_ok=True)
         plan = plan_to_markdown(sink.plan)
         steps = list(state.get("intermediate_steps") or []) + [{"phase": "Planning", "output": plan}]
         logs = graph._log_stage({**state, "stage_log": logs}, "Planning", "completed",
@@ -507,7 +509,9 @@ def implement_node(state: dict) -> dict:
     follow_up = (state.get("follow_up_message") or "").strip() if state.get("is_follow_up") else ""
     # The worktree at the follow-up's start tells a repeated message apart from a resumed run.
     follow_up_key = f"{state.get('follow_up_worktree_before', '')}\n{follow_up}"
+    main, kind = history, IMPLEMENTATION
     if follow_up and history.get("follow_up") != follow_up_key:
+        _path(request_name, REPAIR).unlink(missing_ok=True)  # the last run's repairs are not this one's
         if not history.get("approved"):
             graph._queue_directive(history, get_session_implemented_plan_prompt(plan_json))
             history["approved"] = True
@@ -516,6 +520,7 @@ def implement_node(state: dict) -> dict:
                               get_session_follow_up_prompt(follow_up, request_name=request_name), kind="follow_up")
         history["follow_up"] = follow_up_key
     elif not history.get("approved"):
+        _path(request_name, REPAIR).unlink(missing_ok=True)
         investigated = history.get("investigated", True)
         if investigated:
             _compact_investigation(history)
@@ -524,6 +529,10 @@ def implement_node(state: dict) -> dict:
             investigated=investigated, request_name=request_name,
             findings=state.get("understanding_summary") or ""))
         history["approved"] = True
+    elif state.get("review_notes") and _fresh_repair(state):
+        # A review finding is repaired in a compact conversation of its own: plan, findings, the
+        # current diff and the verdict, not the 125k+ implementation conversation.
+        history, kind = _repair_conversation(state, main, baseline, criteria), REPAIR
     elif state.get("review_notes"):
         graph._queue_followup(history, json.dumps(state.get("task_completion") or {}, ensure_ascii=False),
                               _repair_directive(state, history), kind="repair")
@@ -538,16 +547,18 @@ def implement_node(state: dict) -> dict:
     model = state.get("ai_model", "gpt-4o-mini")
     llm = graph._get_llm(provider=provider, model=model, session_id=request_name)
     # Saved at start, after every round and on interrupt, so a resume never continues an older one.
-    work = _path(request_name)
+    work = _path(request_name, kind)
     prior = work.read_bytes() if work.is_file() else None
     session = {"plan_sink": None, "explorer": _explorer(state, llm, provider, request_name),
-               "after_round": lambda: save(request_name, history)}
-    save(request_name, history)
+               "after_round": lambda: save(request_name, history, kind),
+               # A repair opens like the review: the request, plan context and findings as one shared message.
+               "shared_context": kind == REPAIR}
+    save(request_name, history, kind)
     try:
         updates = graph._run_agent_turn(state, "Implementing", history["task_prompt"], read_only_tools=False,
                                         max_rounds=graph.MAX_TOOL_ROUNDS_EXECUTION, history=history, session=session)
     except BaseException:
-        save(request_name, history)
+        save(request_name, history, kind)
         raise
     if updates.get("review_stopped"):
         # Roll back the conversation so a follow-up does not inherit an unanswered repair.
@@ -558,8 +569,15 @@ def implement_node(state: dict) -> dict:
         return {"review_stopped": updates["review_stopped"],
                 "stage_log": graph._log_stage({**state, "stage_log": logs}, "Implementing", "stopped",
                                               updates["review_stopped"][:200])}
-    save(request_name, history)
-    return {**graph._implementation_updates(state, updates, logs), "resuming": False}
+    save(request_name, history, kind)
+    result = {**graph._implementation_updates(state, updates, logs), "resuming": False}
+    if kind == REPAIR:
+        # The implementation conversation stays the request's conversation (follow-ups continue it):
+        # it learns of the repair as one appended message, so its cached prefix is kept.
+        graph._queue_directive(main, _repair_record(state, result.get("task_completion") or {}))
+        main["rounds_done"] = max(int(main.get("rounds_done") or 0), int(history.get("rounds_done") or 0))
+        save(request_name, main)
+    return result
 
 
 def build_planning_graph():
