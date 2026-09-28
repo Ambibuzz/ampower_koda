@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import uuid
 
 import frappe
@@ -17,7 +18,9 @@ from ampower_koda.agent import session as koda_session
 from ampower_koda.agent import tools as agent_tools
 from ampower_koda.agent import verification
 from ampower_koda.agent.checkpoint import ExecutionJournal, restore_checkpoint, cleanup_temporaries
-from ampower_koda.agent.run_control import managed_job, current_run, check_active, set_request_value
+from ampower_koda.agent.run_control import (
+    managed_job, current_run, check_active, set_request_value, run_context, RunStopped,
+)
 from ampower_koda.agent.graph import _get_bench_env, _message_content_to_str
 from ampower_koda.agent.git_ops import (
     KODA_CLEAN_EXCLUDES,
@@ -925,6 +928,12 @@ def _bench_root() -> str:
     return os.path.normpath(os.path.join(frappe.get_app_path("frappe"), "..", "..", ".."))
 
 
+def _append_receipt(request_name: str, block: str) -> None:
+    # api.py imports this module, so the shared bench-log writer is imported late.
+    from ampower_koda.agent.api import _append_bench_log
+    _append_bench_log(request_name, block)
+
+
 def _run_bench_command(user, request_name, cmd, bench_root, bench_env):
     """Run one command without a shell. Returns (receipt, failure); failure is "" on success."""
     _publish_bench_log(user, request_name, cmd, True, "Running...")
@@ -953,6 +962,107 @@ def _run_bench_command(user, request_name, cmd, bench_root, bench_env):
     _publish_bench_log(user, request_name, cmd, ok, out[:180])
     status_str = "OK" if ok else f"FAILED (exit {result.returncode})"
     return f"$ {cmd}\n{status_str}\n{out.strip()}\n", "" if ok else f"{cmd} (exit {result.returncode})"
+
+
+# A service restart stops the worker that asked for it, so it cannot be awaited
+# in-process. This helper runs it in its own session, keeps its output, and
+# reports the result back through `bench execute` once the services are up.
+_RESTART_HELPER = """
+import json, subprocess, sys
+spec = json.loads(sys.argv[1])
+try:
+    done = subprocess.run(spec["argv"], cwd=spec["cwd"], capture_output=True, text=True,
+                          timeout=spec["timeout"])
+    code, out = done.returncode, (done.stdout or "") + (done.stderr or "")
+except subprocess.TimeoutExpired:
+    code, out = -1, "TIMEOUT after %ss" % spec["timeout"]
+except Exception as exc:
+    code, out = -1, "ERROR: %s" % exc
+with open(spec["output_path"], "w", encoding="utf-8") as handle:
+    handle.write(out[-20000:])
+print("koda restart %r exited %s" % (spec["argv"], code), flush=True)
+sys.exit(subprocess.run(["bench", "--site", spec["site"], "execute",
+                         "ampower_koda.agent.executor.record_service_restart",
+                         "--kwargs", json.dumps(dict(spec["record"], returncode=code))],
+                        cwd=spec["cwd"]).returncode)
+"""
+
+
+def _restart_output_path(token: str) -> str:
+    if uuid.UUID(hex=token).hex != token:
+        raise ValueError("Invalid restart token.")
+    return os.path.join(_bench_root(), "logs", f"koda-restart-{token}.out")
+
+
+def _start_service_restart(request_name, user, cmd, bench_root, bench_env, promote: bool) -> None:
+    """Launch the restart detached; its outcome arrives in record_service_restart."""
+    try:
+        token = uuid.uuid4().hex
+        spec = {
+            "argv": parse_bench_command(cmd),
+            "cwd": bench_root,
+            "timeout": SERVICE_RESTART_TIMEOUT,
+            "site": frappe.local.site,
+            "output_path": _restart_output_path(token),
+            "record": {"request_name": request_name, "run_id": current_run().run_id,
+                       "command": cmd, "token": token, "promote": int(promote)},
+        }
+        os.makedirs(os.path.dirname(spec["output_path"]), exist_ok=True)
+        with open(os.path.join(bench_root, "logs", "koda-service-restart.log"), "a", encoding="utf-8") as log:
+            subprocess.Popen(
+                [sys.executable, "-c", _RESTART_HELPER, json.dumps(spec)],
+                cwd=bench_root,
+                env=bench_env,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # outlives the worker the restart stops
+            )
+    except Exception as e:
+        log_agent_error(
+            "Agent Executor: service restart",
+            f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
+        )
+        _finish_service_restart(request_name, user, cmd, -1, f"ERROR: could not start: {e}", promote)
+
+
+def _finish_service_restart(request_name, user, cmd, returncode: int, output: str, promote: bool) -> None:
+    """Record a restart's receipt; only a success moves the approval flow on to push."""
+    ok = returncode == 0
+    status_str = "OK" if ok else f"FAILED (exit {returncode})"
+    _append_receipt(request_name, f"$ {cmd}\n{status_str}\n{(output or '').strip()}\n")
+    _publish_bench_log(user, request_name, cmd, ok, (output or "")[-180:])
+    try:
+        status = frappe.db.get_value(DOCTYPE_NAME, request_name, "status")
+        if ok and promote and status == "Awaiting Bench Approval":
+            _update_status(request_name, user, "Awaiting Push Approval",
+                "Bench commands and service restart done. Test the changes, then approve push to commit and push.",
+                error_log="")
+        elif ok:
+            _update_status(request_name, user, status, f"Service restart finished: {cmd}")
+        else:
+            _update_status(request_name, user, status,
+                f"Service restart FAILED (exit {returncode}): the previous code may still be running. "
+                "See the bench log, fix the restart, and rerun it.",
+                error_log=f"{cmd} (exit {returncode})\n{(output or '').strip()[-2000:]}")
+    except RunStopped:
+        pass  # a newer run owns the request; the receipt above is still kept
+
+
+def record_service_restart(request_name: str, run_id: str, command: str, token: str,
+                           returncode: int, promote: int = 0) -> None:
+    """Receive a deferred restart's result. Called by _RESTART_HELPER via `bench execute`."""
+    frappe.set_user("Administrator")
+    path = _restart_output_path(token)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            output = handle.read()
+        os.remove(path)
+    except OSError as e:
+        output = f"(restart output unavailable: {e})"
+    owner = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
+    with run_context(request_name, run_id):
+        _finish_service_restart(request_name, owner, command, int(returncode), output, bool(int(promote)))
 
 
 @managed_job
@@ -1007,9 +1117,9 @@ def run_bench_and_commit(request_name: str) -> None:
             if failure:
                 failed_cmds.append(failure)
 
-        if deferred_cmds and not failed_cmds:
-            for cmd in deferred_cmds:
-                bench_output_parts.append(f"$ {cmd}\n(deferred — runs after status update)\n")
+        for cmd in deferred_cmds:
+            bench_output_parts.append(f"$ {cmd}\nNOT RUN: an earlier command failed\n" if failed_cmds else
+                                      f"$ {cmd}\nPENDING: runs last; its result is appended when it finishes\n")
 
         bench_log = "\n".join(bench_output_parts)
 
@@ -1024,33 +1134,29 @@ def run_bench_and_commit(request_name: str) -> None:
                 "Repair the failing command and rerun bench verification before push."
             )
             extra["error_log"] = "\n".join(failed_cmds)
+        elif deferred_cmds:
+            # Push approval waits for the restart's own result: a denied or
+            # failed restart leaves the old code running.
+            message = (
+                f"Bench commands done on branch '{branch_name}'. Waiting for the service restart "
+                f"({', '.join(deferred_cmds)}) to report; push approval opens once it succeeds."
+            )
         else:
             message = (
                 f"Bench commands done on branch '{branch_name}'. "
                 "Test the changes, then approve push to commit and push."
             )
 
+        waiting = failed_cmds or deferred_cmds
         _update_status(
-            request_name, user, "Awaiting Bench Approval" if failed_cmds else "Awaiting Push Approval", message, **extra
+            request_name, user, "Awaiting Bench Approval" if waiting else "Awaiting Push Approval", message, **extra
         )
 
         frappe.db.commit()
 
         for cmd in (() if failed_cmds else deferred_cmds):
             check_active(reserve=5)
-            try:
-                subprocess.Popen(
-                    cmd.split(),
-                    cwd=bench_root,
-                    env=bench_env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception as e:
-                log_agent_error(
-                    "Agent Executor: deferred supervisorctl",
-                    f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
-                )
+            _start_service_restart(request_name, user, cmd, bench_root, bench_env, promote=True)
 
     except Exception as e:
         tb = frappe.get_traceback()
