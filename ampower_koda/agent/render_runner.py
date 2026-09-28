@@ -15,7 +15,9 @@ import os
 import re
 import sys
 import time
+import traceback
 import urllib.parse
+
 MAX_STEPS = 20
 DIFF_LINES = 25
 REMOVED_SHOWN = 3  # removed lines listed per changed block before the rest are counted
@@ -888,3 +890,108 @@ def first_visible(locator):
 def page_width(page):
     return (page.viewport_size or {}).get("width") or 0
 
+
+def main():
+    route, steps, shot, page_json, session_file = (sys.argv[1], json.loads(sys.argv[2]), sys.argv[3], sys.argv[4],
+                                                  sys.argv[5])
+    report_file = sys.argv[6] if len(sys.argv) > 6 else ""
+    report = {"route": route, "steps": []}
+    # Before anything touches the site: a missing runtime must not leave a Page registered.
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        print("KODA_RENDER_UNAVAILABLE the Python package playwright is not importable by " + sys.executable
+              + " (" + type(exc).__name__ + ": " + " ".join(str(exc).split())[:160] + "). Install it with "
+              "pip install 'ampower_koda[browser]' and then playwright install chromium, or point "
+              "KODA_PLAYWRIGHT_PYTHONPATH at an existing install.", flush=True)
+        sys.exit(4)
+    try:
+        os.chdir(os.environ["KODA_SITES_PATH"])
+        import frappe
+        frappe.init(site=os.environ["KODA_SITE"], sites_path=os.environ["KODA_SITES_PATH"])
+        frappe.connect()
+        if page_json:
+            # What bench migrate does for this one Page, so a page just written can be opened.
+            from frappe.modules.import_file import import_file_by_path
+            try:
+                import_file_by_path(page_json, force=True)
+                frappe.db.commit()
+                frappe.clear_cache()
+                report["registered"] = page_json
+            except Exception as exc:
+                report["registration_error"] = " ".join(str(exc).split())[:300]
+        from frappe.www.login import _generate_temporary_login_link
+        login = _generate_temporary_login_link("Administrator", 2)
+        base = (os.environ.get("KODA_RENDER_BASE_URL") or frappe.utils.get_url()).rstrip("/")
+        frappe.destroy()
+    except Exception:
+        traceback.print_exc(limit=4)
+        print("KODA_RUNNER_ERROR could not sign in to the site", flush=True)
+        sys.exit(3)
+
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch()
+        except Exception as exc:
+            print("KODA_RENDER_UNAVAILABLE Playwright is installed but could not launch Chromium (" + " ".join(
+                str(exc).split())[:160] + "). Install the browser with playwright install chromium (and "
+                "playwright install-deps chromium on Linux), or set PLAYWRIGHT_BROWSERS_PATH to where it is.",
+                flush=True)
+            sys.exit(4)
+        try:
+            context = browser.new_context(viewport={"width": 1440, "height": 1000})
+            context.add_init_script(MOTION_JS)
+            context.add_init_script(SMOOTH_JS)
+            tab = Page(context, context.new_page())
+            try:
+                sign_in(context, tab.page, base, login, session_file)
+            except SystemExit:
+                raise
+            except Exception as exc:
+                print("KODA_RENDER_UNAVAILABLE the site is not reachable at " + base + " (is the web server "
+                      "running?): " + " ".join(str(exc).split())[:200], flush=True)
+                sys.exit(4)
+            stage = "loading the page"
+            try:
+                response = tab.page.goto(base + route, wait_until="load")
+                report["status"] = response.status if response else None
+                # Watch the first seconds: late inserts, layout shifts and animations that never stop.
+                tab.evaluate("window.__motion && window.__motion.start()")
+                tab.settle(WATCH_LOAD_MS)
+                report["load"] = motion_lines(tab.evaluate("window.__motion ? window.__motion.stop() : null"),
+                                              tab.seen_animations, load=True)
+                for index, step in enumerate(steps[:int(os.environ.get("KODA_RENDER_MAX_STEPS", MAX_STEPS))], 1):
+                    stage = f"step {index}"
+                    report["steps"].append(tab.step_report(index, step))
+                stage = "reading the final page"
+                report["url"] = tab.page.url
+                text = tab.page.locator("body").inner_text()
+                report["not_found"] = bool(re.search(r"\bPage\s+\S[^\n]{0,80}\s+not found", text, re.I))
+                report["login_page"] = "/login" in tab.page.url
+                report["snapshot"] = compact(tab.snapshot())
+                report["layout"] = tab.evaluate(LAYOUT_JS, [])
+                report["viewport"] = tab.page.viewport_size
+                found = tab.evaluate(REACH_JS)
+                report["reach"] = reach_line(found, page_width(tab.page)) if found else ""
+                stage = "taking the screenshot"
+                tab.page.screenshot(path=shot, full_page=True)
+                report["screenshot"] = shot
+            except Exception as exc:
+                # Whatever was seen before the failure still goes back.
+                report["runner_error"] = f"the check stopped while {stage}: " + " ".join(
+                    f"{type(exc).__name__}: {exc}".split())[:300]
+            report["console"] = tab.console
+            report["api_failures"] = [f"{c['status']} {c['method']}: {c['body']}" for c in tab.calls
+                                      if (c["status"] or 0) >= 400][:15]
+        finally:
+            browser.close()
+    if report_file:
+        with open(report_file, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, default=str)
+        print("KODA_RENDER_REPORT_FILE", flush=True)
+    else:
+        print("KODA_RENDER_REPORT " + json.dumps(report, default=str), flush=True)
+
+
+if __name__ == "__main__":
+    main()
