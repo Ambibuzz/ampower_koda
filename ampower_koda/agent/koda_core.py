@@ -26,12 +26,14 @@ elision of old results, and a fold that summarises before anything is deleted.
 ``Workspace``       already implemented by the core's ``LocalWorkspace``, over
                     the app root Frappe resolves.
 
-Each explore call opens a fresh session. The last session per app root is kept
-(while the checkout is unchanged) so context suggestions skip a cold start.
+Each explore call starts a fresh conversation. The cold-start build per app root is
+kept (while the checkout is unchanged), so explore, context suggestions and
+starting points share one index instead of each paying a cold start.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -52,7 +54,7 @@ from ampower_koda.agent.reranking import OpenRouterReranker
 from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
 from ampower_koda.agent.core.budget.request import estimate_messages
 from ampower_koda.agent.core.config.merge import merge_config
-from ampower_koda.agent.core.config.load import resolve_config
+from ampower_koda.agent.core.config.load import CONFIG_PATH, resolve_config
 from ampower_koda.agent.core import (
     ROLE_PROMPT,
     LocalWorkspace,
@@ -62,6 +64,7 @@ from ampower_koda.agent.core import (
     ToolCall,
     ToolOutcome,
     TurnUsage,
+    allocate,
     open_session,
     run_turn,
     search,
@@ -575,21 +578,27 @@ def _rerank_client(site: str, api_key: str, model: str, timeout: float) -> OpenR
     return OpenRouterReranker(api_key=api_key, model=model, timeout_seconds=timeout)
 
 
+def _reranker_for(session: Session, model: str) -> OpenRouterReranker | None:
+    """The dedicated reranker for ``model``, or ``None`` when disabled or unconfigured."""
+    config = session.context.config.rerank
+    if not config.enabled:
+        return None
+    site = str(getattr(getattr(frappe, "local", None), "site", "") or "")
+    try:
+        settings = frappe.get_single("Agent Settings")
+        api_key = settings.get_password("openrouter_api_key") or ""
+    except Exception:
+        # Outside a Frappe site, the standard environment key supports
+        # scripts. A site never borrows another site's process-global key.
+        api_key = "" if site else os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key.strip():
+        return None
+    return _rerank_client(site, api_key.strip(), model, config.timeout_seconds)
+
+
 def _with_reranker(session: Session) -> Session:
     """Inject the service at the host boundary; the core imports no HTTP client."""
-    config = session.context.config.rerank
-    client = None
-    if config.enabled:
-        site = str(getattr(getattr(frappe, "local", None), "site", "") or "")
-        try:
-            settings = frappe.get_single("Agent Settings")
-            api_key = settings.get_password("openrouter_api_key") or ""
-        except Exception:
-            # Outside a Frappe site, the standard environment key supports
-            # scripts. A site never borrows another site's process-global key.
-            api_key = "" if site else os.environ.get("OPENROUTER_API_KEY", "")
-        if api_key.strip():
-            client = _rerank_client(site, api_key.strip(), config.model, config.timeout_seconds)
+    client = _reranker_for(session, session.context.config.rerank.model)
     return replace(session, retriever=replace(session.retriever, reranker=client))
 
 
@@ -601,42 +610,71 @@ def _without_reranker(session: Session) -> Session:
 
 
 #: One read-only session per app root, reused while the checkout is unchanged; held without
-#: the reranker, which is attached per call.
+#: the reranker, which is attached per call. Explore, find_code and starting points share it.
 _APP_SESSIONS: dict[str, tuple[str, Session]] = {}
+#: One lock per app root, so concurrent callers on a changed checkout share one cold start.
+_COLD_STARTS: dict[str, threading.Lock] = {}
 
 
 def _tree_key(app_name: str) -> str:
     """HEAD plus a content hash of every uncommitted change, tracked or not.
 
     ``git status`` would not do: a file that is already modified keeps the same
-    status line as it changes again, and the session would go stale.
+    status line as it changes again, and the session would go stale. Empty when
+    HEAD cannot be read: without it no change could be told apart, so nothing is held.
+    ``.koda/config.toml`` is hashed too: it is usually gitignored, so the worktree
+    signature misses it, and an edit (a new redaction glob) must rebuild the index.
     """
     repo_root = get_repo_root(app_name)
     ok, head = run_git(["rev-parse", "HEAD"], cwd=repo_root)
-    return f"{head.strip() if ok else ''}:{worktree_signature(repo_root)}"
-
-
-def remember_app_session(app_name: str, session: Session) -> None:
-    """Hold a session for searches while the checkout is unchanged."""
+    if not ok:
+        return ""
     try:
-        entry = (_tree_key(app_name), _without_reranker(session))
-    except Exception:
-        return  # not a git checkout, or git unavailable: fall back to cold start
-    with _SESSIONS_LOCK:
-        _APP_SESSIONS[_app_root(app_name)] = entry
+        config = hashlib.sha1(Path(_app_root(app_name), CONFIG_PATH).read_bytes()).hexdigest()
+    except OSError:
+        config = ""
+    return f"{head.strip()}:{worktree_signature(repo_root)}:{config}"
 
 
-def _app_session(app_name: str, *, rerank: bool = True) -> Session:
+def _for_model(session: Session, model: str) -> Session:
+    """The held index and retriever, with ``model``'s window and budget and no turn state.
+
+    Only the window depends on the model, and nothing cold start builds reads it,
+    so re-resolving the config and budget is all a different caller needs.
+    """
+    config = resolve_config(session.workspace, _overrides(model), [])
+    return Session(
+        workspace=session.workspace,
+        model_id=model,
+        context=replace(session.context, config=config),
+        retriever=session.retriever,
+        budget=allocate(
+            config.context.window_tokens,
+            ledger_override=config.context.ledger_soft_tokens,
+            memory_tokens=config.context.memory_tokens,
+            input_tokens=config.context.input_tokens,
+        ),
+        notes=session.notes,
+    )
+
+
+def _app_session(app_name: str, *, rerank: bool = True, model: str = DEFAULT_ARCHITECT_MODEL) -> Session:
+    """The app's held session for ``model``; a cold start only when the checkout changed."""
     root = _app_root(app_name)
-    key = _tree_key(app_name)
     with _SESSIONS_LOCK:
-        held = _APP_SESSIONS.get(root)
-    if held is not None and held[0] == key:
-        return _with_reranker(held[1]) if rerank else _without_reranker(held[1])
-    session = open_session(LocalWorkspace(root_path=Path(root)))
-    with _SESSIONS_LOCK:
-        _APP_SESSIONS[root] = (key, session)
-    return _with_reranker(session) if rerank else session
+        cold_start = _COLD_STARTS.setdefault(root, threading.Lock())
+    with cold_start:
+        key = _tree_key(app_name)
+        with _SESSIONS_LOCK:
+            held = _APP_SESSIONS.get(root)
+        if key and held is not None and held[0] == key:
+            session = _for_model(held[1], model)
+        else:
+            session = open_session(LocalWorkspace(root_path=Path(root)), model=model, overrides=_overrides(model))
+            if key:
+                with _SESSIONS_LOCK:
+                    _APP_SESSIONS[root] = (key, session)
+    return _with_reranker(session) if rerank else _without_reranker(session)
 
 
 def suggest_context(app_name: str, query: str, *, limit: int = 12, rerank: bool = True) -> list[dict]:
@@ -751,7 +789,8 @@ def understand(
 ) -> Understanding:
     """Run one full core turn for the explore helper and return its answer.
 
-    Cold start happens in :func:`open_session`; everything else — the working
+    Cold start happens in :func:`open_session`, once per checkout state (see
+    :func:`_app_session`); everything else — the working
     set, prompt assembly with its cache plan, the round loop, tools, the ledger,
     elision under input pressure, pressure summarisation and the fold — happens
     inside :func:`run_turn`. What this function adds is the provider interfaces.
@@ -766,13 +805,8 @@ def understand(
         chat = LangChainChatModel(
             llm, provider=provider, request_name=request_name, spent=spent
         )
-        session = open_session(
-            LocalWorkspace(root_path=Path(_app_root(app_name))),
-            model=chat.model_id,
-            overrides=_overrides(chat.model_id),
-        )
-        if rerank:
-            session = _with_reranker(session)
+        # The app's held index while the checkout is unchanged; a fresh conversation either way.
+        session = _app_session(app_name, rerank=rerank, model=chat.model_id)
         result = run_turn(
             question,
             session=session,
@@ -796,8 +830,6 @@ def understand(
             stop_reason="error",
         )
 
-    # Keep the index this turn built under the app key, so the next search skips a cold start.
-    remember_app_session(app_name, result.session)
     total_tokens = chat.total_tokens + result.side_usage.total_tokens
     _persist_tokens(request_name, total_tokens)
     return Understanding(
