@@ -290,6 +290,24 @@ def _repair_directive(state: dict, history: dict) -> str:
                    "completion report.")
 
 
+def _compact_investigation(history: dict) -> None:
+    """At approval, the investigation's rounds give way to their one-line log.
+
+    Otherwise every implementation call re-sends them: in AGENT-0028 the planning reads,
+    their reasoning and the submit_plan call were 35% of each implementation prompt, and
+    most were superseded by the copies implementation made. The plan and the findings
+    carry what they established; the approval directive holds both.
+    """
+    rounds = history.get("rounds") or []
+    if not rounds:
+        return
+    compacted = history.setdefault("compacted", [])
+    compacted.extend(line for entry in rounds for line in entry.get("summary", []))
+    while compacted and sum(len(line) + 1 for line in compacted) > graph.MAX_COMPACTED_HISTORY_CHARS:
+        compacted.pop(0)
+    history["rounds"] = []
+
+
 def _conversation(state: dict) -> dict:
     """The history this pass continues: the investigation when fresh, else the implementation.
 
@@ -337,9 +355,13 @@ def implement_node(state: dict) -> dict:
                               get_session_follow_up_prompt(follow_up, request_name=request_name), kind="follow_up")
         history["follow_up"] = follow_up_key
     elif not history.get("approved"):
+        investigated = history.get("investigated", True)
+        if investigated:
+            _compact_investigation(history)
         graph._queue_directive(history, get_session_approval_prompt(
             plan_json, criteria, edited=history.get("proposed_plan") not in (None, plan),
-            investigated=history.get("investigated", True), request_name=request_name))
+            investigated=investigated, request_name=request_name,
+            findings=state.get("understanding_summary") or ""))
         history["approved"] = True
     elif state.get("review_notes"):
         graph._queue_followup(history, json.dumps(state.get("task_completion") or {}, ensure_ascii=False),

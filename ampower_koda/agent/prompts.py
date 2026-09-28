@@ -244,8 +244,10 @@ existing peer file that supplies the pattern.
 
 SESSION_REQUEST_PROMPT = """## HOW THIS REQUEST RUNS
 One conversation carries this request from investigation to a plan the user approves, then to
-implementation. Everything you read now stays in this conversation for implementation: read each
-thing once, and read enough now that the plan is right.
+implementation. When the plan is approved, implementation keeps the plan, your findings and a
+one-line log of each tool call, not the raw results: put in the findings every fact the plan does not
+hold that implementation needs (exact field and column names, verified example records and values).
+Read each thing once, and read enough now that the plan is right.
 
 Phase 1 is investigation and ends with submit_plan. Tools that write are refused until the user
 approves the plan.
@@ -304,9 +306,12 @@ def get_plan_feedback_prompt(feedback: str, edited_plan_json: str = "") -> str:
 
 
 APPROVAL_INSTRUCTIONS = (
-    "Implement every task of the approved plan in this conversation. What you read while investigating is "
-    "above and still current unless you change it: read again only what an edit needs. Tools that write "
-    "are available now; submit_plan is not."
+    "Implement every task of the approved plan in this conversation. Your investigation is above as one "
+    "line per tool call, and your findings and the plan below carry what it established: read again only "
+    "what an edit needs. Start a file adapted from a reference with copy_file and edit what changes; when "
+    "most of a file changes, write it whole with write_file instead, without copying or reading the old "
+    "one first (read the parts of the reference you need with a purpose). Tools that write are available "
+    "now; submit_plan is not."
 )
 
 #: For a plan executed without the investigation that produced it (one saved on the request).
@@ -340,10 +345,11 @@ COMPLETION_REPORT_FORMAT = (
 
 
 def get_session_approval_prompt(plan_json: str, criteria: list[str], edited: bool, *,
-                                investigated: bool = True, request_name: str = None) -> str:
+                                investigated: bool = True, request_name: str = None, findings: str = "") -> str:
     """Phase 2, appended to the same conversation once the user approves the plan.
 
     An "Implement Prompt" override replaces the instructions; the plan, criteria and rules still follow.
+    ``findings`` is the investigation's summary, which replaces its raw results at approval.
     """
     changed = ("The user edited your plan before approving it; where it differs from what you submitted, "
                "their version below is authoritative.\n" if edited else "")
@@ -352,7 +358,8 @@ def get_session_approval_prompt(plan_json: str, criteria: list[str], edited: boo
         request_name)
     return (
         "## PLAN APPROVED — PHASE 2: IMPLEMENT\n" + changed + instructions + "\n\n"
-        "## APPROVED PLAN\n" + plan_json + "\n\n"
+        + ("## YOUR INVESTIGATION FINDINGS\n" + findings.strip() + "\n\n" if findings.strip() else "")
+        + "## APPROVED PLAN\n" + plan_json + "\n\n"
         "## ACCEPTANCE CRITERIA\n" + "\n".join(f"{i}. {c}" for i, c in enumerate(criteria, 1)) + "\n\n"
         + VERIFICATION_RULES + "\n\n" + COMPLETION_REPORT_FORMAT
     )
