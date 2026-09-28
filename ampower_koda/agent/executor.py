@@ -4,6 +4,7 @@
 import datetime
 import json
 import os
+import re
 import subprocess
 
 import frappe
@@ -17,12 +18,14 @@ from ampower_koda.agent.checkpoint import ExecutionJournal, restore_checkpoint, 
 from ampower_koda.agent.run_control import managed_job, current_run, check_active, set_request_value
 from ampower_koda.agent.graph import _get_bench_env, _message_content_to_str
 from ampower_koda.agent.git_ops import (
+    KODA_CLEAN_EXCLUDES,
     branch_exists,
     generate_branch_name,
     get_repo_root,
     get_current_branch,
     ignored_regression_tests,
     run_git,
+    run_git_stdout,
     create_branch,
     commit_changes,
     push_branch,
@@ -33,13 +36,60 @@ from ampower_koda.agent.git_ops import (
 DOCTYPE_NAME = "Agent Request"
 
 
+#: Files under .koda/ that are the team's configuration, not Koda's generated state.
+_KODA_CONFIG_FILES = {"config.toml", "verification.json", "verification.md"}
+
+
+def _is_request_branch(branch: str, request_name: str, branch_prefix: str, recorded: str = "") -> bool:
+    """True if ``branch`` is this request's own working branch.
+
+    That is the branch recorded on the request, or a name this request's naming
+    scheme produces (generate_branch_name: the base name or its _vN variants).
+    A shared prefix alone never makes a branch this request's.
+    """
+    if not branch:
+        return False
+    if recorded and branch == recorded:
+        return True
+    if not request_name:
+        return False
+    own = generate_branch_name(request_name, branch_prefix)
+    return branch == own or re.fullmatch(re.escape(own) + r"_v\d+", branch) is not None
+
+
+def _uncommitted_paths(repo_root: str) -> list[str]:
+    """Tracked changes and untracked files in the checkout, excluding Koda's own .koda/ state.
+
+    Untracked files inside a .koda/ directory (index cache, render output,
+    leftover or archived agent tests) are Koda's; its config files still count.
+    """
+    ok, out = run_git_stdout(["status", "--porcelain", "-z", "--untracked-files=all"], cwd=repo_root)
+    if not ok:
+        raise RuntimeError("Could not read the working-tree status of the target app checkout.")
+    paths, entries = [], iter(out.split("\0"))
+    for entry in entries:
+        if len(entry) < 4:
+            continue
+        code, path = entry[:2], entry[3:]
+        if code[0] in "RC":
+            next(entries, None)  # the rename/copy source follows as its own entry
+        parts = path.rstrip("/").split("/")
+        if code == "??" and ".koda" in parts[:-1] and parts[-1] not in _KODA_CONFIG_FILES:
+            continue
+        paths.append(path)
+    return paths
+
+
 def _revert_previous_changes(app_name: str, base_branch: str, request_name: str = "",
-                              user: str = "", branch_prefix: str = "ai-agent/", *, archive_tests: bool = True):
-    """Revert all uncommitted changes and agent-created branches before a fresh run.
-    Steps:
-      1. Discard all modified/staged files (git reset --hard + git checkout .)
-      2. Remove all untracked files (git clean -fd)
-      3. If on an agent branch, switch back to base branch and delete the agent branch
+                              user: str = "", branch_prefix: str = "ai-agent/", *,
+                              own_branch: str = "", archive_tests: bool = True):
+    """Return the checkout to the base branch before a fresh run of this request.
+
+    Only this request's own work is discarded. On this request's own branch
+    (``own_branch`` or its naming scheme), uncommitted changes are reverted and
+    the branch is deleted. Any other branch is left intact; the checkout only
+    switches to the base, and uncommitted changes there (user work, another
+    request's pending implementation) stop the run with the files named.
     """
     if not app_name:
         return
@@ -49,43 +99,37 @@ def _revert_previous_changes(app_name: str, base_branch: str, request_name: str 
 
     current = get_current_branch(app_name)
     base = (base_branch or "main").strip()
-    prefix = (branch_prefix or "ai-agent/").strip()
-    is_agent_branch = (
-        current and current != base
-        and (current.startswith(prefix)
-             or current.startswith("ai-agent/")
-             or current.startswith("ai-agent-"))
-    )
+    is_own_branch = current != base and _is_request_branch(current, request_name, branch_prefix, own_branch)
 
-    if is_agent_branch:
-        run_git(["reset", "--hard", "HEAD"], cwd=repo_root)
-        run_git(["clean", "-fd"], cwd=repo_root)
-        ok, _ = run_git(["checkout", base], cwd=repo_root)
-        if ok:
-            run_git(["branch", "-D", current], cwd=repo_root)
-            reverted_items.append(f"switched from {current} → {base} and deleted agent branch")
-        else:
-            reverted_items.append(f"failed to switch from {current} to {base}")
-    else:
-        ok_diff, diff_out = run_git(["diff", "--stat"], cwd=repo_root)
-        ok_staged, staged_out = run_git(["diff", "--cached", "--stat"], cwd=repo_root)
-        ok_untracked, untracked_out = run_git(
-            ["ls-files", "--others", "--exclude-standard"], cwd=repo_root
+    dirty = _uncommitted_paths(repo_root)
+    if dirty and not is_own_branch:
+        shown = ", ".join(dirty[:10]) + (f" (and {len(dirty) - 10} more)" if len(dirty) > 10 else "")
+        raise ValueError(
+            f"The '{app_name}' checkout has uncommitted changes on branch '{current or '(unknown)'}' "
+            f"that do not belong to this request: {shown}. Commit or stash them, then start again. "
+            "Nothing was reverted."
         )
-        has_modifications = bool((diff_out or "").strip()) or bool((staged_out or "").strip())
-        has_untracked = bool((untracked_out or "").strip())
 
-        if has_modifications:
-            run_git(["reset", "--hard", "HEAD"], cwd=repo_root)
-            run_git(["checkout", "."], cwd=repo_root)
-            reverted_items.append("discarded modified/staged files")
+    if is_own_branch:
+        for cmd in (["reset", "--hard", "HEAD"], ["clean", "-fd", *KODA_CLEAN_EXCLUDES]):
+            ok, out = run_git(cmd, cwd=repo_root)
+            if not ok:
+                raise RuntimeError(f"git {cmd[0]} failed while reverting '{current}': {out}")
+        if dirty:
+            reverted_items.append(f"discarded this request's uncommitted changes on {current}")
+    if current != base:
+        ok, out = run_git(["checkout", base], cwd=repo_root)
+        if not ok:
+            raise RuntimeError(f"Could not switch from '{current}' to '{base}': {out}")
+        if is_own_branch:
+            ok, out = run_git(["branch", "-D", current], cwd=repo_root)
+            reverted_items.append(f"switched from {current} → {base} and deleted this request's earlier branch"
+                                  if ok else f"switched from {current} → {base}; could not delete it: {out}")
+        else:
+            reverted_items.append(f"switched from {current} → {base} (branch '{current}' kept)")
 
-        if has_untracked:
-            run_git(["clean", "-fd"], cwd=repo_root)
-            reverted_items.append("removed untracked files")
-
-    # `git clean -fd` skips ignored files, and all of `.koda/` is ignored, so
-    # an earlier run's tests would otherwise become this run's frozen contract.
+    # Cleanup never removes `.koda/` (KODA_CLEAN_EXCLUDES), so an earlier
+    # run's untracked tests would otherwise become this run's frozen contract.
     # Only planning archives: an approved plan was written against the tests
     # present when it was made, and executing it must not remove them.
     archived = []
@@ -288,6 +332,7 @@ def run_planning_phase(request_name: str, plan_feedback: str = "") -> None:
                 config["target_app_name"], config["base_branch"],
                 request_name=request_name, user=user,
                 branch_prefix=config["branch_prefix"],
+                own_branch=(doc.branch_name or "").strip(),
             )
             if revert_msg:
                 _update_status(request_name, user, "Queued", revert_msg)
@@ -461,6 +506,7 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
                 config["target_app_name"], config["base_branch"],
                 request_name=request_name, user=user,
                 branch_prefix=config["branch_prefix"], archive_tests=False,
+                own_branch=(doc.branch_name or "").strip(),
             )
             if revert_msg:
                 _update_status(request_name, user, "Implementing", f"Cleaned up: {revert_msg}")
