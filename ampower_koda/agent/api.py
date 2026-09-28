@@ -16,6 +16,7 @@ from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdo
 from ampower_koda.agent.executor import (
     _generate_patch_diff,
     _update_status,
+    normalize_bench_selection,
     restore_execution_state,
     validate_target_app,
 )
@@ -569,7 +570,8 @@ def remove_plan_task(request_name: str, task_id: str):
 @_whitelist_logged
 def approve_bench(request_name: str, commands: str = None):
     """Approves and runs the pending bench commands (migrate, build, clear-cache, etc.).
-    Optionally pass an edited list of commands as a JSON array to override the defaults."""
+    Optionally pass an edited list of commands as a JSON array to override the defaults.
+    Omitting it keeps the pending list; an empty array skips every bench command."""
     if not request_name:
         frappe.throw(_("Request name is required."))
 
@@ -578,16 +580,15 @@ def approve_bench(request_name: str, commands: str = None):
     if doc.status != "Awaiting Bench Approval":
         frappe.throw(_("Cannot approve bench. Agent status is {0}.").format(doc.status))
 
-    if commands:
-        try:
-            cmd_list = json.loads(commands)
-        except (ValueError, TypeError):
-            frappe.throw(_("Invalid commands format."))
-        if isinstance(cmd_list, list) and cmd_list:
-            frappe.db.set_value(
-                DOCTYPE_NAME, request_name,
-                "pending_bench_commands", json.dumps(cmd_list),
-            )
+    try:
+        cmd_list = normalize_bench_selection(commands)
+    except ValueError as exc:
+        frappe.throw(str(exc))
+    if cmd_list is not None:
+        frappe.db.set_value(
+            DOCTYPE_NAME, request_name,
+            "pending_bench_commands", json.dumps(cmd_list),
+        )
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Building")
     frappe.db.commit()
@@ -610,7 +611,8 @@ def approve_bench(request_name: str, commands: str = None):
 
     return {
         "status": "ok",
-        "message": _("Running {0} bench commands...").format(len(cmds)),
+        "message": _("Running {0} bench commands...").format(len(cmds)) if cmds
+        else _("No bench commands selected: skipping the bench step."),
     }
 
 

@@ -832,9 +832,12 @@ function reject_plan(frm) {
 }
 
 function approve_bench(frm) {
-    var selected_cmds = [];
+    // null: the checklist is not on the page, so the saved pending list stands.
+    // An empty array is the user unchecking everything: skip the bench step.
+    var selected_cmds = null;
     var $list = $(frm.wrapper).find('#bench-cmd-list');
     if ($list.length) {
+        selected_cmds = [];
         $list.find('.bench-cmd-input').each(function () {
             var $input = $(this);
             var $check = $list.find('.bench-cmd-check[data-idx="' + $input.data('idx') + '"]');
@@ -843,37 +846,41 @@ function approve_bench(frm) {
             }
         });
     }
-    if (!selected_cmds.length) {
-        var fallback = [];
-        try { fallback = JSON.parse(frm.doc.pending_bench_commands || '[]'); } catch (e) { }
-        selected_cmds = fallback;
+    var shown_cmds = selected_cmds;
+    if (shown_cmds === null) {
+        shown_cmds = [];
+        try { shown_cmds = JSON.parse(frm.doc.pending_bench_commands || '[]'); } catch (e) { }
+        if (!shown_cmds.length) {
+            frappe.msgprint(__('No bench commands pending.'));
+            return;
+        }
     }
 
-    if (!selected_cmds.length) {
-        frappe.msgprint(__('No bench commands selected.'));
-        return;
+    var question;
+    if (shown_cmds.length) {
+        var preview = shown_cmds.map(function (c) {
+            return '<code style="display:block;padding:3px 8px;margin:2px 0;background:var(--gray-100);border-radius:3px;font-size:12px;">$ '
+                + frappe.utils.escape_html(c) + '</code>';
+        }).join('');
+        question = __('Run these commands?') + '<div style="margin:10px 0;">' + preview + '</div>';
+    } else {
+        question = __('Every bench command is unchecked. Skip the bench step and go straight to push approval?');
     }
-
-    var preview = selected_cmds.map(function (c) {
-        return '<code style="display:block;padding:3px 8px;margin:2px 0;background:var(--gray-100);border-radius:3px;font-size:12px;">$ '
-            + frappe.utils.escape_html(c) + '</code>';
-    }).join('');
 
     frappe.confirm(
-        __('Run these commands?') + '<div style="margin:10px 0;">' + preview + '</div>',
+        question,
         function () {
+            var args = { request_name: frm.doc.name };
+            if (selected_cmds !== null) args.commands = JSON.stringify(selected_cmds);
             frappe.call({
                 method: 'ampower_koda.agent.api.approve_bench',
-                args: {
-                    request_name: frm.doc.name,
-                    commands: JSON.stringify(selected_cmds)
-                },
+                args: args,
                 freeze: true,
                 freeze_message: __('Running bench commands...'),
                 callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
-                            message: __('Bench commands approved: running...'),
+                            message: r.message.message || __('Bench commands approved: running...'),
                             indicator: 'blue'
                         });
                         frm.reload_doc();
