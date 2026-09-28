@@ -7,9 +7,18 @@ Administrator with a one-time login key, and can drive the page with a short lis
 """
 
 from __future__ import annotations
+
+import json
 import os
 import re
+import sys
+import tempfile
+import time
 from pathlib import Path
+
+from ampower_koda.agent import verification
+from ampower_koda.agent.tools import _app_root
+
 RENDER_TIMEOUT = 180  # each step waits for its calls and animations to settle
 MAX_STEPS = 20
 MAX_SNAPSHOT_CHARS = 6000
@@ -121,3 +130,127 @@ def _layout(items: list, viewport: dict, limit: int = MAX_LAYOUT_LABELS) -> str:
             + "\n".join(rows) + ("\n" + " ".join(notes) if notes else ""))
 
 
+def _format(report: dict) -> str:
+    problems = []
+    if report.get("login_page"):
+        problems.append("the browser was sent to the login page")
+    if report.get("not_found"):
+        problems.append("Frappe reports the page as not found (register the Page, or check the route)")
+    if report.get("status") and report["status"] >= 400:
+        problems.append(f"HTTP {report['status']}")
+    if report.get("console"):
+        problems.append(f"{len(report['console'])} console/page error(s)")
+    if report.get("api_failures"):
+        problems.append(f"{len(report['api_failures'])} failed API call(s)")
+    failed_steps = [s for s in report.get("steps", []) if s["outcome"] != "ok"]
+    if failed_steps:
+        problems.append(f"{len(failed_steps)} step(s) failed")
+    failed_expects = sum(1 for s in report.get("steps", []) for line in s.get("lines", [])
+                         if line.startswith("  expect ") and ": FAIL" in line)
+    if failed_expects:
+        problems.append(f"{failed_expects} expect(s) failed")
+    if report.get("registration_error"):
+        problems.insert(0, "the Page JSON could not be registered: " + report["registration_error"])
+    if report.get("runner_error"):
+        problems.append(report["runner_error"])
+    lines = [("RENDER_FAILED: " + "; ".join(problems)) if problems else "RENDER_OK",
+             f"url: {report.get('url')} (HTTP {report.get('status')})"]
+    if report.get("registered"):
+        lines.append("registered the Page from its JSON before loading (as bench migrate would)")
+    if report.get("unregistered"):
+        lines.append(f"not registered: {report['unregistered']} was not imported, since this phase is read-only; "
+                     "the site shows the Page as last registered (or not found if it never was). "
+                     "Implementation registers it before its checks.")
+    if report.get("load"):
+        lines += ["first two seconds after load:", *report["load"]]
+    steps = report.get("steps", [])
+    for step in steps:
+        lines += _step_lines(step["lines"], step["outcome"])
+        layout = _layout(step.get("layout") or [], step.get("viewport") or {})
+        if layout:
+            lines += ["  " + line for line in layout.splitlines()]
+    if report.get("console"):
+        lines.append("console errors:\n" + "\n".join(f"- {e}" for e in report["console"]))
+    if report.get("api_failures"):
+        lines.append("failed API calls:\n" + "\n".join(f"- {e}" for e in report["api_failures"]))
+    lines.append("page after the last step (accessibility snapshot, with open dialogs and alerts):\n"
+                 + _bounded(str(report.get("snapshot") or ""), STEPS_SNAPSHOT_CHARS if steps else MAX_SNAPSHOT_CHARS))
+    layout = _layout(report.get("layout") or [], report.get("viewport") or {},
+                     STEPS_LAYOUT_LABELS if steps else MAX_LAYOUT_LABELS)
+    if layout:
+        lines.append(layout)
+    if report.get("reach"):
+        lines.append(report["reach"])
+    if report.get("screenshot"):
+        lines.append(f"screenshot for the user: {report['screenshot']}")
+    return "\n".join(lines)
+
+
+def check_page(app_name: str, route: str, steps: list | None = None, env: dict | None = None, *,
+               register: bool = True) -> str:
+    """``register=False`` (planning, review) never imports Page JSON into the live site or commits."""
+    route = "/" + str(route or "").strip().lstrip("/")
+    if not re.fullmatch(r"/[A-Za-z0-9_\-./?=&%]*", route) or route.startswith("//"):
+        return "RENDER_FAILED: route must be a site path such as /desk/my_page."
+    if steps is not None and not isinstance(steps, list):
+        return "RENDER_FAILED: steps must be a JSON list of step objects."
+    steps = list(steps or [])[:MAX_STEPS]
+    root = Path(_app_root(app_name)).resolve()
+    command_env = verification._runner_environment(root, env)
+    if not command_env.get("KODA_SITE"):
+        return "RENDER_UNAVAILABLE: no Frappe site is connected to this worker."
+    extra = _playwright_path()
+    if extra:
+        command_env["PYTHONPATH"] = os.pathsep.join(filter(None, [command_env.get("PYTHONPATH", ""), extra]))
+    browsers = _browsers_path()
+    if browsers:
+        command_env["PLAYWRIGHT_BROWSERS_PATH"] = browsers
+    shots = root / RENDER_DIRECTORY
+    shots.mkdir(parents=True, exist_ok=True)
+    shot = shots / f"{re.sub(r'[^A-Za-z0-9_-]+', '_', route).strip('_') or 'page'}-{time.strftime('%H%M%S')}.png"
+    name = re.fullmatch(r"/(?:desk|app)/([A-Za-z0-9_\-]+)/?", route.split("?", 1)[0])
+    page_json = ""
+    if name:
+        slug = name.group(1).replace("-", "_")
+        found = sorted(root.glob(f"**/page/{slug}/{slug}.json"))
+        page_json = str(found[0]) if found else ""
+    unregistered = ""
+    if page_json and not register:
+        unregistered, page_json = Path(page_json).relative_to(root).as_posix(), ""
+    report = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="koda-render-", ignore_cleanup_errors=True) as scratch:
+            # The report goes through a file: _execute keeps only a bounded head and tail of stdout.
+            report_file = Path(scratch) / "report.json"
+            argv = [sys.executable, str(RUNNER), route, json.dumps(steps, default=str), str(shot), page_json,
+                    str(shots / ".session.json"), str(report_file)]
+            code, output, timed_out = verification._execute(
+                argv, Path(command_env["KODA_SITES_PATH"]),
+                {**command_env, "TMPDIR": scratch, "TEMP": scratch, "TMP": scratch}, RENDER_TIMEOUT)
+            if report_file.exists():
+                try:
+                    report = json.loads(report_file.read_text(encoding="utf-8"))
+                except ValueError:
+                    report = None
+            if isinstance(report, dict) and unregistered:
+                report["unregistered"] = unregistered
+    except (OSError, ValueError) as exc:
+        return f"RENDER_UNAVAILABLE: could not start the browser runner: {type(exc).__name__}: {exc}"
+    if "KODA_RENDER_UNAVAILABLE" in output:
+        return "RENDER_UNAVAILABLE: " + output.split("KODA_RENDER_UNAVAILABLE", 1)[1].strip()[:400]
+    if verification.RUNNER_ERROR in output:
+        return "RENDER_UNAVAILABLE: " + _bounded(output, 1500) + verification.ENVIRONMENT_NOTE
+    if timed_out:
+        return f"RENDER_FAILED: the page check did not finish within {RENDER_TIMEOUT}s.\n" + _bounded(output, 2000)
+    if report is not None:
+        return _format(report)
+    marker = output.rfind("KODA_RENDER_REPORT ")
+    if marker < 0:
+        return f"RENDER_FAILED: the browser runner exited {code} without a report.\n" + _bounded(output, 3000)
+    try:
+        report = json.loads(output[marker + len("KODA_RENDER_REPORT "):].strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return "RENDER_FAILED: unreadable browser report.\n" + _bounded(output, 3000)
+    if isinstance(report, dict) and unregistered:
+        report["unregistered"] = unregistered
+    return _format(report)
