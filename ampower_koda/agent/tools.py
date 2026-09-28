@@ -845,20 +845,40 @@ def get_file_outline(app_name: str, path: str) -> str:
 
 
 def read_doctype_schema(app_name: str, doctype_name: str) -> str:
-    """Read app source, or the installed schema of a dependency DocType."""
+    """Read app source, or the installed schema of a dependency DocType.
+
+    The app file goes through the same gate as read_file (canonical path inside the app, redaction,
+    no archived or cache trees) and is returned only when it is DocType metadata.
+    """
+    import json
+
     try:
-        app_root = _app_root(app_name)
+        redaction = _redaction_matcher(app_name)
+        app_root = redaction[0]
         name_lower = doctype_name.replace(" ", "_").lower()
         target_file = f"{name_lower}.json"
-        for dirpath, _dirnames, filenames in os.walk(app_root):
-            if os.path.basename(dirpath) == name_lower and target_file in filenames:
-                full = os.path.join(dirpath, target_file)
-                with open(full, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read()
+        for dirpath, dirnames, filenames in os.walk(app_root):
+            dirnames[:] = _walked_dirs(dirpath, dirnames, app_root)
+            if os.path.basename(dirpath) != name_lower or target_file not in filenames:
+                continue
+            relative = os.path.relpath(os.path.join(dirpath, target_file), app_root).replace(os.sep, "/")
+            try:
+                full = _resolve_path(app_name, relative)  # refuses a link out of the app
+            except ValueError:
+                continue
+            if redaction_pattern(app_name, relative, full, redaction):
+                continue  # secrets are never read, whatever their name
+            try:
+                with open(full, "r", encoding="utf-8") as f:
+                    text = f.read()
+                schema = json.loads(text)
+            except (OSError, ValueError):
+                continue
+            if isinstance(schema, dict) and schema.get("doctype") == "DocType":
+                return text
         # A DocType of another installed app (ERPNext, Frappe) is read from the
         # site's installed metadata, the schema that actually applies.
         if callable(getattr(frappe, "get_meta", None)):
-            import json
             meta = frappe.get_meta(doctype_name)
             try:
                 columns = frappe.db.get_table_columns(doctype_name) if hasattr(frappe.db, "get_table_columns") else []
