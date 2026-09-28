@@ -512,8 +512,10 @@ function setup_action_buttons(frm) {
     var status = frm.doc.status;
     var running = ['Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing'];
     var can_start = ['Queued', 'Failed', 'Cancelled'].indexOf(status) !== -1;
+    // can_start + can_restart together must equal api.RESTARTABLE_STATUSES;
+    // start_agent refuses Awaiting Bench Approval, so it gets no Re-run button.
     var can_restart = status === 'Completed' || status === 'Awaiting Approval'
-        || status === 'Awaiting Bench Approval' || status === 'Awaiting Push Approval';
+        || status === 'Awaiting Push Approval';
 
     if (can_start) {
         frm.add_custom_button(__('Start Agent'), function () {
