@@ -953,8 +953,9 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
     def run_tests() -> str:
         """Execute configured integration tests and .koda/tests behavioral tests.
         Python test*.py uses unittest against the live site; *.test.cjs/js/mjs uses node --test.
-        Nothing a Python test does persists: database writes roll back, file writes, background jobs and
-        email are discarded, and schema changes or commits are refused.
+        For Python tests, database writes roll back, file writes, background jobs and email are discarded,
+        and schema changes, commits and child processes are refused. Network calls to external services
+        are NOT contained and do reach them.
         Import the actual changed code, never patch the module under test, and repair
         failures before completion. A test that passes is frozen for the rest of the run.
         This tool never accepts shell commands."""

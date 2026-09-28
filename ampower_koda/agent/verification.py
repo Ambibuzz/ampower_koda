@@ -188,10 +188,12 @@ print('KODA_TEST_SUMMARY ' + json.dumps(summary), flush=True)
 sys.exit(0 if result.wasSuccessful() and summary['passed'] else 1)
 """
 
-# Nothing call_method does may outlive it: writes outside the scratch dir go to an overlay,
-# real deletes/renames are refused, jobs and mail are recorded, and an audit hook blocks bypasses.
+# What call_method and generated tests do is kept from outliving them where Python can see it:
+# writes outside the scratch dir go to an overlay, real deletes/renames are refused, jobs and mail
+# are recorded, child processes are refused, and an audit hook blocks bypasses. Sockets stay open
+# (the database and Redis use them), so network calls and external services are NOT contained.
 _CALL_CONTAINMENT = """
-import builtins, errno, importlib, io, pathlib, shutil, smtplib, stat
+import builtins, errno, importlib, io, pathlib, shutil, smtplib, stat, subprocess
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _real = {name: getattr(os, name) for name in ('open', 'stat', 'lstat', 'mkdir', 'rename', 'replace', 'remove',
          'unlink', 'rmdir', 'listdir', 'scandir', 'access', 'chmod', 'utime', 'truncate') if hasattr(os, name)}
@@ -375,6 +377,23 @@ _VERBS = {'open': 'write', '_winapi.CopyFile2': 'write', 'os.mkdir': 'create', '
           'os.symlink': 'create', 'os.remove': 'delete', 'os.rmdir': 'delete', 'shutil.rmtree': 'delete',
           'os.rename': 'move'}
 _REMOVALS = ('os.remove', 'os.rmdir', 'shutil.rmtree', 'os.rename')
+# a child process runs outside every patch here, and whatever it does no rollback undoes
+_PROCESS_EVENTS = {'subprocess.Popen', 'os.system', 'os.exec', 'os.spawn', 'os.posix_spawn', 'os.fork',
+                   'os.forkpty', 'os.startfile', '_winapi.CreateProcess', 'pty.spawn'}
+
+def _process_refused(name):
+    return PermissionError(errno.EPERM, name + ' is blocked in verification: code run by call_method or run_tests '
+                           'cannot start child processes, since nothing they do could be rolled back')
+
+def _no_process(name):
+    def blocked(*args, **kwargs):
+        raise _process_refused(name)
+    return blocked
+
+class _BlockedPopen(subprocess.Popen):
+    # a class, so code that subclasses or isinstance-checks Popen still imports
+    def __init__(self, *args, **kwargs):
+        raise _process_refused('subprocess.Popen')
 
 def _at(fd, value):
     # a path relative to a directory descriptor; None where the descriptor cannot be traced
@@ -385,6 +404,8 @@ def _at(fd, value):
 
 def _guard(event, args):
     # refuse a change outside the scratch dir that did not go through the overlay
+    if _active and event in _PROCESS_EVENTS:
+        raise _process_refused(event)  # also a Popen or os.system bound before contain()
     changes = _CHANGES.get(event) if _active else None
     if changes is None or event == 'open' and not (args[2] & _WRITE_FLAGS or isinstance(args[1], str)
                                                    and any(flag in args[1] for flag in 'wax+')):
@@ -476,6 +497,16 @@ def contain():
         _swap(windows, 'CopyFile2', _copying(windows.CopyFile2))
     _swap(smtplib.SMTP, 'sendmail', _smtp_sendmail)
     _swap(smtplib.SMTP, 'send_message', _smtp_send_message)
+    _swap(subprocess, 'Popen', _BlockedPopen)
+    for name in ('run', 'call', 'check_call', 'check_output', 'getoutput', 'getstatusoutput'):
+        _swap(subprocess, name, _no_process('subprocess.' + name))
+    for name in [n for n in dir(os) if n in ('system', 'popen', 'fork', 'forkpty', 'startfile')
+                 or n.startswith(('exec', 'spawn', 'posix_spawn'))]:
+        if callable(getattr(os, name, None)):
+            _swap(os, name, _no_process('os.' + name))
+    posix = sys.modules.get('_posixsubprocess')  # multiprocessing starts children with it directly
+    if callable(getattr(posix, 'fork_exec', None)):
+        _swap(posix, 'fork_exec', _no_process('_posixsubprocess.fork_exec'))
     owners = [frappe]
     try:
         owners.append(importlib.import_module('frappe.utils.background_jobs'))
@@ -537,7 +568,7 @@ finally:
     site_disconnect()
 sys.exit(code)
 """
-# Tests run under the same containment as call_method: nothing they do outlives the run.
+# Tests run under the same containment as call_method, with the same limits (network is not contained).
 _UNITTEST_RUNNER = _SITE_CONNECT + _CALL_CONTAINMENT + _UNITTEST_BODY
 CALL_TIMEOUT = 60
 MAX_CALL_OUTPUT = 6000
@@ -943,8 +974,8 @@ def call_method(app_name: str, method: str, kwargs: dict | None = None, *, env: 
     records, the real permission and validation paths, the real response shape.
     Runs as Administrator in a separate process; DB writes roll back, file writes go to a
     discarded overlay, real deletes/renames are refused, and jobs and email are only recorded.
-    SQL that would commit on its own (DDL, COMMIT, START TRANSACTION, LOCK) is refused.
-    Not contained: raw cursor SQL, Redis, realtime, network, child processes, native writes.
+    SQL that would commit on its own (DDL, COMMIT, START TRANSACTION, LOCK) and child processes
+    are refused. Not contained: raw cursor SQL, Redis, realtime, network, native writes.
 
     ``limit`` bounds the returned text; a helper reading it for a purpose takes more.
     """
