@@ -5,6 +5,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import subprocess
 import uuid
 
@@ -871,6 +872,89 @@ def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
     }, user=user)
 
 
+#: Longest one bench command may run, and the service restart after them (which
+#: waits for every worker to stop first).
+BENCH_COMMAND_TIMEOUT = 900
+SERVICE_RESTART_TIMEOUT = 1800
+_INVALID_SELECTION = "Invalid commands format: expected a JSON array of command strings."
+
+
+def parse_bench_command(command) -> list[str]:
+    """One edited command line as argv, quoted the way a POSIX shell would read it.
+
+    The text is only split, never handed to a shell, so quoted paths and JSON
+    arguments arrive as single arguments and nothing else is interpreted.
+    """
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("A bench command must be non-empty text.")
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"Cannot parse bench command `{command.strip()}`: {exc}.") from None
+    if not argv:
+        raise ValueError("A bench command must be non-empty text.")
+    return argv
+
+
+def normalize_bench_selection(value):
+    """The submitted command list, validated; None when nothing was submitted.
+
+    An explicit empty list is returned as-is: the user unchecked every command,
+    which means skip them all, not "fall back to the defaults".
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            raise ValueError(_INVALID_SELECTION) from None
+    if not isinstance(value, list) or not all(isinstance(entry, str) for entry in value):
+        raise ValueError(_INVALID_SELECTION)
+    commands = [entry.strip() for entry in value if entry.strip()]
+    for command in commands:
+        parse_bench_command(command)
+    return commands
+
+
+def _is_service_restart(cmd: str) -> bool:
+    return "supervisorctl" in cmd.lower()
+
+
+def _bench_root() -> str:
+    return os.path.normpath(os.path.join(frappe.get_app_path("frappe"), "..", "..", ".."))
+
+
+def _run_bench_command(user, request_name, cmd, bench_root, bench_env):
+    """Run one command without a shell. Returns (receipt, failure); failure is "" on success."""
+    _publish_bench_log(user, request_name, cmd, True, "Running...")
+    try:
+        result = subprocess.run(
+            parse_bench_command(cmd),
+            cwd=bench_root,
+            capture_output=True,
+            text=True,
+            timeout=BENCH_COMMAND_TIMEOUT,
+            env=bench_env,
+        )
+    except subprocess.TimeoutExpired:
+        _publish_bench_log(user, request_name, cmd, False, f"TIMEOUT after {BENCH_COMMAND_TIMEOUT}s")
+        log_agent_error("Agent Executor: bench command timeout", f"request={request_name}\ncmd={cmd}")
+        return f"$ {cmd}\nTIMEOUT after {BENCH_COMMAND_TIMEOUT}s\n", f"{cmd} (timeout)"
+    except Exception as e:
+        _publish_bench_log(user, request_name, cmd, False, str(e))
+        log_agent_error(
+            "Agent Executor: bench command",
+            f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
+        )
+        return f"$ {cmd}\nERROR: {e}\n", f"{cmd} ({e})"
+    out = (result.stdout or "") + (result.stderr or "")
+    ok = result.returncode == 0
+    _publish_bench_log(user, request_name, cmd, ok, out[:180])
+    status_str = "OK" if ok else f"FAILED (exit {result.returncode})"
+    return f"$ {cmd}\n{status_str}\n{out.strip()}\n", "" if ok else f"{cmd} (exit {result.returncode})"
+
+
 @managed_job
 def run_bench_and_commit(request_name: str) -> None:
     """Run the approved bench commands, then pause for push approval so the user can test."""
@@ -889,66 +973,39 @@ def run_bench_and_commit(request_name: str) -> None:
     try:
         _update_status(request_name, user, "Building", "Running bench commands...")
 
-        cmds_json = doc.pending_bench_commands or "[]"
+        # Blank means no selection was ever saved, so the defaults apply. An
+        # explicit empty list means every command was unchecked: skip the step.
+        saved = (doc.pending_bench_commands or "").strip()
         try:
-            cmds = json.loads(cmds_json)
-        except (json.JSONDecodeError, TypeError):
-            cmds = []
-
-        if not cmds:
+            cmds = normalize_bench_selection(saved)
+        except ValueError as exc:
+            _update_status(request_name, user, "Awaiting Bench Approval",
+                f"The saved bench commands are invalid: {exc}", error_log=str(exc))
+            return
+        if cmds is None:
             cmds = _compute_bench_commands(app_name, [])
+        if not cmds:
+            skipped = "No bench commands selected: every bench command was skipped."
+            _update_status(request_name, user, "Awaiting Push Approval",
+                f"{skipped} Test the changes on branch '{branch_name}', then approve push to commit and push.",
+                bench_log=skipped, error_log="")
+            return
 
-
-        bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
-        bench_root = os.path.normpath(bench_root)
+        bench_root = _bench_root()
         bench_env = _get_bench_env()
 
-        deferred_cmds = []
-        immediate_cmds = []
-        for cmd in cmds:
-            if "supervisorctl" in cmd.lower():
-                deferred_cmds.append(cmd)
-            else:
-                immediate_cmds.append(cmd)
+        deferred_cmds = [cmd for cmd in cmds if _is_service_restart(cmd)]
+        immediate_cmds = [cmd for cmd in cmds if not _is_service_restart(cmd)]
 
         bench_output_parts = []
         failed_cmds = []
         for cmd in immediate_cmds:
-            check_active(reserve=930)
-            _publish_bench_log(user, request_name, cmd, True, "Running...")
-            try:
-                result = subprocess.run(
-                    cmd.split(),
-                    cwd=bench_root,
-                    capture_output=True,
-                    text=True,
-                    timeout=900,
-                    env=bench_env,
-                )
-                check_active()
-                out = (result.stdout or "") + (result.stderr or "")
-                ok = result.returncode == 0
-                status_str = "OK" if ok else f"FAILED (exit {result.returncode})"
-                bench_output_parts.append(f"$ {cmd}\n{status_str}\n{out.strip()}\n")
-                _publish_bench_log(user, request_name, cmd, ok, out[:180])
-                if not ok:
-                    failed_cmds.append(f"{cmd} (exit {result.returncode})")
-            except subprocess.TimeoutExpired:
-                bench_output_parts.append(f"$ {cmd}\nTIMEOUT after 900s\n")
-                _publish_bench_log(user, request_name, cmd, False, "TIMEOUT after 900s")
-                failed_cmds.append(f"{cmd} (timeout)")
-                log_agent_error(
-                    "Agent Executor: bench command timeout",
-                    f"request={request_name}\ncmd={cmd}",
-                )
-            except Exception as e:
-                bench_output_parts.append(f"$ {cmd}\nERROR: {e}\n")
-                _publish_bench_log(user, request_name, cmd, False, str(e))
-                failed_cmds.append(f"{cmd} ({e})")
-                log_agent_error(
-                    "Agent Executor: bench command",
-                    f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
-                )
+            check_active(reserve=BENCH_COMMAND_TIMEOUT + 30)
+            receipt, failure = _run_bench_command(user, request_name, cmd, bench_root, bench_env)
+            check_active()
+            bench_output_parts.append(receipt)
+            if failure:
+                failed_cmds.append(failure)
 
         if deferred_cmds and not failed_cmds:
             for cmd in deferred_cmds:
