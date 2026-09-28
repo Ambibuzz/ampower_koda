@@ -27,9 +27,11 @@ from ampower_koda.agent.git_ops import (
     branch_exists,
     checkout_base,
     diff_file,
+    diff_worktree_file,
     get_current_branch,
     get_repo_root,
     list_changed_files,
+    list_worktree_changes,
     run_git,
 )
 from ampower_koda.agent.graph import _app_file_exists
@@ -1038,11 +1040,19 @@ def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]
 
 
 def _get_changed_files_for_request(doc) -> tuple[dict[str, str], str]:
-    """Return changed file map and data source ('git' or 'patch_diff')."""
+    """Return changed file map and data source ('working_tree', 'git' or 'patch_diff')."""
     app_name = (doc.target_app_name or "").strip()
     base_branch = (doc.base_branch or "main").strip()
     branch_name = (doc.branch_name or "").strip()
 
+    # With the request branch checked out, the disk is the truth: base vs working
+    # tree covers commits, uncommitted edits and new untracked files alike.
+    if app_name and branch_name and get_current_branch(app_name) == branch_name:
+        ok, files = list_worktree_changes(app_name, base_branch)
+        if ok:
+            return {f["path"]: f["status"] for f in files}, "working_tree"
+
+    # Another branch is checked out: show the request branch's committed changes.
     if app_name and branch_name and branch_exists(app_name, branch_name):
         ok, files = list_changed_files(app_name, base_branch, branch_name)
         if ok and files:
@@ -1132,13 +1142,18 @@ def get_file_diff(request_name: str, file_path: str):
     status = changed.get(file_path, "")
 
     diff_text = ""
-    if branch_name and branch_exists(app_name, branch_name):
-        ok, diff_text = diff_file(app_name, base_branch, branch_name, file_path)
+    if source == "working_tree":
+        ok, diff_text = diff_worktree_file(app_name, base_branch, file_path)
         if not ok:
             diff_text = ""
+    else:
+        if branch_name and branch_exists(app_name, branch_name):
+            ok, diff_text = diff_file(app_name, base_branch, branch_name, file_path)
+            if not ok:
+                diff_text = ""
 
-    if not diff_text.strip():
-        diff_text = _extract_file_diff_from_patch(doc.patch_diff or "", file_path)
+        if not diff_text.strip():
+            diff_text = _extract_file_diff_from_patch(doc.patch_diff or "", file_path)
 
     return {
         "path": file_path,

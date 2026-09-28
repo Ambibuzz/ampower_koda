@@ -486,3 +486,64 @@ def checkout_base(app_name: str, base_branch: str = "main") -> tuple[bool, str]:
     if not ok:
         return False, f"{done}, but pulling origin/{base_branch} failed: {out}"
     return True, f"{done}, pulled latest"
+
+
+def list_worktree_changes(app_name: str, base_branch: str) -> tuple[bool, list[dict]]:
+    """
+    List files that differ between base_branch and the current working tree:
+    committed, staged and unstaged edits plus untracked (not ignored) files.
+    Only meaningful while the request branch is checked out.
+    Returns (ok, [{"status": "M|A|D|...", "path": "relative/path"}, ...]).
+    """
+    root = get_repo_root(app_name)
+    base = (base_branch or "main").strip()
+    # -z keeps paths with spaces or non-ASCII names unquoted; --no-renames
+    # reports a rename as its delete and its add, one path per entry.
+    ok, out = run_git_stdout(["diff", "--name-status", "--no-renames", "-z", base], cwd=root)
+    if not ok:
+        return False, []
+    files = []
+    fields = out.split("\0")
+    for i in range(0, len(fields) - 1, 2):
+        status, path = fields[i].strip(), fields[i + 1]
+        if status and path:
+            files.append({"status": status[0].upper(), "path": path})
+
+    ok, out = run_git_stdout(["ls-files", "--others", "--exclude-standard", "-z"], cwd=root)
+    if ok:
+        files.extend({"status": "A", "path": path} for path in out.split("\0") if path)
+    return True, files
+
+
+def diff_worktree_file(app_name: str, base_branch: str, file_path: str) -> tuple[bool, str]:
+    """Return the unified diff of one file from base_branch to the working tree (untruncated).
+
+    An untracked file has no base or index entry, so it is diffed against /dev/null.
+    """
+    if not file_path:
+        return False, ""
+    root = get_repo_root(app_name)
+    base = (base_branch or "main").strip()
+    ok, out = run_git_stdout(["diff", "--no-renames", base, "--", file_path], cwd=root)
+    if not ok or out.strip():
+        return ok, out
+
+    ok, untracked = run_git_stdout(
+        ["ls-files", "--others", "--exclude-standard", "--", file_path], cwd=root
+    )
+    if not ok or not untracked.strip():
+        return True, ""
+    cmd = ["diff", "--no-index", "--", "/dev/null", file_path]
+    try:
+        # --no-index exits 1 when the files differ, which is the expected case here.
+        result = subprocess.run(["git"] + cmd, cwd=root, capture_output=True, text=True, timeout=120)
+        return result.returncode in (0, 1), (result.stdout or "")
+    except subprocess.TimeoutExpired:
+        log_agent_error("Agent Git: stdout command timeout", f"cmd={' '.join(cmd)}\ncwd={root}")
+        return False, ""
+    except Exception as e:
+        log_agent_error(
+            "Agent Git: stdout command failed",
+            f"cmd={' '.join(cmd)}\ncwd={root}\n{e}\n{frappe.get_traceback()}",
+        )
+        return False, ""
