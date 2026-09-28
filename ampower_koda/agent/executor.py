@@ -161,16 +161,44 @@ def _revert_previous_changes(app_name: str, base_branch: str, request_name: str 
     return ""
 
 
-#: The variables LangChain reads to decide whether, and where, to trace.
-#: ``LANGCHAIN_*`` rather than the newer ``LANGSMITH_*`` spelling: both are
-#: honoured by current releases, and the older pair is the one every installed
-#: version understands.
+#: The variables LangChain reads to decide whether, and where, to trace, in both
+#: spellings. The SDK reads ``LANGSMITH_*`` before ``LANGCHAIN_*``, so a worker
+#: started with the newer one would otherwise override whatever is set here.
 LANGSMITH_ENV = {
-    "enabled": "LANGCHAIN_TRACING_V2",
-    "key": "LANGCHAIN_API_KEY",
-    "project": "LANGCHAIN_PROJECT",
-    "endpoint": "LANGCHAIN_ENDPOINT",
+    "enabled": ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGSMITH_TRACING_V2", "LANGCHAIN_TRACING"),
+    "key": ("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"),
+    "project": ("LANGSMITH_PROJECT", "LANGCHAIN_PROJECT"),
+    "endpoint": ("LANGSMITH_ENDPOINT", "LANGCHAIN_ENDPOINT"),
 }
+
+
+def _set_langsmith_env(role: str, value) -> None:
+    """Set every spelling of one tracing variable, or remove them all for None."""
+    for variable in LANGSMITH_ENV[role]:
+        if value is None:
+            os.environ.pop(variable, None)
+        else:
+            os.environ[variable] = value
+
+
+def _disable_langsmith() -> None:
+    """Remove the trace destination and explicitly switch both enable flags off."""
+    for role in LANGSMITH_ENV:
+        _set_langsmith_env(role, None)
+    os.environ["LANGSMITH_TRACING"] = "false"
+    os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
+
+def _reset_langsmith_cache() -> None:
+    """The SDK caches environment reads per process; a reused worker must re-read them."""
+    try:
+        from langsmith import utils as langsmith_utils
+    except ImportError:
+        return
+    for name in ("get_env_var", "get_tracer_project"):
+        cache_clear = getattr(getattr(langsmith_utils, name, None), "cache_clear", None)
+        if cache_clear:
+            cache_clear()
 
 
 def _apply_langsmith(settings) -> None:
@@ -191,8 +219,7 @@ def _apply_langsmith(settings) -> None:
     """
     try:
         if not getattr(settings, "enable_langsmith", 0):
-            for variable in LANGSMITH_ENV.values():
-                os.environ.pop(variable, None)
+            _disable_langsmith()
             return
 
         api_key = (settings.get_password("langsmith_api_key", raise_exception=False) or "").strip()
@@ -200,24 +227,25 @@ def _apply_langsmith(settings) -> None:
             # Validation blocks this combination on save, but a row written
             # before the field existed can still reach here. Tracing without a
             # key silently drops every trace, so say so rather than pretend.
-            for variable in LANGSMITH_ENV.values():
-                os.environ.pop(variable, None)
+            _disable_langsmith()
             log_agent_error(
                 "Agent LangSmith",
                 "LangSmith tracing is enabled but no API key is set — tracing stays off.",
             )
             return
 
-        os.environ[LANGSMITH_ENV["enabled"]] = "true"
-        os.environ[LANGSMITH_ENV["key"]] = api_key
-        os.environ[LANGSMITH_ENV["project"]] = (
+        _set_langsmith_env("enabled", "true")
+        _set_langsmith_env("key", api_key)
+        _set_langsmith_env("project", (
             getattr(settings, "langsmith_project", "") or "Koda"
-        ).strip()
-        os.environ[LANGSMITH_ENV["endpoint"]] = (
+        ).strip())
+        _set_langsmith_env("endpoint", (
             getattr(settings, "langsmith_endpoint", "") or "https://api.smith.langchain.com"
-        ).strip().rstrip("/")
+        ).strip().rstrip("/"))
     except Exception:
         log_agent_error("Agent LangSmith", frappe.get_traceback())
+    finally:
+        _reset_langsmith_cache()
 
 
 def validate_target_app(app_name: str) -> str:
