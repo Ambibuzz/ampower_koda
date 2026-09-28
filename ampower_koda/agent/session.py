@@ -92,6 +92,10 @@ def load(request_name: str, kind: str = IMPLEMENTATION) -> dict:
     return history
 
 
+#: Submits whose independent coverage check may fail before the plan is accepted without it.
+MAX_COVERAGE_FAILURES = 2
+
+
 class PlanSink:
     """What ``submit_plan`` does during investigation: validate, check, accept."""
 
@@ -99,6 +103,7 @@ class PlanSink:
         self.state = state
         self.coverage = coverage
         self.checked = False
+        self.failures = 0
         self.plan = None
         self.findings = ""
 
@@ -119,9 +124,18 @@ class PlanSink:
         except PlanValidationError as error:
             return "SUBMIT_FAILED: fix these and submit again:\n- " + "\n- ".join(error.issues)
         if self.coverage is not None and not self.checked:
-            # Checked once; the checker sees only the request and the plan.
+            # Checked once; the checker sees only the request and the plan. Marked only once it
+            # answers: a checker that raised runs again on the next submit, and one that keeps
+            # failing is logged and skipped, since a second opinion must not block planning.
+            try:
+                gaps = self.coverage(plan)
+            except Exception:
+                self.failures += 1
+                if self.failures < MAX_COVERAGE_FAILURES:
+                    raise
+                log_agent_error("Koda session: plan coverage check unavailable", frappe.get_traceback())
+                gaps = []
             self.checked = True
-            gaps = self.coverage(plan)
             if gaps:
                 return ("SUBMIT_FAILED: an independent check of the plan against the request found:\n- "
                         + "\n- ".join(gaps)
