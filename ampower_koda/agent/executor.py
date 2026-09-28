@@ -330,6 +330,17 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
     frappe.publish_realtime("agent_progress", payload, user=user)
 
 
+def _config_failed(request_name: str, title: str, error: Exception) -> None:
+    """Fail a job whose configuration could not load, through the normal status path.
+
+    Setting the fields without publishing left a request that was still Queued in
+    an open form showing Queued until someone reloaded it.
+    """
+    log_agent_error(title, frappe.get_traceback())
+    owner = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
+    _update_status(request_name, owner, "Failed", f"Configuration error: {error}", error_log=str(error))
+
+
 # Phase 1: Planning (investigate + plan, or revise the plan from the user's feedback)
 
 @managed_job
@@ -342,10 +353,7 @@ def run_planning_phase(request_name: str, plan_feedback: str = "") -> None:
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        log_agent_error("Agent Planning Config Error", frappe.get_traceback())
-        set_request_value(request_name, "status", "Failed")
-        set_request_value(request_name, "error_log", str(e))
-        frappe.db.commit()
+        _config_failed(request_name, "Agent Planning Config Error", e)
         return
 
     user = config["user"]
@@ -476,10 +484,7 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        log_agent_error("Agent Execution Config Error", frappe.get_traceback())
-        set_request_value(request_name, "status", "Failed")
-        set_request_value(request_name, "error_log", str(e))
-        frappe.db.commit()
+        _config_failed(request_name, "Agent Execution Config Error", e)
         return
 
     user = config["user"]
@@ -858,10 +863,7 @@ def run_bench_and_commit(request_name: str) -> None:
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        log_agent_error("Agent Bench Config Error", frappe.get_traceback())
-        set_request_value(request_name, "status", "Failed")
-        set_request_value(request_name, "error_log", str(e))
-        frappe.db.commit()
+        _config_failed(request_name, "Agent Bench Config Error", e)
         return
 
     user = config["user"]
@@ -993,10 +995,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        log_agent_error("Agent Deploy Config Error", frappe.get_traceback())
-        set_request_value(request_name, "status", "Failed")
-        set_request_value(request_name, "error_log", str(e))
-        frappe.db.commit()
+        _config_failed(request_name, "Agent Deploy Config Error", e)
         return
 
     user = config["user"]
