@@ -189,9 +189,12 @@ def plan_node(state: dict) -> dict:
 
         history = load(request_name, PLANNING) if feedback else {}
         if not history.get("task_prompt"):
-            history = {"task_prompt": get_session_request_prompt(
+            prompt = get_session_request_prompt(
                 state.get("user_message", ""), state.get("request_type", "Improvement"),
-                verification.contract_context(verification.prepare_contract(app_name)), request_name=request_name)}
+                verification.contract_context(verification.prepare_contract(app_name)), request_name=request_name)
+            # Ranked from the request alone, so the first model call already knows where to look.
+            points = koda_core.starting_points(app_name, state.get("user_message", ""), request_name=request_name)
+            history = {"task_prompt": f"{prompt}\n\n{points}" if points else prompt}
         if feedback:
             current = state.get("plan_object")
             edited = (json.dumps(current, ensure_ascii=False, indent=1)

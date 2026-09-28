@@ -65,6 +65,7 @@ from ampower_koda.agent.core import (
     ToolOutcome,
     TurnUsage,
     allocate,
+    brief,
     open_session,
     run_turn,
     search,
@@ -685,6 +686,33 @@ def suggest_context(app_name: str, query: str, *, limit: int = 12, rerank: bool 
     ``rerank=False`` skips the paid reranker, whose spend the cost ledger cannot see.
     """
     return suggestions_for(_app_session(app_name, rerank=rerank), query, limit=limit)
+
+
+def starting_points(app_name: str, message: str, *, request_name: str = "") -> str:
+    """Where a request most likely starts: three files and their best definitions, before any model call.
+
+    Two dedicated rerank calls over the held app index (about half a cent), booked on
+    the request's cost. Never raises: on any failure the investigation starts as before.
+    """
+    if not app_name or not message.strip():
+        return ""
+    try:
+        session = _app_session(app_name, rerank=False)
+        client = _reranker_for(session, session.context.config.rerank.brief_model)
+        spent = client.cost if client is not None else 0.0
+        result = brief(session.retriever, message, reranker=client)
+        cost = (client.cost - spent) if client is not None else 0.0
+        if request_name and cost > 0:
+            tokens = int(frappe.db.get_value(DOCTYPE_NAME, request_name, "tokens_used") or 0)
+            persist_usage(request_name, tokens, cost_delta=cost)
+        _publish(request_name, "starting_points", files=[point.path for point in result.points],
+                 reranked=result.reranked, rerank_calls=result.rerank_calls, cost=round(cost, 6),
+                 notes=list(result.notes))
+        return result.text
+    except Exception:
+        log_agent_error("Koda core: starting points",
+                        f"request={request_name}\napp={app_name}\n{frappe.get_traceback()}")
+        return ""
 
 
 def suggestions_for(session: Session, query: str, *, limit: int = 12) -> list[dict]:
