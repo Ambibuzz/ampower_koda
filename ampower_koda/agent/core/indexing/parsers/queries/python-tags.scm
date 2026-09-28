@@ -45,26 +45,35 @@
 ; ---------------------------------------------------------------------------
 ; Class-level fields. Covers `rate = 1` and `currency: str = "INR"` alike:
 ; tree-sitter models an annotated assignment as an assignment with a type.
+; Each statement pattern below also accepts a bare `assignment`: the grammar in
+; tree-sitter-language-pack hides `expression_statement`, so the assignment is
+; the statement there.
 ; ---------------------------------------------------------------------------
 
 (class_definition body: (block
-  (expression_statement
-    (assignment left: (identifier) @name)) @definition.field))
+  [(expression_statement (assignment left: (identifier) @name))
+   (assignment left: (identifier) @name)] @definition.field))
 
 (class_definition body: (block
-  (expression_statement
-    (assignment left: [(pattern_list (identifier) @name)
-                       (tuple_pattern (identifier) @name)])) @definition.field))
+  [(expression_statement
+     (assignment left: [(pattern_list (identifier) @name)
+                        (tuple_pattern (identifier) @name)]))
+   (assignment left: [(pattern_list (identifier) @name)
+                      (tuple_pattern (identifier) @name)])] @definition.field))
 
 ; ---------------------------------------------------------------------------
 ; Module-level type aliases, before constants: `PATH: TypeAlias = str` is a
 ; type first and an upper-case name second.
 ; ---------------------------------------------------------------------------
 
-((module (expression_statement
-   (assignment
-     left: (identifier) @name
-     type: (type (identifier) @_alias))) @definition.type)
+((module
+   [(expression_statement
+      (assignment
+        left: (identifier) @name
+        type: (type (identifier) @_alias)))
+    (assignment
+      left: (identifier) @name
+      type: (type (identifier) @_alias))] @definition.type)
  (#eq? @_alias "TypeAlias"))
 
 (type_alias_statement left: (type (identifier) @name)) @definition.type
@@ -75,13 +84,17 @@
 ; any attempt to prove a name is never rebound.
 ; ---------------------------------------------------------------------------
 
-((module (expression_statement
-   (assignment left: (identifier) @name)) @definition.constant)
+((module
+   [(expression_statement (assignment left: (identifier) @name))
+    (assignment left: (identifier) @name)] @definition.constant)
  (#match? @name "^_*[A-Z][A-Z0-9_]*$"))
 
-((module (expression_statement
-   (assignment left: [(pattern_list (identifier) @name)
-                      (tuple_pattern (identifier) @name)])) @definition.constant)
+((module
+   [(expression_statement
+      (assignment left: [(pattern_list (identifier) @name)
+                         (tuple_pattern (identifier) @name)]))
+    (assignment left: [(pattern_list (identifier) @name)
+                       (tuple_pattern (identifier) @name)])] @definition.constant)
  (#match? @name "^_*[A-Z][A-Z0-9_]*$"))
 
 ; ---------------------------------------------------------------------------
