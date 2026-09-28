@@ -158,6 +158,12 @@ CACHE_WRITE_PRICE = 1.25
 MAX_UNDERSTANDING_CONTEXT_CHARS = 12000
 # A copy at least this long changes by edits: rewriting it whole drops what the reference does.
 COPY_REWRITE_MIN_LINES = 150
+CLIENT_SOURCE_SUFFIXES = (".js", ".css", ".html", ".vue")
+
+
+def _server_calls(app_name: str, source: str) -> list[str]:
+    """Dotted whitelisted-method paths of this app that a client source calls."""
+    return _re.findall(rf"\b{_re.escape(app_name)}(?:\.[A-Za-z_][A-Za-z0-9_]*)+", source or "")
 # Room to write a whole file in one call, with the reasoning that precedes it.
 # Output is billed as generated, so a high ceiling costs nothing unused.
 MODEL_ROUND_OUTPUT_TOKENS = 32000
@@ -1120,9 +1126,22 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         full, canonical, current = capture_write(path, fresh_read=True)
         reference = copied.get(canonical)
         if reference and current is not None and current.count("\n") >= COPY_REWRITE_MIN_LINES:
-            return (f"WRITE_FAILED: {path} was copied from {reference} so that it keeps the reference's "
-                    "behavior. Change it with edit_file on the parts the task changes (several edits in one "
-                    "response are fine); rewriting it whole drops what the reference does.")
+            if not path.endswith(CLIENT_SOURCE_SUFFIXES):
+                return (f"WRITE_FAILED: {path} was copied from {reference} so that it keeps the reference's "
+                        "behavior. Change it with edit_file on the parts the task changes (several edits in one "
+                        "response are fine); rewriting it whole drops what the reference does.")
+            # A client script may be redesigned whole (a request for a different UI), but not lose
+            # the server contract the copy carried.
+            # By method name inside a string or template literal: a rewrite may build the dotted path
+            # from a base (`${methodBase}trace_batch`), which the full-path pattern misses, and a name
+            # left only in a comment or an identifier is not a call.
+            dropped = sorted(call for call in set(_server_calls(app_name, current))
+                             if not _re.search(r"[\"'`][^\"'`\n]*\b" + _re.escape(call.rsplit(".", 1)[-1])
+                                               + r"\b[^\"'`\n]*[\"'`]", content))
+            if dropped:
+                return (f"WRITE_FAILED: {path} was copied from {reference}; this rewrite no longer calls "
+                        + ", ".join(dropped) + ". Keep every server call, its parameters and the states "
+                        "around it (loading, empty, error) when you redesign the page.")
         return source_feedback(remember(full, agent_tools.write_file(app_name, path, content)), path)
 
     @tool

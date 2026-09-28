@@ -128,7 +128,10 @@ features (DocTypes, Script Reports, Pages, APIs, hooks, client scripts) and make
   reference's parameter names and response keys. Example, "a page like page_a that lists customers
   instead of suppliers": copy_file page_a.py and page_a.js with {{"page_a": "page_b"}}, read the supplier
   code, edit_file those spans; not write_file of a new page_b.js, which silently loses the page's other
-  behavior.
+  behavior. When the request asks for a different UI or UX, the client script is a CHANGE: copy it, then
+  write it whole with its own layout and interaction instead of recolouring the copy. Keep every server
+  call, parameter, control and state (loading, empty, error, retry) the reference has; write_file refuses
+  a rewrite of a copied client script that drops one of its server calls.
 
 ## Target app layout (tool paths are relative to the app root)
 - {app_name}/<module>/doctype/<name>/ — DocType: .json, .py, .js
