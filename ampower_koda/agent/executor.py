@@ -1187,6 +1187,62 @@ def run_bench_and_commit(request_name: str) -> None:
         _update_status(request_name, user, "Failed", str(e), error_log=tb)
 
 
+@managed_job
+def run_selected_bench_commands(request_name: str, commands: list, previous_status: str) -> None:
+    """Run commands chosen in the form or IDE outside the approval flow.
+
+    Queued by api.run_selected_bench_commands so a long migrate or build never
+    holds a web request open. Each command's receipt is appended to the bench log
+    as it finishes; the request shows Building meanwhile and returns to
+    ``previous_status`` afterwards. A service restart runs last and reports back
+    through record_service_restart.
+    """
+    frappe.set_user("Administrator")
+    user = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
+    try:
+        # The API checked the checkout when queuing; it may have moved since.
+        doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+        refused = bench_branch_refusal(
+            (doc.target_app_name or "").strip(), doc.branch_name,
+            allowed=((doc.base_branch or "main").strip(),),
+        )
+        if refused:
+            _append_receipt(request_name, refused)
+            _update_status(request_name, user, previous_status, refused)
+            return
+
+        bench_root = _bench_root()
+        bench_env = _get_bench_env()
+        restarts = [cmd for cmd in commands if _is_service_restart(cmd)]
+        failed = []
+        for cmd in commands:
+            if _is_service_restart(cmd):
+                continue
+            check_active(reserve=BENCH_COMMAND_TIMEOUT + 30)
+            receipt, failure = _run_bench_command(user, request_name, cmd, bench_root, bench_env)
+            _append_receipt(request_name, receipt)
+            if failure:
+                failed.append(failure)
+
+        if failed:
+            for cmd in restarts:
+                _append_receipt(request_name, f"$ {cmd}\nNOT RUN: an earlier command failed\n")
+            message = f"{len(failed)} bench command(s) FAILED: {', '.join(failed[:3])}. See the bench log."
+        elif restarts:
+            message = "Bench commands done. The service restart runs last; its result is added to the bench log."
+        else:
+            message = "Bench commands done. See the bench log."
+        _update_status(request_name, user, previous_status, message)
+
+        for cmd in (() if failed else restarts):
+            check_active(reserve=5)
+            _start_service_restart(request_name, user, cmd, bench_root, bench_env, promote=False)
+    except Exception as e:
+        tb = frappe.get_traceback()
+        log_agent_error("Agent Selected Bench Commands Error", tb)
+        _update_status(request_name, user, previous_status, f"Bench commands stopped: {e}", error_log=tb)
+
+
 # Phase 3: Deployment (Push + Pull Request)
 
 @managed_job
