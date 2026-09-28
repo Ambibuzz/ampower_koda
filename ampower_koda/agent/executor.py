@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import uuid
 
 import frappe
 from ampower_koda.agent import koda_core
@@ -858,6 +859,7 @@ def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
         "type": "bench_command",
         "command": cmd,
         "timestamp": ts,
+        "event_id": uuid.uuid4().hex,
     }, user=user)
     frappe.publish_realtime("agent_log", {
         "request_name": request_name,
@@ -865,6 +867,7 @@ def _publish_bench_log(user, request_name, cmd, success, output_preview=""):
         "success": success,
         "output_preview": (output_preview or "")[:180],
         "timestamp": ts,
+        "event_id": uuid.uuid4().hex,
     }, user=user)
 
 

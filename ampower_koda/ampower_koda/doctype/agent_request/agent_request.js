@@ -1440,8 +1440,11 @@ function setup_live_log_panel(frm) {
 function append_log_entry(frm, data) {
     if (!frm._log_history) frm._log_history = [];
     
-    // Check if this specific log entry is already in history to avoid duplicates after reload
-    var entry_id = (data.timestamp || '') + (data.type || '') + (data.tool_name || '') + (data.preview || '').substring(0, 50);
+    // Check if this specific log entry is already in history to avoid duplicates after reload.
+    // Publishers send a unique event_id; the display-text key is only for events without one.
+    var entry_id = data.event_id
+        ? 'id:' + data.event_id
+        : (data.timestamp || '') + (data.type || '') + (data.tool_name || '') + (data.preview || '').substring(0, 50);
     if (frm._last_entry_ids && frm._last_entry_ids.indexOf(entry_id) !== -1) return;
     
     frm._log_history.push(data);

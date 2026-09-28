@@ -963,7 +963,8 @@ def _publish(request_name: str, log_type: str, **payload) -> None:
         user = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
         frappe.publish_realtime(
             "agent_log",
-            {"request_name": request_name, "type": log_type, **payload},
+            # A unique id: the form deduplicates on it, and two calls to one tool in a second differ.
+            {"request_name": request_name, "type": log_type, "event_id": os.urandom(16).hex(), **payload},
             user=user,
         )
     except Exception:

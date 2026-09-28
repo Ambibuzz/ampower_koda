@@ -747,6 +747,9 @@ def _publish_agent_log(request_name: str, log_type: str, **kwargs):
             "request_name": request_name,
             "type": log_type,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # The form deduplicates on this; display text and a one-second
+            # timestamp collapsed distinct calls to the same tool.
+            "event_id": os.urandom(16).hex(),
             **kwargs,
         }
         frappe.publish_realtime("agent_log", payload, user=user)
