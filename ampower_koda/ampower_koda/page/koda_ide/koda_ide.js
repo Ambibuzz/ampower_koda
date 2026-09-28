@@ -1,9 +1,6 @@
 /* global ace */
 
 frappe.pages['koda-ide'].on_page_load = function (wrapper) {
-    const route = frappe.get_route();
-    const request_name = route[1];
-
     const page = frappe.ui.make_app_page({
         parent: wrapper,
         title: __('Koda IDE'),
@@ -11,11 +8,20 @@ frappe.pages['koda-ide'].on_page_load = function (wrapper) {
     });
 
     const ide = {
-        request_name: request_name,
+        request_name: null,
+        bound: false,
+        // Bumped whenever the IDE binds to a request; responses that carry an
+        // older value belong to the previous request and are dropped.
+        session: 0,
+        // Latest file open / diff load; an older response must not touch the editor.
+        openGeneration: 0,
+        diffGeneration: 0,
         context: {},
         treeData: null,
         files: {},
         activePath: null,
+        // The file whose text the editor holds. It lags activePath while a file loads.
+        editorPath: null,
         editor: null,
         aceReady: null,
         viewMode: 'code',
@@ -26,17 +32,69 @@ frappe.pages['koda-ide'].on_page_load = function (wrapper) {
     const $shell = build_ide_shell(page, ide);
     page.main.append($shell);
     bind_ide_shortcuts(ide, $shell);
+    ide.aceReady = load_ace().then(function () {
+        init_editor($shell, ide);
+    });
+
+    wrapper.koda_ide = { ide: ide, $shell: $shell };
+    bind_ide_route(wrapper);
+};
+
+// Frappe caches the page: a later visit, possibly for another request, only shows it again.
+frappe.pages['koda-ide'].on_page_show = function (wrapper) {
+    bind_ide_route(wrapper);
+};
+
+function bind_ide_route(wrapper) {
+    const state = wrapper.koda_ide;
+    if (!state) return;
+    const ide = state.ide;
+    const request_name = frappe.get_route()[1] || '';
+    if (ide.bound && ide.request_name === request_name) return;
+
+    const previous = ide.request_name;
+    const rebind = function () {
+        reset_ide_request(state.$shell, ide, request_name);
+    };
+    sync_editor_buffer(ide);
+    if (ide.bound && ide.dirtyPaths.size) {
+        frappe.confirm(
+            __('{0} has unsaved changes in {1} file(s). Discard them and open {2}?',
+                [frappe.utils.escape_html(previous), ide.dirtyPaths.size,
+                    frappe.utils.escape_html(request_name || __('this page'))]),
+            rebind,
+            function () {
+                frappe.set_route('koda-ide', previous);
+            }
+        );
+        return;
+    }
+    rebind();
+}
+
+function reset_ide_request($shell, ide, request_name) {
+    ide.session += 1;
+    ide.bound = true;
+    ide.request_name = request_name;
+    ide.context = {};
+    ide.treeData = null;
+    ide.files = {};
+    ide.dirtyPaths.clear();
+    ide.readOnly = false;
+    clear_editor($shell, ide);
+    $shell.find('.koda-tabs').empty();
+    $shell.find('.koda-toolbar-meta').text(__('Loading...'));
 
     if (!request_name) {
         show_ide_error($shell, __('Open this page from an Agent Request.'));
         return;
     }
 
-    load_ace().then(function () {
-        init_editor($shell, ide);
-        load_workspace(request_name, $shell, ide);
+    const session = ide.session;
+    ide.aceReady.then(function () {
+        if (ide.session === session) load_workspace(request_name, $shell, ide);
     });
-};
+}
 
 function load_ace() {
     const root = frappe.boot.developer_mode
@@ -576,8 +634,10 @@ function apply_theme(theme, $shell, ide) {
 }
 
 function bind_ide_shortcuts(ide, $shell) {
-    $(document).on('keydown.koda-ide', function (e) {
-        if (!ide.activePath) return;
+    // The handler is document-wide and the page stays cached after navigating
+    // away: act only while the IDE is on screen, so Ctrl+S on a form saves the form.
+    $(document).off('keydown.koda-ide').on('keydown.koda-ide', function (e) {
+        if (!ide.activePath || !$shell.is(':visible')) return;
         if ((e.ctrlKey || e.metaKey) && e.key === 's') {
             e.preventDefault();
             save_active_file($shell, ide);
@@ -602,32 +662,48 @@ function init_editor($shell, ide) {
         scrollPastEnd: 0.5,
     });
     ide.editor.setKeyboardHandler('ace/keyboard/vscode');
+    ide.editor.session.on('change', function () {
+        // Enable Save at once; the dirty comparison below is debounced, and
+        // save_active_file re-derives it from the editor anyway.
+        if (ide._setting_content || !ide.editorPath || ide.readOnly) return;
+        $shell.find('.koda-btn-save').prop('disabled', false);
+    });
     ide.editor.session.on('change', frappe.utils.debounce(function () {
-        if (!ide.activePath || ide._setting_content) return;
-        const file = ide.files[ide.activePath];
+        const file = sync_editor_buffer(ide);
         if (!file) return;
-        file.content = ide.editor.getValue();
-        file.dirty = file.content !== file.original;
-        if (file.dirty) {
-            ide.dirtyPaths.add(ide.activePath);
-        } else {
-            ide.dirtyPaths.delete(ide.activePath);
-        }
         update_tabs($shell, ide);
         update_save_button($shell, ide);
-        set_status($shell, file.dirty ? __('Unsaved changes — press Save or Ctrl+S') : __('Ready'), file.full_path || ide.activePath);
+        set_status($shell, file.dirty ? __('Unsaved changes — press Save or Ctrl+S') : __('Ready'), file.full_path || ide.editorPath);
     }, 200));
     ide.editor.resize();
 }
 
+// Copy the editor's text into the file it shows and recompute that file's dirty
+// state. The editor is the truth for that file; ide.files holds every other tab.
+function sync_editor_buffer(ide) {
+    const path = ide.editorPath;
+    const file = path && ide.files[path];
+    if (!file || !ide.editor) return null;
+    file.content = ide.editor.getValue();
+    file.dirty = file.content !== file.original;
+    if (file.dirty) {
+        ide.dirtyPaths.add(path);
+    } else {
+        ide.dirtyPaths.delete(path);
+    }
+    return file;
+}
+
 function load_workspace(request_name, $shell, ide) {
     ide.request_name = request_name;
+    const session = ide.session;
     $shell.find('.koda-tree').html(`<div class="koda-empty">${__('Loading...')}</div>`);
 
     frappe.call({
         method: 'ampower_koda.agent.api.get_change_tree',
         args: { request_name: request_name },
         callback: function (r) {
+            if (ide.session !== session) return;
             if (!r.message) {
                 show_ide_error($shell, __('Could not load workspace.'));
                 return;
@@ -854,15 +930,13 @@ function open_file(file_path, $shell, ide, force) {
 }
 
 function do_open_file(file_path, $shell, ide) {
-    if (ide.activePath && ide.files[ide.activePath]) {
-        ide.files[ide.activePath].content = ide.editor.getValue();
-    }
+    sync_editor_buffer(ide);
 
     ide.activePath = file_path;
-    $shell.find('.koda-tree-row').removeClass('selected');
-    $shell.find('.koda-tree-row').filter(function () {
-        return $(this).attr('data-path') === file_path;
-    }).addClass('selected');
+    // Only the latest open may fill the editor; a slower earlier response is dropped.
+    const generation = ++ide.openGeneration;
+    const session = ide.session;
+    select_tree_row($shell, file_path);
 
     if (ide.readOnly) {
         // Working tree is on a different branch; show the diff only, never read the file.
@@ -887,6 +961,7 @@ function do_open_file(file_path, $shell, ide) {
             cached.full_path = full_path || cached.full_path;
             set_editor_content(ide, content, language);
         }
+        ide.editorPath = file_path;
         $shell.find('.koda-editor-wrap').addClass('has-file');
         update_breadcrumb($shell, file_path, cached.full_path);
         update_tabs($shell, ide);
@@ -906,9 +981,13 @@ function do_open_file(file_path, $shell, ide) {
         args: { request_name: ide.request_name, file_path: file_path },
         callback: function (r) {
             if (!r.message) return;
-            loadAndShow(r.message.content || '', r.message.language || 'Text', r.message.full_path);
+            if (ide.session !== session || ide.openGeneration !== generation || ide.activePath !== file_path) {
+                return;
+            }
+            loadAndShow(r.message.content || '', r.message.language || 'Text', r.message.full_path, r.message.sha256);
         },
         error: function () {
+            if (ide.session !== session) return;
             append_terminal($shell, __('Failed to load file: ') + file_path);
         },
     });
@@ -997,26 +1076,37 @@ function update_tabs($shell, ide) {
     if (had_focus) $tabs.find('.koda-tab.active').trigger('focus');
 }
 
+// Empty the editor and everything that describes the file it showed.
+function clear_editor($shell, ide) {
+    ide.activePath = null;
+    ide.editorPath = null;
+    if (ide.editor) {
+        ide._setting_content = true;
+        ide.editor.session.setValue('');
+        ide._setting_content = false;
+    }
+    $shell.find('.koda-editor-wrap').removeClass('has-file');
+    update_breadcrumb($shell, '', '');
+    set_status($shell, __('Ready'), '');
+    $shell.find('.koda-diff-content').empty();
+    update_save_button($shell, ide);
+}
+
 function close_tab(file_path, $shell, ide) {
+    sync_editor_buffer(ide);
     const file = ide.files[file_path];
     const do_close = function () {
         const was_active = ide.activePath === file_path;
         delete ide.files[file_path];
         ide.dirtyPaths.delete(file_path);
+        if (ide.editorPath === file_path) ide.editorPath = null;
 
         if (was_active) {
             const remaining = Object.keys(ide.files);
             if (remaining.length) {
                 open_file(remaining[remaining.length - 1], $shell, ide, true);
             } else {
-                ide.activePath = null;
-                ide._setting_content = true;
-                ide.editor.session.setValue('');
-                ide._setting_content = false;
-                $shell.find('.koda-editor-wrap').removeClass('has-file');
-                update_breadcrumb($shell, '', '');
-                set_status($shell, __('Ready'), '');
-                $shell.find('.koda-diff-content').empty();
+                clear_editor($shell, ide);
             }
         }
         update_tabs($shell, ide);
@@ -1100,10 +1190,16 @@ function update_breadcrumb($shell, rel_path, full_path) {
 }
 
 function load_file_diff(file_path, $shell, ide) {
+    const generation = ++ide.diffGeneration;
+    const session = ide.session;
     frappe.call({
         method: 'ampower_koda.agent.api.get_file_diff',
         args: { request_name: ide.request_name, file_path: file_path },
         callback: function (r) {
+            // Only the latest diff request for the file still active may render.
+            if (ide.session !== session || ide.diffGeneration !== generation || ide.activePath !== file_path) {
+                return;
+            }
             const diff = (r.message && r.message.diff) || '';
             render_diff_panel($shell, diff);
         },
@@ -1268,19 +1364,15 @@ function open_push_dialog(ide, $shell) {
 }
 
 function refresh_tree_badges($shell, ide) {
+    const session = ide.session;
     frappe.call({
         method: 'ampower_koda.agent.api.get_change_tree',
         args: { request_name: ide.request_name },
         callback: function (r) {
-            if (!r.message) return;
+            if (!r.message || ide.session !== session) return;
             ide.context = r.message;
             render_toolbar_meta($shell, ide, r.message);
             render_tree($shell, ide, r.message);
-            if (ide.activePath) {
-                $shell.find('.koda-tree-row').filter(function () {
-                    return $(this).attr('data-path') === ide.activePath;
-                }).addClass('selected');
-            }
         },
     });
 }
