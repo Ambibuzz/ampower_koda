@@ -83,12 +83,6 @@ EDGE_WEIGHTS: Final[dict[str, float]] = {
     "references": 0.35,
 }
 
-PAGERANK_ALPHA: Final[float] = 0.85
-
-PAGERANK_ITERATIONS: Final[int] = 40
-
-MIRROR_RANK_FACTOR: Final[float] = 0.1
-
 MIRROR_MIN_SHARED_FILES: Final[int] = 5
 MIRROR_MIN_SHARED_FRACTION: Final[float] = 0.6
 
