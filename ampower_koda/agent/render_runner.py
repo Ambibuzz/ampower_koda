@@ -14,6 +14,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.parse
 MAX_STEPS = 20
 DIFF_LINES = 25
 REMOVED_SHOWN = 3  # removed lines listed per changed block before the rest are counted
@@ -641,4 +643,144 @@ def sign_in(context, page, base, login, session_file):
                 json.dump({"sid": sid}, handle)
             os.chmod(session_file, 0o600)
 
+
+class Page:
+    """One browser tab on the site, with the page's server calls and console errors."""
+
+    def __init__(self, context, page):
+        self.context, self.page = context, page
+        self.calls, self.console, self.inflight, self.seen_animations = [], [], 0, set()
+        page.set_default_timeout(4000)  # a control that does not respond is reported, not waited on
+        page.set_default_navigation_timeout(30000)  # the first load after registering a Page is slow
+        page.on("console", self.on_console)
+        page.on("pageerror", lambda error: self.remember("uncaught: " + str(error)))
+        page.on("request", self.on_request)
+        page.on("requestfinished", self.on_done)
+        page.on("requestfailed", self.on_done)
+
+    def remember(self, text):
+        text = " ".join(str(text).split())[:300]
+        if text and text not in self.console and len(self.console) < 30:
+            self.console.append(text)
+
+    def on_console(self, message):
+        if message.type != "error":
+            return
+        source = str((message.location or {}).get("url") or "")
+        if "socket.io" in source or "socket.io" in message.text:
+            return  # realtime is not part of the page under test
+        self.remember(message.text + (f" [{source.split('?')[0]}]" if source else ""))
+
+    def on_request(self, request):
+        if "/api/" not in request.url:
+            return
+        self.inflight += 1
+        if "/api/method/" not in request.url:
+            return
+        args = {}
+        try:
+            args = {k: v[0] for k, v in urllib.parse.parse_qs(request.post_data or "").items()}
+        except (TypeError, ValueError):
+            pass
+        self.calls.append({"request": request, "method": request.url.split("/api/method/", 1)[1].split("?")[0],
+                           "args": args, "status": None, "body": ""})
+
+    def on_done(self, request):
+        if "/api/" not in request.url:
+            return
+        self.inflight = max(0, self.inflight - 1)
+        for call in self.calls:
+            if call["request"] is request and call["status"] is None:
+                try:
+                    response = request.response()
+                    if response:
+                        call["status"] = response.status
+                        call["body"] = body_summary(response.text(), response.status)
+                except Exception:
+                    call["status"] = call["status"] or 0
+
+    def settle(self, first=250):
+        self.page.wait_for_timeout(first)
+        deadline = time.time() + 6
+        while self.inflight > 0 and time.time() < deadline:
+            self.page.wait_for_timeout(100)
+        self.page.wait_for_timeout(350)
+
+    def snapshot(self):
+        """The visible Desk page plus open dialogs and alerts, which live outside the page container."""
+        parts = []
+        for selector in (".page-container:visible .layout-main", ".page-container:visible", "body"):
+            try:
+                element = self.page.locator(selector).first
+                if element.count():
+                    parts.append(element.aria_snapshot())
+                    break
+            except Exception:
+                continue
+        for index, selector in enumerate((".modal.show", "#alert-container .desk-alert")):
+            locator = self.page.locator(selector)
+            for n in range(min(locator.count(), 4)):
+                try:
+                    if locator.nth(n).is_visible():
+                        parts.append(("dialog:\n" if index == 0 else "alert:\n") + locator.nth(n).aria_snapshot())
+                except Exception:
+                    pass
+        return "\n".join(parts)
+
+    def visible_text(self):
+        texts = []
+        for selector in (".page-container:visible", ".modal.show", "#alert-container"):
+            locator = self.page.locator(selector)
+            for n in range(min(locator.count(), 4)):
+                try:
+                    if locator.nth(n).is_visible():
+                        texts.append(locator.nth(n).inner_text())
+                except Exception:
+                    pass
+        return " ".join(" ".join(texts).split())
+
+    def evaluate(self, script, default=None, arg=None):
+        try:
+            return self.page.evaluate(script) if arg is None else self.page.evaluate(script, arg)
+        except Exception:
+            return default
+
+    def target(self, text, kind):
+        """A visible element by label, placeholder, role name or text, inside an open dialog first."""
+        dialog = self.page.locator(".modal.show")
+        scopes = [dialog.last] if dialog.count() and dialog.last.is_visible() else []
+        scopes.append(self.page)
+        for scope in scopes:
+            finders = [lambda s=scope: s.get_by_label(text, exact=True), lambda s=scope: s.get_by_label(text),
+                       lambda s=scope: s.get_by_placeholder(text)]
+            if kind == "click":
+                finders = [*(lambda s=scope, r=role, e=exact: s.get_by_role(r, name=text, exact=e)
+                             for exact in (True, False) for role in ("button", "option", "link", "tab")),
+                           *finders, lambda s=scope: s.get_by_text(text, exact=True),
+                           lambda s=scope: s.get_by_text(text)]
+            for finder in finders:
+                try:
+                    found = first_visible(finder())
+                except Exception:
+                    found = None
+                if found is not None:
+                    return found
+        try:
+            return first_visible(self.page.locator(text))
+        except Exception:
+            return None
+
+def first_visible(locator):
+    for index in range(min(locator.count(), 12)):
+        candidate = locator.nth(index)
+        try:
+            if candidate.is_visible():
+                return candidate
+        except Exception:
+            pass
+    return None
+
+
+def page_width(page):
+    return (page.viewport_size or {}).get("width") or 0
 
