@@ -2120,7 +2120,8 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
                        reasoning_effort=_phase_reasoning_effort(phase, provider, model))
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
         shared_context = (_shared_request_context(state)
-                          if state.get("execution_tasks") and session is None else "")
+                          if state.get("execution_tasks") and (session is None or session.get("shared_context"))
+                          else "")
         content, tool_edited_paths, total_tokens, rounds_used, exhausted = _run_tool_calling_loop(
             llm, tools, system_prompt, prompt,
             request_name=request_name,
@@ -3215,6 +3216,9 @@ def review_node(state: dict) -> dict:
                 {**state, **updates}, "Reviewing", prompt, read_only_tools=True,
                 max_rounds=MAX_TOOL_ROUNDS_REVIEW if recovery_pass == 0 else MAX_TOOL_ROUNDS_REVIEW_RECOVERY,
                 history=history,
+                # The same catalogue as planning and implementation, so the review
+                # reuses the cached tools+system prefix; both session tools refuse here.
+                session={"plan_sink": None, "explorer": None, "shared_context": True},
             )
             updates.update(turn_updates)
             updates.pop("_write_baseline", None)
