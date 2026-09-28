@@ -554,7 +554,10 @@ except Exception:
     site_disconnect()
     sys.exit(3)
 try:
-    result = frappe.get_attr(method)(**kwargs)
+    # frappe.db is a proxy attribute, not a module get_attr can import.
+    target = (getattr(frappe.db, method.rsplit('.', 1)[1]) if method.startswith('frappe.db.')
+              else frappe.get_attr(method))
+    result = target(**kwargs)
     print('KODA_CALL_RESULT ' + json.dumps(result, default=str, ensure_ascii=False, indent=1), flush=True)
     code = 0
 except Exception:
@@ -572,6 +575,10 @@ sys.exit(code)
 _UNITTEST_RUNNER = _SITE_CONNECT + _CALL_CONTAINMENT + _UNITTEST_BODY
 CALL_TIMEOUT = 60
 MAX_CALL_OUTPUT = 6000
+# Read-only Frappe calls allowed besides the app's own functions: they let the model see real records
+# and columns before designing a query (the same rollback containment applies to them).
+READ_PROBES = frozenset({"frappe.get_all", "frappe.get_list", "frappe.db.get_all", "frappe.db.get_value",
+                         "frappe.db.get_values", "frappe.db.count", "frappe.db.exists", "frappe.db.sql"})
 RUNNER_ERROR = "KODA_RUNNER_ERROR"
 CONTAINED_MARKER = "KODA_CALL_CONTAINED "
 #: A stopped runner cannot count; its overlay, jobs and emails end with it all the same.
@@ -981,10 +988,18 @@ def call_method(app_name: str, method: str, kwargs: dict | None = None, *, env: 
     """
     method = str(method or "").strip()
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+", method) or \
-            not method.startswith(app_name + "."):
-        return f"CALL_FAILED: method must be a dotted path inside {app_name}, e.g. {app_name}.module.file.function"
+            not (method.startswith(app_name + ".") or method in READ_PROBES):
+        return (f"CALL_FAILED: method must be a dotted path inside {app_name}, e.g. "
+                f"{app_name}.module.file.function, or one of the read probes {', '.join(sorted(READ_PROBES))}.")
     if kwargs is not None and not isinstance(kwargs, dict):
         return "CALL_FAILED: kwargs must be an object of keyword arguments."
+    if method == "frappe.db.sql":
+        query = str((kwargs or {}).get("query") or "")
+        refused = _SQL_RULES["_commits"](query, read_only=True)
+        if refused:
+            return ("CALL_FAILED: frappe.db.sql here runs one read-only statement (SELECT, WITH, SHOW, DESCRIBE) "
+                    f"without INTO or writes; this query has {refused}.")
+        kwargs = {"as_dict": True, **kwargs}
     root = Path(_app_root(app_name)).resolve()
     command_env = _runner_environment(root, env)
     if not command_env.get("KODA_SITE"):

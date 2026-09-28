@@ -975,9 +975,13 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
     def call_method(method: str, arguments: str = "", purpose: str = "") -> str:
         """Run a function of this app against the live site and return its result or traceback.
         method is the full dotted path (e.g. app.module.page.name.name.get_data); arguments is a JSON object
-        string of its keyword arguments, e.g. '{"customer": "CUST-0001", "limit": 20}'. Runs as Administrator
-        with real records and schema; nothing it does persists: database writes are rolled back, and file
-        writes, background jobs and email are discarded (the result says which). Use it to see what a query
+        string of its keyword arguments, e.g. '{"customer": "CUST-0001", "limit": 20}'. To look at real
+        records and columns before designing a query, method may also be a read probe: frappe.get_all,
+        frappe.db.get_value, frappe.db.count or frappe.db.sql with '{"query": "SELECT ... LIMIT 20"}'
+        (one read-only statement). Runs as Administrator
+        with real records and schema: database writes are rolled back, file writes, background jobs and email
+        are discarded (the result says which), and commits and child processes are refused. Network calls to
+        external services are NOT rolled back, so do not call functions that post to one. Use it to see what a query
         or endpoint really returns before and after changing it. purpose ("does every row have a
         due date?"): a helper reads the whole result and returns only the answer."""
         kwargs, problem = _json_object_argument(arguments, "arguments")
