@@ -826,60 +826,137 @@ def get_agent_status(request_name: str):
 
 _SKIP_TREE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "dist", "build", ".mypy_cache"}
 _SKIP_TREE_SUFFIXES = (".pyc", ".pyo")
+# Lines git writes between "diff --git" and "---" (see git-diff "extended header lines").
+_PATCH_EXTENDED_HEADERS = (
+    "index ", "old mode ", "new mode ", "deleted file mode ", "new file mode ",
+    "similarity index ", "dissimilarity index ", "rename from ", "rename to ",
+    "copy from ", "copy to ",
+)
+
+
+def _patch_header_path(raw: str, prefix: str) -> str | None:
+    """Path from a ---/+++ header value; None for /dev/null."""
+    # Git appends a tab after a path that contains spaces.
+    raw = raw.rstrip("\r").rstrip("\t")
+    if raw == "/dev/null":
+        return None
+    return raw[len(prefix):] if raw.startswith(prefix) else raw
+
+
+def _diff_git_paths(header: str) -> tuple[str | None, str | None]:
+    """Old/new paths from a 'diff --git a/X b/Y' line (exact when X == Y)."""
+    rest = header[len("diff --git "):].rstrip("\r")
+    if not rest.startswith("a/"):
+        return None, None
+    half = (len(rest) - 3) // 2  # "a/X b/X" is two equal halves around " "
+    if rest[:half] == "a/" + rest[half + 3:] and rest[half:half + 3] == " b/":
+        return rest[2:half], rest[half + 3:]
+    at = rest.rfind(" b/")
+    return (rest[2:at], rest[at + 3:]) if at > 0 else (None, None)
+
+
+def _split_patch_blocks(patch_diff: str) -> list[dict]:
+    """Split a stored diff into per-file blocks: [{"old", "new", "text"}].
+
+    A block starts at 'diff --git' or, for the header-less untracked-file
+    blocks _generate_patch_diff writes, at a '---' line after a finished
+    header. Hunk bodies are skipped by their @@ line counts, so a removed
+    line that reads '-- x' ('--- x' in the diff) never starts a block.
+    old/new are None for /dev/null (an added or a deleted file).
+    """
+    blocks: list[dict] = []
+    current = None
+    old_left = new_left = 0
+
+    def start(old=None, new=None):
+        # "open" while only header lines have been read, so a ---/+++ belongs to it.
+        block = {"old": old, "new": new, "lines": [], "minus": False, "open": True}
+        blocks.append(block)
+        return block
+
+    for line in (patch_diff or "").split("\n"):
+        if current is not None and (old_left > 0 or new_left > 0):
+            marker = line[:1]
+            if marker in (" ", ""):
+                old_left, new_left = old_left - 1, new_left - 1
+            elif marker == "-":
+                old_left -= 1
+            elif marker == "+":
+                new_left -= 1
+            if marker in (" ", "", "-", "+", "\\"):
+                current["lines"].append(line)
+                continue
+            old_left = new_left = 0  # truncated hunk: read this line as a header
+
+        in_header = current is not None and current["open"]
+        if line.startswith("diff --git "):
+            current = start(*_diff_git_paths(line))
+        elif line.startswith("--- ") and not (in_header and not current["minus"]):
+            current = start()
+            current["minus"] = True
+            current["old"] = _patch_header_path(line[4:], "a/")
+        elif line.startswith("--- "):
+            current["minus"] = True
+            current["old"] = _patch_header_path(line[4:], "a/")
+        elif line.startswith("+++ ") and in_header and current["minus"]:
+            current["new"] = _patch_header_path(line[4:], "b/")
+            current["open"] = False
+        elif line.startswith("@@") and current is not None:
+            current["open"] = False
+            counts = line.split("@@")[1].split() if line.count("@@") >= 2 else []
+            old_left = new_left = 0
+            for count in counts:
+                span = count[1:].split(",")
+                size = int(span[1]) if len(span) > 1 and span[1].isdigit() else 1
+                if count.startswith("-"):
+                    old_left = size
+                elif count.startswith("+"):
+                    new_left = size
+        elif in_header and line.startswith("deleted file mode"):
+            current["new"] = None
+        elif in_header and line.startswith("new file mode"):
+            current["old"] = None
+        elif in_header and line.startswith("rename from "):
+            current["old"] = line[len("rename from "):]
+        elif in_header and line.startswith("rename to "):
+            current["new"] = line[len("rename to "):]
+        elif in_header and not line.startswith(_PATCH_EXTENDED_HEADERS):
+            current["open"] = False  # e.g. "Binary files ... differ" or the blank separator
+        if current is not None:
+            current["lines"].append(line)
+
+    return [
+        {"old": b["old"], "new": b["new"], "text": "\n".join(b["lines"]).strip("\n")}
+        for b in blocks
+    ]
 
 
 def _parse_patch_diff_index(patch_diff: str) -> dict[str, str]:
     """Build {relative_path: status} from a stored unified diff."""
     changed: dict[str, str] = {}
-    if not patch_diff:
-        return changed
-
-    lines = patch_diff.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.startswith("--- "):
-            i += 1
-            continue
-
-        old_raw = line[4:].strip()
-        new_raw = ""
-        if i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
-            new_raw = lines[i + 1][4:].strip()
-            i += 2
+    for block in _split_patch_blocks(patch_diff):
+        old, new = block["old"], block["new"]
+        if old is None and new:
+            status, path = "A", new
+        elif new is None and old:
+            status, path = "D", old
+        elif new:
+            status, path = "M", new
         else:
-            i += 1
             continue
-
-        if old_raw == "/dev/null" and new_raw.startswith("b/"):
-            changed[new_raw[2:]] = "A"
-        elif new_raw == "/dev/null" and old_raw.startswith("a/"):
-            changed[old_raw[2:]] = "D"
-        elif old_raw.startswith("a/") and new_raw.startswith("b/"):
-            changed[new_raw[2:]] = "M"
-        elif new_raw.startswith("b/"):
-            changed[new_raw[2:]] = "M"
-
+        # Staged changes precede unstaged ones: keep the first (HEAD-relative) status.
+        changed.setdefault(path, status)
     return changed
 
 
 def _extract_file_diff_from_patch(patch_diff: str, file_path: str) -> str:
-    """Extract one file's diff block from combined patch_diff text."""
+    """Extract one file's diff blocks from combined patch_diff text."""
     if not patch_diff or not file_path:
         return ""
-
-    blocks = patch_diff.split("\n\n")
-    needle_a = f"--- a/{file_path}"
-    needle_null_old = "--- /dev/null"
-    needle_b = f"+++ b/{file_path}"
-
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        if needle_b in block and (needle_a in block or needle_null_old in block):
-            return block
-    return ""
+    return "\n".join(
+        block["text"] for block in _split_patch_blocks(patch_diff)
+        if file_path in (block["old"], block["new"])
+    )
 
 
 def _safe_repo_path(repo_root: str, file_path: str) -> str:
