@@ -20,8 +20,9 @@ from ampower_koda.agent.core.globs import compile_globs
 from ampower_koda.agent.javascript_validation import globals_configs, validate_javascript_names
 
 READ_WHOLE_FILE_LINES = 2000
-# Longer code files are first shown as a summary: every read rides along in later requests.
-SUMMARY_MIN_LINES = 200
+# Only files too long to read whole are shown as a summary first. A summary of a file the model then
+# needs cost more than it saved: it was followed by overlapping range reads and re-reads.
+SUMMARY_MIN_LINES = READ_WHOLE_FILE_LINES + 1
 # Runs between signatures up to this long are shown verbatim.
 SUMMARY_KEEP_RUN = 6
 MAX_READ_RANGES = 20

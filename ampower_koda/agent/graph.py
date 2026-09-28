@@ -124,8 +124,16 @@ FIND_CODE_EXCERPT_CHARS = 160
 # A result fetched with a purpose is read by a bare model call and the conversation
 # gets only its answer, so the full result is not re-sent with every later request.
 READER_TOOLS = frozenset({"read_file", "search_code", "get_file_outline", "call_method"})
-READER_MIN_CHARS = 1500  # shorter results cost less than the call that would read them
+# Shorter results cost less than the call that would read them: at 1.5-2.5k chars its answer was
+# 40-60% of the input, plus the call's own reasoning and latency.
+READER_MIN_CHARS = 4000
 READER_INPUT_CHARS = MAX_READ_RESULT_CHARS  # what the helper reads of one result, a whole read at most
+# A purpose read of a whole file longer than this returns its outline instead of a helper reading it all.
+PURPOSE_OUTLINE_LINES = 800
+# The same in characters, for dense files: AGENT-0036's generated script was 126 lines but 26k characters.
+PURPOSE_OUTLINE_CHARS = 40000
+# The exact text of a file this request changes reaches the model as it is, never a summary of it.
+READER_BYPASS = "[exact text: "
 READER_OUTPUT_TOKENS = 4000  # the answer plus low-effort reasoning
 READER_SYSTEM = (
     "You read one tool result for a coding agent that will not see it, and give it what it needs. "
@@ -730,7 +738,7 @@ def _output_share(window: int, wanted: int) -> int:
 def _reader_replaces(purpose: str, reader, result: str) -> bool:
     """Whether a tool result goes to the reader and the model gets only its answer."""
     return (bool(str(purpose or "").strip()) and reader is not None and _tool_result_succeeded(result)
-            and len(result) >= READER_MIN_CHARS)
+            and len(result) >= READER_MIN_CHARS and not result.startswith(READER_BYPASS))
 
 
 # Helpers
@@ -928,12 +936,34 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         With purpose ("what get_totals returns and where it stops"), a helper reads the text and you get
         only its answer, with line numbers: use it to understand. Without purpose you get the exact text,
         which stays in the conversation: use it for lines you will copy, edit or quote.
-        A code file of 200+ lines comes back as a summary (signatures kept, long bodies elided);
-        then fetch every span you need in ONE call with ranges="40-80,120-160" (ranges="1-N" reads it all).
-        Edit_file receipts show the edited region."""
+        A file of up to 2000 lines comes back whole; read it once, not in slices. Longer files come back
+        as a summary (signatures kept, long bodies elided); then fetch every span you need in ONE call with
+        ranges="40-80,120-160". Edit_file receipts show the edited region."""
         full = agent_tools._resolve_path(app_name, path)
         snapshot = read_snapshot(full)
+        # A final newline ends the last line; it does not start another (an 800-line file is not 801).
+        lines = snapshot.count("\n") + (not snapshot.endswith("\n")) if snapshot is not None else 0
+        whole = not (start_line or end_line or str(ranges or "").strip())
+        chars = len(snapshot) if snapshot is not None else 0
+        if (str(purpose or "").strip() and whole
+                and (lines > PURPOSE_OUTLINE_LINES or chars > PURPOSE_OUTLINE_CHARS)):
+            # A helper reading all of a long file costs as much as the file, and what the
+            # purpose needs is a few spans of it (AGENT-0036 read a 1,624-line script whole twice).
+            outline = agent_tools.get_file_outline(app_name, path)
+            if not _tool_result_succeeded(outline):
+                return outline  # a redacted file is refused, not outlined
+            return (f"[outline only: {path} has {lines} lines ({chars} characters), too long to read whole "
+                    "for a purpose. Its "
+                    "outline follows: read the spans the purpose needs in ONE call with ranges=\"a-b,c-d\" (with "
+                    "the purpose to have them explained, without it for the exact text).]\n"
+                    + outline)
         result = agent_tools.read_file(app_name, path, start_line, end_line, ranges)
+        canonical = os.path.relpath(full, os.path.realpath(agent_tools._app_root(app_name))).replace("\\", "/")
+        if (str(purpose or "").strip() and not read_only and _tool_result_succeeded(result)
+                and (canonical in copied or (before is not None and canonical in before))):
+            # A file this request changes is read to be edited, and an edit needs the exact
+            # text: a helper's summary would only force a second read of the same file.
+            result = f"{READER_BYPASS}{path} is changed by this request, so this is its exact text.]\n{result}"
         # A summary shows signatures, not the text an overwrite or edit replaces, and
         # a result the helper reads reaches the model only as the helper's answer.
         if (snapshot is not None and " summary of " not in result.split("\n", 1)[0]
@@ -1451,8 +1481,10 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                            result_chars=len(raw), answer_chars=len(answer), tokens=tokens)
         if not answer:
             return raw
+        follow = ("this file is long, so read the spans you need with ranges=\"a-b,c-d\""
+                  if raw.startswith("[outline only: ") else "call without purpose for the exact text")
         return (f"[{what}, read for: {purpose[:200]}]\n{answer}\n"
-                f"[A helper read {len(raw):,} characters for this answer; call without purpose for the exact text.]")
+                f"[A helper read {len(raw):,} characters for this answer; {follow}.]")
 
     def maybe_trim(extra=(), with_tools=True, output_tokens=None):
         nonlocal evidence_chars
@@ -1775,14 +1807,16 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                     result = str(fn.invoke(arguments))
                     tool_ok = _tool_result_succeeded(result)
                     if tool_ok and name in REPLAYABLE_TOOLS and len(result) >= 400:
-                        result_round = seen_results.get(result)
+                        # The exact-text header is not content: the same text read plainly is the same bytes.
+                        seen_key = result.split("\n", 1)[-1] if result.startswith(READER_BYPASS) else result
+                        result_round = seen_results.get(seen_key)
                         if result_round is not None and result_round in retained_numbers:
                             result = (
                                 f"[{name} returned bytes identical to round {result_round}; "
                                 "use the earlier result and move on.]"
                             )
                         else:
-                            seen_results[result] = label
+                            seen_results[seen_key] = label
                     raw = result
                     result = _bounded_tool_result(name, arguments, result)
                     purpose = str(arguments.get("purpose") or "").strip() if name in READER_TOOLS else ""

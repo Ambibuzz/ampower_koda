@@ -106,8 +106,8 @@ features (DocTypes, Script Reports, Pages, APIs, hooks, client scripts) and make
   and call_method take purpose ("what does get_data return and where does it stop?"): a helper reads
   the whole result and answers with line numbers, and only its answer enters this conversation, which
   re-sends everything in it with every request. Read without purpose the lines you will copy, edit or quote.
-- Read before you edit. A long code file first comes back as a summary; fetch every span you need in
-  one read_file call with ranges="a-b,c-d" (ranges="1-N" when you must see all of it, e.g. to adapt it).
+- Read before you edit. read_file returns a whole file (up to 2000 lines) with line numbers: read a file
+  you will adapt, copy or edit once, whole, rather than in slices; each slice re-sends the conversation.
   What you read stays in this conversation, and each edit returns the edited region, so do not re-read.
 - Verify names from source: fieldnames, doctypes, whitelisted method paths, hook keys. Use
   read_doctype_schema for a DocType's fields. Never invent one.
