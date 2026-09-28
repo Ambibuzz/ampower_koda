@@ -961,15 +961,32 @@ def _extract_file_diff_from_patch(patch_diff: str, file_path: str) -> str:
     )
 
 
-def _safe_repo_path(repo_root: str, file_path: str) -> str:
-    """Resolve file_path inside repo_root or throw on traversal."""
-    if not file_path or file_path.startswith("/") or ".." in file_path.split("/"):
-        frappe.throw(_("Invalid file path."))
+def _is_git_metadata(relative: str) -> bool:
+    return any(part.lower() == ".git" for part in relative.replace("\\", "/").split("/"))
 
-    full = os.path.normpath(os.path.join(repo_root, file_path))
-    root_norm = os.path.normpath(repo_root)
-    if not full.startswith(root_norm + os.sep) and full != root_norm:
+
+def _safe_repo_path(repo_root: str, file_path: str) -> str:
+    """Resolve file_path inside repo_root or throw on traversal.
+
+    Symlinks and junctions are resolved first, so a link cannot lead outside
+    the repository or into Git metadata.
+    """
+    if (not file_path or os.path.isabs(file_path) or os.path.splitdrive(file_path)[0]
+            or ".." in file_path.replace("\\", "/").split("/")):
+        frappe.throw(_("Invalid file path."))
+    if _is_git_metadata(file_path):
+        frappe.throw(_("Git metadata cannot be opened in the IDE."))
+
+    root = os.path.realpath(repo_root)
+    full = os.path.realpath(os.path.join(root, file_path))
+    try:
+        inside = os.path.commonpath([root, full]) == root
+    except ValueError:  # different drives on Windows
+        inside = False
+    if not inside or full == root:
         frappe.throw(_("File path is outside the repository."))
+    if _is_git_metadata(os.path.relpath(full, root)):
+        frappe.throw(_("Git metadata cannot be opened in the IDE."))
     return full
 
 
@@ -990,8 +1007,13 @@ def _should_skip_tree_entry(name: str) -> bool:
     return any(name.endswith(suffix) for suffix in _SKIP_TREE_SUFFIXES)
 
 
-def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]:
-    """Walk repo_root and return nested tree nodes with change metadata."""
+def _build_directory_tree(repo_root: str, changed: dict[str, str], is_redacted=None) -> list[dict]:
+    """Walk repo_root and return nested tree nodes with change metadata.
+
+    Directory links (symlinks, junctions) are left out, never followed: they
+    can lead outside the repository or loop. is_redacted(rel, full) marks files
+    the IDE may not open.
+    """
 
     def walk(dir_path: str, rel_prefix: str) -> list[dict]:
         nodes: list[dict] = []
@@ -1001,13 +1023,16 @@ def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]
             return nodes
 
         for name in entries:
-            if _should_skip_tree_entry(name):
+            if _should_skip_tree_entry(name) or name.lower() == ".git":
                 continue
 
             full = os.path.join(dir_path, name)
             rel = f"{rel_prefix}/{name}" if rel_prefix else name
 
             if os.path.isdir(full):
+                # dir_path is already resolved, so any difference means full is a link.
+                if os.path.normcase(os.path.realpath(full)) != os.path.normcase(full):
+                    continue
                 children = walk(full, rel)
                 changed_count = sum(
                     1 for c in changed if c == rel or c.startswith(rel + "/")
@@ -1028,6 +1053,7 @@ def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]
                     "path": rel,
                     "status": status,
                     "has_changes": bool(status),
+                    "redacted": bool(is_redacted and is_redacted(rel, full)),
                 })
 
         folders = [n for n in nodes if n["type"] == "folder"]
@@ -1036,7 +1062,7 @@ def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]
         files.sort(key=lambda n: n["name"].lower())
         return folders + files
 
-    return walk(repo_root, "")
+    return walk(os.path.realpath(repo_root), "")
 
 
 def _get_changed_files_for_request(doc) -> tuple[dict[str, str], str]:
@@ -1085,7 +1111,12 @@ def get_change_tree(request_name: str):
 
     repo_root = get_repo_root(app_name)
     changed, source = _get_changed_files_for_request(doc)
-    tree = _build_directory_tree(repo_root, changed)
+    # Names only; the flag lets the IDE skip opening what get_file_content refuses.
+    matcher = agent_tools._redaction_matcher(app_name)
+    tree = _build_directory_tree(
+        repo_root, changed,
+        lambda rel, full: bool(agent_tools.redaction_pattern(app_name, rel, full, matcher)),
+    )
 
     branch_state = _get_branch_state(doc)
 
@@ -1134,12 +1165,23 @@ def get_file_diff(request_name: str, file_path: str):
         frappe.throw(_("Target app is not set on this request."))
 
     repo_root = get_repo_root(app_name)
-    _safe_repo_path(repo_root, file_path)
+    full = _safe_repo_path(repo_root, file_path)
 
     base_branch = (doc.base_branch or "main").strip()
     branch_name = (doc.branch_name or "").strip()
     changed, source = _get_changed_files_for_request(doc)
     status = changed.get(file_path, "")
+
+    # A diff shows the file's lines, so it obeys the same redaction as get_file_content.
+    pattern = agent_tools.redaction_pattern(app_name, file_path, full)
+    if pattern:
+        return {
+            "path": file_path,
+            "status": status,
+            "source": "none",
+            "diff": "",
+            "redacted": _("{0} matches the redaction pattern {1}; its diff is hidden.").format(file_path, pattern),
+        }
 
     diff_text = ""
     if source == "working_tree":
@@ -1266,6 +1308,10 @@ def get_file_content(request_name: str, file_path: str):
     full = _safe_repo_path(repo_root, file_path)
     if not os.path.isfile(full):
         frappe.throw(_("File not found: {0}").format(file_path))
+    # The same redaction the agent's reads obey: the editor is not a way around it.
+    pattern = agent_tools.redaction_pattern(app_name, file_path, full)
+    if pattern:
+        frappe.throw(_("{0} matches the redaction pattern {1} and cannot be opened.").format(file_path, pattern))
 
     with open(full, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()

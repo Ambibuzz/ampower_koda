@@ -889,12 +889,17 @@ function render_tree_node(node, depth, changed_map, $shell, ide) {
         <div class="koda-tree-row ${node.has_changes ? 'changed' : 'dimmed'} ${dirty ? 'dirty' : ''} ${selected ? 'selected' : ''}"
              data-path="${frappe.utils.escape_html(node.path)}"
              style="padding-left:${12 + indent}px"
-             role="treeitem" tabindex="-1" aria-level="${depth + 1}" aria-selected="${selected ? 'true' : 'false'}">
+             role="treeitem" tabindex="-1" aria-level="${depth + 1}" aria-selected="${selected ? 'true' : 'false'}"
+             ${node.redacted ? `title="${__('Redacted: this file cannot be opened')}"` : ''}>
             <span class="koda-tree-name">${frappe.utils.escape_html(node.name)}${dirty ? ' •' : ''}</span>
-            ${status ? `<span class="koda-badge koda-badge-${status}">${status}</span>` : ''}
+            ${status ? `<span class="koda-badge koda-badge-${frappe.utils.escape_html(status)}">${frappe.utils.escape_html(status)}</span>` : ''}
         </div>
     `);
     $row.on('click', function () {
+        if (node.redacted) {
+            set_status($shell, __('{0} is redacted and cannot be opened.', [node.path]), node.path);
+            return;
+        }
         open_file(node.path, $shell, ide);
     });
     $item.append($row);
@@ -1201,13 +1206,17 @@ function load_file_diff(file_path, $shell, ide) {
                 return;
             }
             const diff = (r.message && r.message.diff) || '';
-            render_diff_panel($shell, diff);
+            render_diff_panel($shell, diff, r.message && r.message.redacted);
         },
     });
 }
 
-function render_diff_panel($shell, diff_text) {
+function render_diff_panel($shell, diff_text, redacted) {
     const $content = $shell.find('.koda-diff-content').empty();
+    if (redacted) {
+        $content.append($('<div class="koda-empty"></div>').text(redacted));
+        return;
+    }
     if (!diff_text.trim()) {
         $content.html(`<div class="koda-empty">${__('No diff for this file.')}</div>`);
         return;
@@ -1398,7 +1407,7 @@ function show_ide_error($shell, message) {
 
 function find_first_changed_file(nodes) {
     for (const node of nodes) {
-        if (node.type === 'file' && node.has_changes) return node;
+        if (node.type === 'file' && node.has_changes && !node.redacted) return node;
         if (node.type === 'folder' && node.children) {
             const found = find_first_changed_file(node.children);
             if (found) return found;
