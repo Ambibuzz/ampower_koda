@@ -404,6 +404,40 @@ def _configured_reasoning_effort(provider: str, model: str) -> str | None:
     return str(setting) if setting in {'low', 'medium', 'high'} else 'high'
 
 
+# Review turns (first pass, recovery pass, forced verdict, every recheck) run at this effort.
+# Replays of run 5's verdict call found the same P1 at medium and low (6/6); through a text-only tool
+# format low often claimed its tools were unavailable (AGENT-0034), medium did not.
+# Agent Settings "Review Reasoning Effort" overrides it; it only ever lowers the configured effort.
+REVIEW_REASONING_EFFORT = 'medium'
+_EFFORT_ORDER = ('low', 'medium', 'high')
+
+
+def _lower_effort(configured: str | None, wanted: str | None) -> str | None:
+    """``wanted`` when it is a known effort below ``configured``; None keeps the configured one."""
+    if configured not in _EFFORT_ORDER or wanted not in _EFFORT_ORDER:
+        return None
+    return wanted if _EFFORT_ORDER.index(wanted) < _EFFORT_ORDER.index(configured) else None
+
+
+def _phase_reasoning_effort(phase: str, provider: str, model: str) -> str | None:
+    """The effort override for one phase's turn, or None for the configured effort.
+
+    Effort is part of the provider's prompt-cache key: in the replays, each change of effort on
+    a byte-identical prompt read 0 cached tokens, even for the tools and system prefix. So effort
+    changes only where a conversation starts (the review has its own), never inside one.
+    """
+    if phase != 'Reviewing':
+        return None
+    try:
+        setting = frappe.db.get_single_value('Agent Settings', 'review_reasoning_effort')
+    except Exception:  # noqa: BLE001 - an unmigrated site has no such column
+        setting = None  # installations not yet migrated use the default
+    setting = str(setting or REVIEW_REASONING_EFFORT)
+    if setting.lower().startswith('same'):
+        return None
+    return _lower_effort(_configured_reasoning_effort(provider, model), setting)
+
+
 def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: str = "",
              reasoning_effort: str | None = None):
     """Build the chat model for the given provider and model.
@@ -2011,7 +2045,8 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             session=session,
             reader=reader,
         )
-        llm = _get_llm(provider=provider, model=model, session_id=request_name)
+        llm = _get_llm(provider=provider, model=model, session_id=request_name,
+                       reasoning_effort=_phase_reasoning_effort(phase, provider, model))
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
         shared_context = (_shared_request_context(state)
                           if state.get("execution_tasks") and session is None else "")

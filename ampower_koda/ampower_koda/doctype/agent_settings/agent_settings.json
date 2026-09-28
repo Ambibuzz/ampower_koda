@@ -12,6 +12,7 @@
         "column_break_defaults",
         "default_ai_model",
         "reasoning_effort",
+        "review_reasoning_effort",
         "openai_section",
         "openai_api_key",
         "gemini_section",
@@ -78,6 +79,14 @@
             "options": "Provider default\nlow\nmedium\nhigh",
             "default": "high",
             "description": "Effort for OpenAI reasoning models, directly or through OpenRouter. Higher effort favors planning and repair quality over speed. Other models keep their provider defaults."
+        },
+        {
+            "fieldname": "review_reasoning_effort",
+            "fieldtype": "Select",
+            "label": "Review Reasoning Effort",
+            "options": "Same as Reasoning Effort\nlow\nmedium\nhigh",
+            "default": "medium",
+            "description": "Effort for the independent review's turns. It only lowers Reasoning Effort, never raises it. Medium found the same defects as high in replays, with about 35-40% less output."
         },
         {
             "fieldname": "openai_section",
@@ -186,7 +195,7 @@
     ],
     "issingle": 1,
     "links": [],
-    "modified": "2026-09-24 11:00:00.000000",
+    "modified": "2026-09-27 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "Ampower Koda",
     "name": "Agent Settings",
