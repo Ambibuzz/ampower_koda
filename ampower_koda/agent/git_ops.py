@@ -157,10 +157,20 @@ def create_branch(app_name: str, branch_name: str, base_branch: str = "main") ->
     This provides a safe sandbox for the agent's changes.
     """
     root = get_repo_root(app_name)
-    run_git(["fetch", "origin", base_branch], cwd=root)
-    ok, out = run_git(["checkout", "-b", branch_name, base_branch], cwd=root)
+    start = base_branch
+    fetched, _ = run_git(["fetch", "origin", base_branch], cwd=root)
+    remote_base = f"origin/{base_branch}"
+    if fetched and run_git(["rev-parse", "--verify", "--quiet", f"{remote_base}^{{commit}}"], cwd=root)[0]:
+        # Branch from the fetched remote base when the local base is missing or
+        # only behind it. A local base with commits of its own is kept as is.
+        has_local, _ = run_git(["rev-parse", "--verify", "--quiet", f"{base_branch}^{{commit}}"], cwd=root)
+        behind, _ = run_git(["merge-base", "--is-ancestor", base_branch, remote_base], cwd=root)
+        if not has_local or behind:
+            start = remote_base
+    # --no-track: the working branch must not pull from, or push to, the base.
+    ok, out = run_git(["checkout", "--no-track", "-b", branch_name, start], cwd=root)
     if not ok:
-        return False, f"Failed to create branch '{branch_name}' from '{base_branch}': {out}"
+        return False, f"Failed to create branch '{branch_name}' from '{start}': {out}"
     return ok, out
 
 
@@ -291,11 +301,14 @@ def generate_branch_name(request_name: str, branch_prefix: str = "ai-agent/", ap
         )
         return base_name
 
-    ok, branches = run_git(["branch", "--list", "--all"], cwd=root)
-    if not ok:
+    # Local and remote-tracking names both count: a pushed branch whose local
+    # copy was deleted must not be reused. refs/remotes/<remote>/ is stripped.
+    ok, local = run_git_stdout(["for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads"], cwd=root)
+    ok_remote, remote = run_git_stdout(["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes"], cwd=root)
+    if not (ok and ok_remote):
         return base_name
 
-    existing = {b.strip().lstrip("* ") for b in branches.splitlines()}
+    existing = {b.strip() for b in (local + "\n" + remote).splitlines() if b.strip()}
     if base_name not in existing:
         return base_name
 
