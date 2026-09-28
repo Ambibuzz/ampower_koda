@@ -7,6 +7,7 @@ import os
 import re
 import site
 import sys
+import time
 
 import frappe
 
@@ -342,6 +343,11 @@ SEARCH_MAX_CHARS = 20_000
 SEARCH_DEFAULT_LIMIT = {"files": 50, "content": 40}
 SEARCH_MAX_LIMIT = 200
 SEARCH_MAX_CONTEXT = 8
+# Python's re has no timeout and backtracks: a search stops at this deadline with what it found,
+# and the classic runaway shape (a repeated group that itself repeats, "(a+)+") is refused.
+SEARCH_DEADLINE_SECONDS = 5.0
+SEARCH_MAX_PATTERN_CHARS = 500
+_NESTED_REPEAT = re.compile(r"\((?:[^()\\]|\\.)*(?<!\\)[+*}](?:[^()\\]|\\.)*\)(?:[+*]|\{\d*,)")
 
 
 def _search_files(app_name: str, root: str):
@@ -392,6 +398,11 @@ def search_code(app_name: str, pattern: str, path: str = "", *, glob: str = "", 
         if path and not os.path.exists(root):
             return f"Not a file or directory: {path}"
         note = ""
+        if len(pattern) > SEARCH_MAX_PATTERN_CHARS:
+            return f"SEARCH_FAILED: pattern is over {SEARCH_MAX_PATTERN_CHARS} characters; search a distinctive part."
+        if _NESTED_REPEAT.search(pattern):
+            return ("SEARCH_FAILED: the pattern repeats a group that itself repeats (like (a+)+ or (\\w+\\.)*), "
+                    "which can backtrack for minutes. Use a character class instead, e.g. [\\w.]+.")
         try:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error as error:
@@ -406,14 +417,29 @@ def search_code(app_name: str, pattern: str, path: str = "", *, glob: str = "", 
 
         # found holds (full, relative, matching line indexes) only; rendered files are read again.
         found, searched, excluded = [], 0, 0
+        deadline, stopped = time.monotonic() + SEARCH_DEADLINE_SECONDS, ""
         for full, relative in _search_files(app_name, root):
             if within is not None and within(os.path.relpath(full, root).replace(os.sep, "/")) is None:
                 excluded += 1
                 continue
+            if time.monotonic() > deadline:
+                stopped = relative
+                break
             searched += 1
-            hits = [i for i, line in enumerate(_read_lines(full) or ()) if regex.search(line)]
+            hits = []
+            for i, line in enumerate(_read_lines(full) or ()):
+                if i % 256 == 0 and time.monotonic() > deadline:
+                    stopped = relative
+                    break
+                if regex.search(line):
+                    hits.append(i)
             if hits:
                 found.append((full, relative, hits))
+            if stopped:
+                break
+        if stopped:
+            note += (f"[Search stopped after {SEARCH_DEADLINE_SECONDS:g}s at {stopped}; results are partial. "
+                     "Narrow path or glob, or simplify the pattern.]\n")
         if not found:
             if excluded and not searched:
                 return note + _glob_missed(glob, f"{excluded} searchable files under {path or 'the app'}")
