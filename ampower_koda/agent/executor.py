@@ -809,27 +809,39 @@ def _same_file(path: str, others) -> bool:
     return any(path == other or path.endswith("/" + other) or other.endswith("/" + path) for other in others)
 
 
+#: Module folders whose ``<folder>/<name>/<name>.json`` records `bench migrate`
+#: syncs into the database, plus the app-level fixtures and customisations.
+MIGRATED_METADATA_FOLDERS = (
+    "doctype", "report", "page", "workspace", "workspace_sidebar", "dashboard",
+    "dashboard_chart", "dashboard_chart_source", "number_card", "print_format",
+    "web_form", "notification", "module_onboarding", "onboarding_step",
+    "form_tour", "custom", "fixtures",
+)
+
+#: Front-end sources that `bench build` bundles: plain assets, templates and the
+#: Vue/TypeScript/preprocessed-style sources of the esbuild bundles.
+BUILT_ASSET_SUFFIXES = (
+    ".js", ".jsx", ".ts", ".tsx", ".vue", ".css", ".scss", ".sass", ".less", ".html",
+)
+
+
+def _needs_migrate(path: str) -> bool:
+    parts = path.replace("\\", "/").lower().split("/")
+    if parts[-1] == "patches.txt":
+        return True
+    return parts[-1].endswith(".json") and any(folder in parts[:-1] for folder in MIGRATED_METADATA_FOLDERS)
+
+
 def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
     """Determine which bench commands are needed based on which file types were edited.
     Always includes clear-cache and supervisorctl restart."""
     edited_paths = [e.get("path", "") for e in edits if e.get("path")]
     site_name = frappe.local.site
 
-    has_doctype_changes = any(
-        p.endswith(".json") and "/doctype/" in p for p in edited_paths
-    )
-    has_report_changes = any(
-        p.endswith(".json") and "/report/" in p for p in edited_paths
-    )
-    has_js_css_changes = any(
-        p.endswith((".js", ".css", ".html")) for p in edited_paths
-    )
-
     cmds = []
-    has_patch_registration = any(os.path.basename(p) == "patches.txt" for p in edited_paths)
-    if has_doctype_changes or has_report_changes or has_patch_registration:
+    if any(_needs_migrate(p) for p in edited_paths):
         cmds.append(f"bench --site {site_name} migrate")
-    if has_js_css_changes:
+    if any(p.lower().endswith(BUILT_ASSET_SUFFIXES) for p in edited_paths):
         cmds.append(f"bench build --app {app_name}")
     cmds.append(f"bench --site {site_name} clear-cache")
     cmds.append("supervisorctl restart all")
