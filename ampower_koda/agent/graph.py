@@ -3395,7 +3395,9 @@ def _checkpoint_next_node(name: str, merged: dict, updates: dict) -> str:
 def _checkpointed_node(name, fn):
     def run(state):
         check_active(reserve=5)
-        active = checkpoint.journal()
+        # A node reached with an earlier node's error only passes it on: the checkpoint keeps the
+        # node that failed, or a restart would start here (a failed implement resumed at review).
+        active = None if state.get("error") else checkpoint.journal()
         if active:
             active.begin(state, name)
         updates = fn(state)
