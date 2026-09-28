@@ -86,6 +86,21 @@ def _uncommitted_paths(repo_root: str) -> list[str]:
     return paths
 
 
+def bench_branch_refusal(app_name: str, branch_name: str, allowed=()) -> str:
+    """Why bench commands must not run for this request now, or "" when they may.
+
+    Checked immediately before the commands: they act on whatever is checked
+    out, so the checkout must be the request's branch (or a branch in ``allowed``).
+    """
+    branch_name = (branch_name or "").strip()
+    current = get_current_branch(app_name)
+    if current and (current == branch_name or current in allowed) and current != "HEAD":
+        return ""
+    expected = " or ".join(f"'{b}'" for b in (branch_name, *allowed) if b) or "(none recorded)"
+    return (f"Bench commands were not run: the checkout is on '{current or '(unknown)'}', not "
+            f"{expected} of this request. Check out the request's branch, then run the commands again.")
+
+
 def _revert_previous_changes(app_name: str, base_branch: str, request_name: str = "",
                               user: str = "", branch_prefix: str = "ai-agent/", *,
                               own_branch: str = "", archive_tests: bool = True):
@@ -1081,6 +1096,14 @@ def run_bench_and_commit(request_name: str) -> None:
     branch_name = (doc.branch_name or "").strip()
 
     try:
+        # The commands build and migrate whatever is checked out: refuse unless
+        # that is this request's branch, or another request's work is deployed
+        # and then reported as this one's.
+        refused = bench_branch_refusal(app_name, branch_name)
+        if refused:
+            _update_status(request_name, user, "Awaiting Bench Approval", refused, error_log=refused)
+            return
+
         _update_status(request_name, user, "Building", "Running bench commands...")
 
         # Blank means no selection was ever saved, so the defaults apply. An
