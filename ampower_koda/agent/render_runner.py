@@ -770,6 +770,110 @@ class Page:
         except Exception:
             return None
 
+    def run_step(self, step):
+        """Run one step and let the page settle; return (outcome, what it acted on)."""
+        page, acted = self.page, ""
+        try:
+            if "viewport" in step:
+                width, height = (int(v) for v in step["viewport"])
+                page.set_viewport_size({"width": width, "height": height})
+                acted = f"viewport {width}x{height}"
+                page.wait_for_timeout(400)
+                # Desk opens its sidebar over the page at phone width; a phone user closes it first.
+                if (page.locator(".body-sidebar-container.expanded").count()
+                        and page.locator("div.overlay:visible").count()):
+                    page.mouse.click(width - 6, height // 2)
+                    acted += " (closed the Desk sidebar overlay)"
+            elif "wait_ms" in step:
+                page.wait_for_timeout(min(int(step["wait_ms"]), 5000))
+            elif "press" in step:
+                page.keyboard.press(str(step["press"]))
+                acted = f"key {step['press']}"
+            elif any(k in step for k in ("fill", "click", "select")):
+                kind = next(k for k in ("fill", "click", "select") if k in step)
+                element = self.target(str(step[kind]), "click" if kind == "click" else "fill")
+                if element is None:
+                    raise LookupError("no visible element matches " + json.dumps(step[kind]))
+                acted = element.evaluate(
+                    "e => e.tagName.toLowerCase() + ' \"' + (e.getAttribute('aria-label') || e.innerText || "
+                    "e.value || e.placeholder || '').trim().replace(/\\s+/g, ' ').slice(0, 60) + '\"'")
+                if kind == "click" and element.is_disabled():
+                    return "FAILED: the element is disabled; nothing was clicked", acted
+                if kind == "fill":
+                    element.fill(str(step.get("value", "")))
+                elif kind == "select":
+                    try:
+                        element.select_option(label=str(step.get("value", "")))
+                    except Exception:
+                        element.select_option(str(step.get("value", "")))
+                else:
+                    element.click()
+            else:
+                raise ValueError("unknown step " + json.dumps(step))
+            self.settle()
+            return "ok", acted
+        except Exception as exc:
+            message = " ".join(str(exc).split())
+            blocker = re.search(r"<\w[^>]{0,160}>(?:[^<]{0,60}</\w+>)? (?:from <[^>]{0,80}> subtree )?"
+                                r"intercepts pointer events", message)
+            if blocker:
+                message = "the click was blocked: " + blocker.group(0) + ". " + message
+            return "FAILED: " + message[:320], acted
+
+    def step_report(self, index, step):
+        if step and set(step) <= CHECK_KEYS:
+            return self.checks(step, "ok", [f"step {index} {json.dumps(step, ensure_ascii=False)}: ok"])
+        before, before_tables = self.snapshot(), self.evaluate(TABLES_JS, [])
+        calls, errors = len(self.calls), len(self.console)
+        self.evaluate("window.__motion && window.__motion.start()")
+        self.evaluate("window.__smooth && window.__smooth.start()")
+        outcome, acted = self.run_step(step)
+        # A slow or stalled animation is reported to its end, not cut off where the page usually settles.
+        waited = time.time()
+        while time.time() - waited < MOTION_WAIT_S and (self.evaluate("window.__smooth ? window.__smooth.idle() : 99999")
+                                                       or 0) < STILL_MS:
+            self.page.wait_for_timeout(100)
+        smoothness = self.evaluate("window.__smooth ? window.__smooth.stop() : null")
+        trace = self.evaluate("window.__motion ? window.__motion.stop() : null")
+        if trace and smoothness:
+            # Content pushed along by an element that is animating is not a layout shift of its own.
+            spans = [(t["points"][0][0] - 50, t["points"][-1][0] + 50) for t in smoothness.get("tracks") or []]
+            trace["shifts"] = [s for s in trace.get("shifts") or [] if not any(a <= s["t"] <= b for a, b in spans)]
+        lines = [f"step {index} {json.dumps(step, ensure_ascii=False)}: {outcome}" + (f" — {acted}" if acted else "")]
+        for call in self.calls[calls:]:
+            if (call["status"] or 0) >= 400 or not call["method"].startswith(DESK_BACKGROUND):
+                args = json.dumps(call["args"], ensure_ascii=False)[:300]
+                lines.append(f"  server: {call['method'].rsplit('.', 1)[-1]} {args} -> {call['status']} {call['body']}")
+        lines += ["  error: " + error for error in self.console[errors:]]
+        changes = diff_lines(before, self.snapshot())
+        lines += changes or ["  no visible change in the page, dialogs or alerts"]
+        if changes:
+            lines += table_readout(before_tables, self.evaluate(TABLES_JS, []))
+        if "viewport" in step:
+            # A resize moves things without changing the accessibility tree.
+            found = self.evaluate(REACH_JS)
+            if found:
+                lines.append("  " + reach_line(found, page_width(self.page)))
+        else:
+            lines += motion_lines(trace, self.seen_animations) + smooth_lines(smoothness)
+        return self.checks(step, outcome, lines)
+
+    def checks(self, step, outcome, lines):
+        """The step's expects and, if it asks, the label layout at this point (formatted by the caller)."""
+        report = {"step": step, "outcome": outcome, "lines": lines}
+        for expect in expects(step):
+            try:
+                passed, detail = expect_result(expect, self.visible_text,
+                                               lambda ask: self.evaluate(FIND_JS, None, ask))
+            except (KeyError, TypeError, ValueError) as exc:
+                passed, detail = False, f"malformed expect: {type(exc).__name__}: {exc}"
+            lines.append(expect_line(expect, passed, detail))
+        if step.get("layout"):
+            report["layout"] = self.evaluate(LAYOUT_JS, [])
+            report["viewport"] = self.page.viewport_size
+        return report
+
+
 def first_visible(locator):
     for index in range(min(locator.count(), 12)):
         candidate = locator.nth(index)
