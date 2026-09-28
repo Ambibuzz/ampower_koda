@@ -829,6 +829,10 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         # _resolve_path resolves symlinks; measure against the resolved root too,
         # or a junctioned app root turns every written path into "../../...".
         canonical = os.path.relpath(full, os.path.realpath(agent_tools._app_root(app_name))).replace("\\", "/")
+        # Refused before the snapshot: the before-content goes into the baseline the reviewer diffs.
+        pattern = agent_tools.redaction_pattern(app_name, path, full)
+        if pattern:
+            raise ValueError(f"{path} matches the redaction pattern {pattern}; secrets are never read or written.")
         if verification_contract is not None and (
             canonical == verification.CONFIG_PATH or canonical in verification_contract.get("existing_tests", {})
             or canonical in (verification_contract.get("frozen_tests") or {})
@@ -2693,7 +2697,22 @@ def _integration_neighbor_paths(state: dict, paths: list[str], changed_paths: li
 
 
 def _read_current(state: dict, path: str):
-    return read_snapshot(agent_tools._resolve_path(state["target_app_name"], path))
+    """A file's current content for baselines and review evidence; None for a redacted path,
+    whose content must not reach the reviewer even when the plan names it."""
+    app_name = state["target_app_name"]
+    full = agent_tools._resolve_path(app_name, path)
+    if agent_tools.redaction_pattern(app_name, path, full):
+        return None
+    return read_snapshot(full)
+
+
+def _without_redacted(state: dict, baseline: dict) -> dict:
+    """The baseline minus redacted paths. Content recorded before a path was redacted (an older
+    checkpoint, a glob added since) would otherwise come back as a "Deleted" diff."""
+    app_name = state["target_app_name"]
+    matcher = agent_tools._redaction_matcher(app_name)
+    return {path: content for path, content in baseline.items() if not agent_tools.redaction_pattern(
+        app_name, path, agent_tools._resolve_path(app_name, path), matcher)}
 
 
 def _persist_task_results(state: dict):
@@ -2725,6 +2744,7 @@ def _implementation_updates(state: dict, updates: dict, logs: list) -> dict:
     baseline = dict(state.get("execution_baseline") or {})
     for path, content in before.items():
         baseline.setdefault(path, content)
+    baseline = _without_redacted(state, baseline)
     edits, _ = change_evidence(baseline, lambda p: _read_current(state, p))
     steps = updates.get("intermediate_steps") or []
     output = steps[-1].get("output", "") if steps else ""
@@ -2805,7 +2825,7 @@ def review_node(state: dict) -> dict:
         return {}  # repair stopped (its call budget ran out); the last review's findings stand
     active, criteria, allowed = _execution_context(state)
     logs = _log_stage(state, "Reviewing", "started", "Reviewing the changes")
-    baseline = state.get("execution_baseline") or {}
+    baseline = _without_redacted(state, state.get("execution_baseline") or {})
     changes, diff = change_evidence(baseline, lambda p: _read_current(state, p))
     changed_paths = [e["path"] for e in changes]
     paths = _integration_neighbor_paths(

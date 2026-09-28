@@ -327,7 +327,8 @@ def implement_node(state: dict) -> dict:
                               _repair_directive(state, history), kind="repair")
     if state.get("resuming"):
         # The interrupted pass may have written more than its saved conversation shows.
-        _, applied = graph.change_evidence(baseline, lambda p: graph._read_current(state, p), limit=12000)
+        _, applied = graph.change_evidence(graph._without_redacted(state, baseline),
+                                           lambda p: graph._read_current(state, p), limit=12000)
         graph._queue_directive(history, "## RESUMED AFTER AN INTERRUPTION\nThese changes are on disk now; "
                                         "continue from them:\n" + (applied or "(no changes yet)"))
 

@@ -255,6 +255,28 @@ def _summary(path: str, all_lines: list[str]) -> str:
             "reads the whole file. Edit only lines you have read.]")
 
 
+def _redaction_matcher(app_name: str):
+    """(real app root, matcher) for the redaction the core index applies: its defaults plus the
+    app's .koda/config.toml. A .env the index skips must not come back whole through a read."""
+    from pathlib import Path
+
+    from ampower_koda.agent.core.workspace.local import LocalWorkspace
+    from ampower_koda.agent.core.workspace.redaction import redaction_matcher
+
+    root = os.path.realpath(_app_root(app_name))
+    return root, redaction_matcher(LocalWorkspace(root_path=Path(root)))
+
+
+def redaction_pattern(app_name: str, path: str, full: str, matcher=None) -> str | None:
+    """The redaction pattern the requested or resolved path matches, or None.
+
+    ``matcher`` is ``_redaction_matcher``'s pair, passed by callers that check many files.
+    """
+    root, match = matcher or _redaction_matcher(app_name)
+    requested = os.path.normpath(path).replace(os.sep, "/")
+    return match(requested) or match(os.path.relpath(full, root).replace(os.sep, "/"))
+
+
 def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0, ranges: str = "") -> str:
     """Read a file (path relative to app root) with line numbers.
 
@@ -270,6 +292,9 @@ def read_file(app_name: str, path: str, start_line: int = 0, end_line: int = 0, 
         full = _resolve_path(app_name, path)
         if not os.path.isfile(full):
             return f"Not a file: {path}"
+        pattern = redaction_pattern(app_name, path, full)
+        if pattern:
+            return f"READ_FAILED: {path} matches the redaction pattern {pattern} (secrets are never read)"
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             all_lines = f.readlines()
 
@@ -321,9 +346,13 @@ SEARCH_MAX_CONTEXT = 8
 
 def _search_files(app_name: str, root: str):
     """(full, app-relative) searchable files under ``root``, a file or directory, in path order."""
-    app_root = os.path.realpath(_app_root(app_name))
+    # Built once per search: every walked file is checked against it.
+    redaction = _redaction_matcher(app_name)
+    app_root = redaction[0]
     if os.path.isfile(root):
-        yield root, os.path.relpath(root, app_root).replace(os.sep, "/")
+        relative = os.path.relpath(root, app_root).replace(os.sep, "/")
+        if not redaction_pattern(app_name, relative, root, redaction):
+            yield root, relative
         return
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = _walked_dirs(dirpath, dirnames, app_root)
@@ -331,6 +360,9 @@ def _search_files(app_name: str, root: str):
             if not name.endswith(SEARCH_SUFFIXES) or name.endswith(SEARCH_SKIP_SUFFIXES):
                 continue
             full = os.path.join(dirpath, name)
+            # A secrets.yml would otherwise print its lines as matches.
+            if redaction_pattern(app_name, os.path.relpath(full, app_root), full, redaction):
+                continue
             try:
                 if os.path.getsize(full) > SEARCH_MAX_FILE_BYTES:
                     continue
@@ -447,6 +479,9 @@ def write_file(app_name: str, path: str, content: str) -> str:
     """
     try:
         full = _resolve_path(app_name, path)
+        pattern = redaction_pattern(app_name, path, full)
+        if pattern:
+            return f"WRITE_FAILED: {path} matches the redaction pattern {pattern} (secrets are never written)"
         original = read_bytes(full)
         _write_source(app_name, full, content.encode("utf-8", errors="surrogateescape"), original)
         return f"WRITE_OK: Wrote {len(content)} chars to {path}"
@@ -463,6 +498,10 @@ def copy_file(app_name: str, source_path: str, destination_path: str, *,
         destination = _resolve_path(app_name, destination_path)
         if source == destination:
             return "COPY_FAILED: Source and destination are the same file."
+        # A copy is a read: a redacted source would come back through the destination.
+        pattern = redaction_pattern(app_name, source_path, source)
+        if pattern:
+            return f"COPY_FAILED: {source_path} matches the redaction pattern {pattern} (secrets are never read)"
         content = read_bytes(source)
         if content is None:
             return f"COPY_FAILED: Source does not exist: {source_path}"
@@ -501,6 +540,9 @@ def delete_file(app_name: str, path: str, *, expected_sha256: str) -> str:
     """Delete one explicitly approved file; reconcile retries and lost acknowledgements."""
     try:
         full = _resolve_path(app_name, path)
+        pattern = redaction_pattern(app_name, path, full)
+        if pattern:
+            return f"DELETE_FAILED: {path} matches the redaction pattern {pattern} (secrets are never deleted)"
         current = read_bytes(full)
         if current is None:
             return f"DELETE_OK: {path} is already absent."
@@ -532,6 +574,10 @@ def rename_file(app_name: str, source_path: str, destination_path: str, *, expec
         destination = _resolve_path(app_name, destination_path)
         if os.path.normcase(source) == os.path.normcase(destination):
             return "RENAME_FAILED: Source and destination must be different file paths."
+        # Moving a redacted file to an unredacted name would make it readable.
+        pattern = redaction_pattern(app_name, source_path, source)
+        if pattern:
+            return f"RENAME_FAILED: {source_path} matches the redaction pattern {pattern} (secrets are never moved)"
 
         def digest(path):
             with open(path, "rb") as stream:
@@ -579,6 +625,10 @@ def edit_file(app_name: str, path: str, old_string: str, new_string: str, expect
         full = _resolve_path(app_name, path)
         if not os.path.isfile(full):
             return f"EDIT_FAILED: Not a file: {path}"
+        # Checked before the read: a missed anchor or the receipt would quote the file back.
+        pattern = redaction_pattern(app_name, path, full)
+        if pattern:
+            return f"EDIT_FAILED: {path} matches the redaction pattern {pattern} (secrets are never edited)"
         original = read_bytes(full)
         content = original.decode("utf-8", errors="surrogateescape")
         if content.count("\r\n") * 2 > content.count("\n"):  # mostly CRLF: edits keep those line endings
@@ -774,6 +824,9 @@ def get_file_outline(app_name: str, path: str) -> str:
         full = _resolve_path(app_name, path)
         if not os.path.isfile(full):
             return f"Not a file: {path}"
+        pattern = redaction_pattern(app_name, path, full)
+        if pattern:
+            return f"READ_FAILED: {path} matches the redaction pattern {pattern} (secrets are never read)"
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
 
@@ -853,6 +906,10 @@ def validate_code(app_name: str, path: str) -> str:
         full = _resolve_path(app_name, path)
         if not os.path.isfile(full):
             return f"VALIDATION_FAILED: Not a file: {path}"
+        # A syntax error echoes the offending line.
+        pattern = redaction_pattern(app_name, path, full)
+        if pattern:
+            return f"VALIDATION_FAILED: {path} matches the redaction pattern {pattern} (secrets are never read)"
 
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
