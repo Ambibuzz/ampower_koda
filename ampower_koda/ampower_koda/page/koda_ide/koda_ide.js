@@ -273,13 +273,24 @@ function inject_ide_styles() {
             height: 16px;
             align-items: center;
             justify-content: center;
+            border: none;
             border-radius: 3px;
+            padding: 0;
+            background: transparent;
             font-size: 14px;
             line-height: 1;
             color: var(--muted);
             flex-shrink: 0;
         }
-        .koda-tab:hover .koda-tab-close { display: inline-flex; }
+        .koda-tab:hover .koda-tab-close,
+        .koda-tab.active .koda-tab-close,
+        .koda-tab:focus-within .koda-tab-close { display: inline-flex; }
+        .koda-tab:focus-visible,
+        .koda-tab-close:focus-visible,
+        .koda-tree-row:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: -2px;
+        }
         .koda-tab-close:hover {
             background: var(--hover);
             color: var(--text);
@@ -691,6 +702,7 @@ function apply_branch_state($shell, ide, data) {
 
 function render_tree($shell, ide, data) {
     const $tree = $shell.find('.koda-tree').empty();
+    $tree.removeAttr('role aria-label').off('keydown.koda-tree');
     if (!data.tree || !data.tree.length) {
         $tree.html(`<div class="koda-empty">${__('No files found.')}</div>`);
         return;
@@ -700,22 +712,85 @@ function render_tree($shell, ide, data) {
         $root.append(render_tree_node(node, 0, data.changed || {}, $shell, ide));
     });
     $tree.append($root);
+    $tree.attr({ role: 'tree', 'aria-label': __('Files') });
+    $tree.on('keydown.koda-tree', '.koda-tree-row', function (e) {
+        handle_tree_key(e, $(this), $tree);
+    });
+    const $selected = $tree.find('.koda-tree-row.selected');
+    set_tree_focus_target($tree, $selected.length ? $selected.first() : $tree.find('.koda-tree-row').first());
+}
+
+// One row is in the Tab order (roving tabindex); arrows move between rows.
+function set_tree_focus_target($tree, $row) {
+    if (!$row || !$row.length) return;
+    $tree.find('.koda-tree-row').attr('tabindex', '-1');
+    $row.attr('tabindex', '0');
+}
+
+function handle_tree_key(e, $row, $tree) {
+    const $rows = $tree.find('.koda-tree-row:visible');
+    const index = $rows.index($row);
+    const is_folder = $row.attr('aria-expanded') !== undefined;
+    const expanded = $row.attr('aria-expanded') === 'true';
+    let $target = null;
+
+    switch (e.key) {
+    case 'Enter':
+    case ' ':
+        $row.trigger('click');
+        break;
+    case 'ArrowDown':
+        $target = $rows.eq(Math.min(index + 1, $rows.length - 1));
+        break;
+    case 'ArrowUp':
+        $target = $rows.eq(Math.max(index - 1, 0));
+        break;
+    case 'Home':
+        $target = $rows.first();
+        break;
+    case 'End':
+        $target = $rows.last();
+        break;
+    case 'ArrowRight':
+        if (is_folder && !expanded) {
+            $row.trigger('click');
+        } else if (is_folder) {
+            $target = $rows.eq(index + 1);
+        }
+        break;
+    case 'ArrowLeft':
+        if (is_folder && expanded) {
+            $row.trigger('click');
+        } else {
+            // The parent folder's row precedes the group that holds this row.
+            $target = $row.closest('[role="group"]').prev('.koda-tree-row');
+        }
+        break;
+    default:
+        return;
+    }
+    e.preventDefault();
+    if ($target && $target.length) {
+        set_tree_focus_target($tree, $target);
+        $target.trigger('focus');
+    }
 }
 
 function render_tree_node(node, depth, changed_map, $shell, ide) {
     const indent = depth * 12;
-    const $item = $('<div></div>');
+    const $item = $('<div role="none"></div>');
 
     if (node.type === 'folder') {
         const expanded = node.has_changes;
         const $row = $(`
-            <div class="koda-tree-row ${node.has_changes ? 'changed' : 'dimmed'}" style="padding-left:${8 + indent}px">
-                <span class="koda-caret">${expanded ? '▾' : '▸'}</span>
+            <div class="koda-tree-row ${node.has_changes ? 'changed' : 'dimmed'}" style="padding-left:${8 + indent}px"
+                 role="treeitem" tabindex="-1" aria-level="${depth + 1}" aria-expanded="${expanded ? 'true' : 'false'}">
+                <span class="koda-caret" aria-hidden="true">${expanded ? '▾' : '▸'}</span>
                 <span class="koda-tree-name">${frappe.utils.escape_html(node.name)}</span>
                 ${node.changed_count ? `<span class="koda-badge koda-badge-M">${node.changed_count}</span>` : ''}
             </div>
         `);
-        const $children = $('<div></div>');
+        const $children = $('<div role="group"></div>');
         if (!expanded) $children.hide();
         (node.children || []).forEach(function (child) {
             $children.append(render_tree_node(child, depth + 1, changed_map, $shell, ide));
@@ -725,6 +800,7 @@ function render_tree_node(node, depth, changed_map, $shell, ide) {
             const open = $children.is(':visible');
             $children.toggle(!open);
             $row.find('.koda-caret').text(open ? '▸' : '▾');
+            $row.attr('aria-expanded', open ? 'false' : 'true');
         });
         $item.append($row, $children);
         return $item;
@@ -732,10 +808,12 @@ function render_tree_node(node, depth, changed_map, $shell, ide) {
 
     const status = node.status || '';
     const dirty = ide.dirtyPaths.has(node.path);
+    const selected = node.path === ide.activePath;
     const $row = $(`
-        <div class="koda-tree-row ${node.has_changes ? 'changed' : 'dimmed'} ${dirty ? 'dirty' : ''}"
+        <div class="koda-tree-row ${node.has_changes ? 'changed' : 'dimmed'} ${dirty ? 'dirty' : ''} ${selected ? 'selected' : ''}"
              data-path="${frappe.utils.escape_html(node.path)}"
-             style="padding-left:${12 + indent}px">
+             style="padding-left:${12 + indent}px"
+             role="treeitem" tabindex="-1" aria-level="${depth + 1}" aria-selected="${selected ? 'true' : 'false'}">
             <span class="koda-tree-name">${frappe.utils.escape_html(node.name)}${dirty ? ' •' : ''}</span>
             ${status ? `<span class="koda-badge koda-badge-${status}">${status}</span>` : ''}
         </div>
@@ -745,6 +823,17 @@ function render_tree_node(node, depth, changed_map, $shell, ide) {
     });
     $item.append($row);
     return $item;
+}
+
+// Mark the active file's row selected (visual and aria-selected) and make it the tree's Tab stop.
+function select_tree_row($shell, path) {
+    const $rows = $shell.find('.koda-tree-row[data-path]');
+    $rows.removeClass('selected').attr('aria-selected', 'false');
+    const $row = $rows.filter(function () {
+        return $(this).attr('data-path') === path;
+    });
+    $row.addClass('selected').attr('aria-selected', 'true');
+    set_tree_focus_target($shell.find('.koda-tree'), $row);
 }
 
 function open_file(file_path, $shell, ide, force) {
@@ -852,18 +941,51 @@ function format_display_path(path) {
 }
 
 function update_tabs($shell, ide) {
-    const $tabs = $shell.find('.koda-tabs').empty();
+    const $tabs = $shell.find('.koda-tabs');
+    const had_focus = $tabs[0] && $tabs[0].contains && $tabs[0].contains(document.activeElement);
+    $tabs.empty().attr({ role: 'tablist', 'aria-label': __('Open files') });
     Object.keys(ide.files).forEach(function (path) {
         const file = ide.files[path];
         const name = path.split('/').pop();
+        const active = path === ide.activePath;
+        // Manual activation: arrows move focus, Enter/Space opens, Delete closes.
         const $tab = $(`
-            <div class="koda-tab ${path === ide.activePath ? 'active' : ''} ${file.dirty ? 'dirty' : ''}" data-path="${frappe.utils.escape_html(path)}">
+            <div class="koda-tab ${active ? 'active' : ''} ${file.dirty ? 'dirty' : ''}" data-path="${frappe.utils.escape_html(path)}"
+                 role="tab" aria-selected="${active ? 'true' : 'false'}" tabindex="${active ? '0' : '-1'}"
+                 title="${frappe.utils.escape_html(path)}">
                 <span class="koda-tab-label">${frappe.utils.escape_html(name)}</span>
-                <span class="koda-tab-close" title="${__('Close')}">×</span>
+                <button type="button" class="koda-tab-close" tabindex="-1"
+                        title="${__('Close')}" aria-label="${__('Close {0}', [frappe.utils.escape_html(name)])}">×</button>
             </div>
         `);
         $tab.on('click', function () {
             open_file(path, $shell, ide);
+        });
+        $tab.on('keydown', function (e) {
+            if (e.target !== this) return;
+            const $all = $tabs.find('.koda-tab');
+            const index = $all.index($tab);
+            let $target = null;
+            if (e.key === 'Enter' || e.key === ' ') {
+                open_file(path, $shell, ide);
+            } else if (e.key === 'Delete') {
+                close_tab(path, $shell, ide);
+            } else if (e.key === 'ArrowRight') {
+                $target = $all.eq((index + 1) % $all.length);
+            } else if (e.key === 'ArrowLeft') {
+                $target = $all.eq((index - 1 + $all.length) % $all.length);
+            } else if (e.key === 'Home') {
+                $target = $all.first();
+            } else if (e.key === 'End') {
+                $target = $all.last();
+            } else {
+                return;
+            }
+            e.preventDefault();
+            if ($target && $target.length) {
+                $all.attr('tabindex', '-1');
+                $target.attr('tabindex', '0').trigger('focus');
+            }
         });
         $tab.find('.koda-tab-close').on('click', function (e) {
             e.stopPropagation();
@@ -871,6 +993,8 @@ function update_tabs($shell, ide) {
         });
         $tabs.append($tab);
     });
+    // Re-rendering drops the focused element; give focus back to the active tab.
+    if (had_focus) $tabs.find('.koda-tab.active').trigger('focus');
 }
 
 function close_tab(file_path, $shell, ide) {
@@ -896,12 +1020,7 @@ function close_tab(file_path, $shell, ide) {
             }
         }
         update_tabs($shell, ide);
-        $shell.find('.koda-tree-row').removeClass('selected');
-        if (ide.activePath) {
-            $shell.find('.koda-tree-row').filter(function () {
-                return $(this).attr('data-path') === ide.activePath;
-            }).addClass('selected');
-        }
+        select_tree_row($shell, ide.activePath);
     };
 
     if (file && file.dirty) {
