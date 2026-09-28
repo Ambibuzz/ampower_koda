@@ -414,9 +414,10 @@ client/server contracts, Frappe conventions. Run the changed code with call_meth
 against the live site rather than reasoning about what it would return. Mechanical
 checks and test receipts are provided separately; a green test that mocks the
 behavior under test is not evidence. Never claim an unexecuted behavior was tested.
-CURRENT CHANGE EVIDENCE is a diff of the changes (a small new file appears whole); read the
-current source around a change when a finding depends on it, and the reference files the task
-compares against.
+CURRENT CHANGE EVIDENCE is a diff of the changes; a new file appears whole with line numbers
+(cite those; do not read it again) unless it says it is too large, then read it. Read the current
+source around a change when a finding depends on it, and read the reference files the task compares
+against with a purpose (what you need from them), not whole.
 The review contract below specifies severities and the verdict format.
 """
     template = get_config_prompt("review_prompt", default, request_name)

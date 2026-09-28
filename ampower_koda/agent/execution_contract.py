@@ -49,6 +49,18 @@ def change_evidence(before: dict, read_current, *, limit: int = 20000) -> tuple[
         }
         changes.append(change)
         header = f"\n### {path} ({change['summary']})\nSHA256 {change['before']} -> {change['after']}\n"
+        if original is None and current is not None:
+            # A new file whole, numbered so findings can cite path:line without reading it again.
+            lines = current.splitlines()
+            numbered = "".join(f"{n:>5} | {line}\n" for n, line in enumerate(lines, 1))
+            if len(numbered) > remaining:
+                # A slice would be read again in full anyway; leave the budget to the files after it.
+                blocks.append(header + f"[New file, {len(lines)} lines, too large for this block: read it "
+                                       "with read_file.]\n")
+                continue
+            remaining -= len(numbered)
+            blocks.append(header + numbered)
+            continue
         diff = "".join(difflib.unified_diff(
             (original or "").splitlines(keepends=True),
             (current or "").splitlines(keepends=True),
@@ -203,6 +215,13 @@ def review_decision(payload, criteria: list[str]) -> tuple[str, str]:
     if "unverified" in statuses:
         return "needs_evidence", json.dumps(payload, ensure_ascii=True)
     if advisory:
+        # A severity label never turns an unmet criterion into approval: ask for a consistent verdict.
+        unmet = sorted(item["criterion"] for item in evidence if item["status"] == "unmet")
+        if unmet:
+            return "invalid", (
+                "Invalid review result: criteria " + ", ".join(map(str, unmet)) + " are marked unmet, but every "
+                'issue is P2/P3. An unmet criterion needs a P0/P1 issue; if only P2/P3 problems remain for it, '
+                'mark it "satisfied" with its evidence.')
         return "pass", json.dumps({**payload, "review_passed": True,
                                    "advisory": "Only P2/P3 findings remain; recorded, not blocking."},
                                   ensure_ascii=True)
