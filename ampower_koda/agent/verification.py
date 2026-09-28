@@ -1083,10 +1083,11 @@ def run_verification(app_name: str, contract: dict, *, env: dict | None = None,
             commands.append({"name": "node:test", "argv": ["node", "--test", "--test-reporter=tap", *map(str, javascript)],
                              "cwd": ".", "timeout_seconds": DEFAULT_TIMEOUT, "node": True, "portable": True})
         if not commands:
-            detail = ("No executable behavioral tests were found. Add unittest test*.py under .koda/tests that "
-                      "import the changed server code and run it against the live site, with the records each "
-                      "case needs read or inserted inside the test (writes are rolled back), then call "
-                      "run_tests." if required else
+            detail = ("No executable behavioral tests were found. Write one now with write_file at "
+                      ".koda/tests/test_<feature>.py (write_file creates the folder; do not look for it first): "
+                      "unittest cases that import the changed server code and run it against the live site, "
+                      "with the records each case needs read or inserted inside the test (writes are rolled "
+                      "back), then call run_tests." if required else
                       "No tests found; none are required because no server Python changed.")
             return HealthReport([CheckResult("tests:missing", not required, detail, verified=False)]), []
         command_env = _runner_environment(root, env)
