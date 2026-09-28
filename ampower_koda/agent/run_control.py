@@ -3,16 +3,29 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
+import os
 import time
 from uuid import uuid4
 
 import frappe
 
 DOCTYPE = "Agent Request"
-MODEL_TIMEOUT_SECONDS = 90
+
+
+def _env_seconds(name: str, default: int) -> int:
+    """A positive whole number of seconds from the environment, else ``default`` (never an import error)."""
+    try:
+        value = int(os.environ.get(name) or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Overridable for slower test providers (a local proxy over the Codex CLI takes up to ~150 s a call).
+MODEL_TIMEOUT_SECONDS = _env_seconds("KODA_MODEL_TIMEOUT_SECONDS", 90)
 MODEL_MAX_RETRIES = 1
 MODEL_TIME_RESERVE = MODEL_TIMEOUT_SECONDS * (MODEL_MAX_RETRIES + 1) + 90
-WORKER_TIMEOUT_SECONDS = 1800
+WORKER_TIMEOUT_SECONDS = _env_seconds("KODA_WORKER_TIMEOUT_SECONDS", 1800)
 _current = ContextVar("koda_active_run", default=None)
 
 
@@ -115,6 +128,9 @@ def enqueue_job(method: str, *, request_name: str, queue="default", timeout=WORK
     ``clear_checkpoint`` is for jobs after the implementation was accepted: a
     failure there must not offer to resume a checkpoint from before a commit or migration.
     """
+    # The test override, when set, only ever extends a caller's own timeout (api.py passes 1800 explicitly).
+    if os.environ.get("KODA_WORKER_TIMEOUT_SECONDS"):
+        timeout = max(int(timeout), WORKER_TIMEOUT_SECONDS)
     run_id = str(uuid4())
     values = {"agent_run_id": run_id, "rq_job_id": ""}
     if clear_checkpoint:

@@ -275,7 +275,27 @@ def _extract_review_json(text: str) -> dict | None:
 
 # LLM factory — supports OpenAI, OpenRouter, Gemini and Claude
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_OPENROUTER_DEFAULT_URL = "https://openrouter.ai/api/v1"
+
+
+def _openrouter_base_url() -> str:
+    """OpenRouter, or a local OpenAI-compatible proxy for testing (koda-local/codex-proxy).
+
+    The override is honoured only on a loopback host: the OpenRouter key goes with every
+    request, and an environment variable must not be able to send it anywhere else.
+    """
+    from urllib.parse import urlparse
+
+    override = (os.environ.get("KODA_OPENROUTER_BASE_URL") or "").strip()
+    if not override:
+        return _OPENROUTER_DEFAULT_URL
+    if (urlparse(override).hostname or "") in {"localhost", "127.0.0.1", "::1"}:
+        return override
+    print(f"[koda] KODA_OPENROUTER_BASE_URL ignored: {override!r} is not a loopback address")
+    return _OPENROUTER_DEFAULT_URL
+
+
+OPENROUTER_BASE_URL = _openrouter_base_url()
 
 
 class _OpenRouterChat(ChatOpenAI):
