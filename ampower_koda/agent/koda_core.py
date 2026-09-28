@@ -721,6 +721,7 @@ class Understanding:
 
     @property
     def ok(self) -> bool:
+        """An answer, or findings salvaged from the ledger; an empty model reply with none is not."""
         return not self.error and bool(self.summary.strip())
 
     @property
@@ -728,6 +729,8 @@ class Understanding:
         """Why this pass produced nothing: the error, or where the turn stopped."""
         if self.error:
             return self.error
+        if self.stop_reason == "empty":
+            return "the helper returned an empty answer and established no findings"
         if self.stop_reason and self.stop_reason != "answered":
             return f"the helper stopped: {self.stop_reason}"
         return "the helper produced no answer"

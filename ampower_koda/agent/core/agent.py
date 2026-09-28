@@ -242,6 +242,10 @@ def _rounds(state, *, working, model, model_id, host, role_prompt,
 
         calls = turn.calls or leaked
         if not calls:
+            if not text:
+                # Neither an answer nor a call: never "answered". What the ledger holds is still
+                # reported; with no findings the answer stays empty.
+                state.stop_reason = "empty"
             state.answer = text or _salvage(state, "", "the model returned no text")
             return state
 
@@ -311,13 +315,14 @@ def _salvage(state, body: str, reason: str) -> str:  # noqa: ANN001
     """An answer for a turn that ended before the model wrote one.
 
     Falls back to the ledger, so an interrupted turn still reports its findings.
+    Empty when there are none: a placeholder would read as an answer (stop_reason says why).
     """
     if body:
         return f"{body}\n\n[{reason}]"
 
     block = render_ledger(state.ledger.entries, soft_tokens=state.session.budget.ledger)
     if block.is_empty:
-        return f"[{reason} - the turn produced no findings]"
+        return ""
     return (
         f"[{reason} before a final answer was written. "
         f"What the turn established, from the ledger:]\n\n{block.text}"
