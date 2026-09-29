@@ -92,3 +92,44 @@ def fetch_hd_ticket(ticket_id: str) -> dict:
         "subject": subject or "",
         "description": _strip_html(description or ""),
     }
+
+def post_ticket_comment(ticket_id: str, content: str) -> None:
+    """Posts an internal HD Ticket Comment (never emailed to the customer).
+    Used for staging a suggested reply an agent can review and choose to
+    send, rather than auto-replying.
+    """
+    mode, base_url, api_key, api_secret = _get_hd_config()
+
+    if mode == "Same Site":
+        if not frappe.db.exists("HD Ticket", ticket_id):
+            raise HDNotFoundError(ticket_id)
+        frappe.get_doc({
+            "doctype": "HD Ticket Comment",
+            "reference_ticket": ticket_id,
+            "content": content,
+        }).insert(ignore_permissions=True)
+        frappe.db.commit()
+    else:
+        if not (base_url and api_key and api_secret):
+            frappe.throw(
+                _("Helpdesk connection is not configured. Set HD Base URL, "
+                  "API Key and API Secret in Agent Settings.")
+            )
+
+        url = f"{base_url}/api/resource/HD Ticket Comment"
+        headers = {"Authorization": f"token {api_key}:{api_secret}"}
+        payload = {"reference_ticket": ticket_id, "content": content}
+
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            frappe.throw(_("Could not reach Helpdesk: {0}").format(e))
+
+        if response.status_code == 404:
+            raise HDNotFoundError(ticket_id)
+        if response.status_code not in (200, 201):
+            frappe.throw(
+                _("Helpdesk returned an error posting comment ({0}): {1}").format(
+                    response.status_code, response.text[:500]
+                )
+            )
