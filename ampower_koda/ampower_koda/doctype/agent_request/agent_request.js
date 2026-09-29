@@ -102,13 +102,15 @@ frappe.ui.form.on('Agent Request', {
     onload: function (frm) {
         // Settings' default model is not in the static catalogue below; fetch it
         // so it is offered here and becomes the default for a new request.
-        frappe.call({ method: 'ampower_koda.agent.api.get_model_defaults', callback: function (r) {
-            frm._settings_defaults = r.message || {};
-            if (frm.is_new()) {
-                load_user_defaults(frm);
+        frappe.call({
+            method: 'ampower_koda.agent.api.get_model_defaults', callback: function (r) {
+                frm._settings_defaults = r.message || {};
+                if (frm.is_new()) {
+                    load_user_defaults(frm);
+                }
+                set_model_options_for_provider(frm, false);
             }
-            set_model_options_for_provider(frm, false);
-        } });
+        });
         update_request_type_help(frm);
     }
 });
@@ -477,6 +479,20 @@ function toggle_config_readonly(frm) {
 function setup_action_buttons(frm) {
     frm.clear_custom_buttons();
     if (frm.is_new()) return;
+
+    if (frm.doc.source_hd_ticket) {
+        frm.add_custom_button(__('Open HD Ticket'), function () {
+            frappe.call({
+                method: 'get_hd_ticket_url',
+                doc: frm.doc,
+                callback: function (r) {
+                    if (r.message) {
+                        window.open(r.message, '_blank');
+                    }
+                }
+            });
+        });
+    }
 
     var status = frm.doc.status;
     var running = ['Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing'];
@@ -924,10 +940,10 @@ function show_post_checkout_bench_dialog(frm) {
                             var failed = r2.message.failed || [];
                             var header = failed.length
                                 ? '<p style="margin-bottom:8px;"><b>'
-                                    + __('{0} command(s) failed:', [failed.length])
-                                    + '</b><br>'
-                                    + frappe.utils.escape_html(failed.join('\n')).replace(/\n/g, '<br>')
-                                    + '</p>'
+                                + __('{0} command(s) failed:', [failed.length])
+                                + '</b><br>'
+                                + frappe.utils.escape_html(failed.join('\n')).replace(/\n/g, '<br>')
+                                + '</p>'
                                 : '';
                             frappe.msgprint({
                                 title: failed.length
@@ -1008,20 +1024,28 @@ function open_task_dialog(frm) {
         title: __('Add / Edit Task'),
         size: 'large',
         fields: [
-            { fieldname: 'task_id', fieldtype: 'Select', label: __('Task'), options: ['New task', ...ids], default: 'New task',
-              change: () => fill_task(dialog, tasks.find((t) => t.id === dialog.get_value('task_id'))) },
+            {
+                fieldname: 'task_id', fieldtype: 'Select', label: __('Task'), options: ['New task', ...ids], default: 'New task',
+                change: () => fill_task(dialog, tasks.find((t) => t.id === dialog.get_value('task_id')))
+            },
             { fieldname: 'title', fieldtype: 'Data', label: __('Title'), reqd: 1 },
             { fieldname: 'goal', fieldtype: 'Data', label: __('Goal (one sentence)'), reqd: 1 },
-            { fieldname: 'description', fieldtype: 'Small Text', label: __('Description'), reqd: 1,
-              description: __('What changes, where, why, and which existing pattern to follow. No code.') },
+            {
+                fieldname: 'description', fieldtype: 'Small Text', label: __('Description'), reqd: 1,
+                description: __('What changes, where, why, and which existing pattern to follow. No code.')
+            },
             { fieldtype: 'Column Break' },
             { fieldname: 'action', fieldtype: 'Select', label: __('Action'), options: ['MODIFY', 'CREATE'], default: 'MODIFY', reqd: 1 },
-            { fieldname: 'depends_on', fieldtype: 'MultiSelectPills', label: __('Depends on'),
-              get_data: () => ids.map((id) => ({ value: id, description: '' })) },
+            {
+                fieldname: 'depends_on', fieldtype: 'MultiSelectPills', label: __('Depends on'),
+                get_data: () => ids.map((id) => ({ value: id, description: '' }))
+            },
             { fieldname: 'acceptance_criteria', fieldtype: 'Small Text', label: __('Acceptance criteria (one per line)'), reqd: 1 },
             { fieldname: 'files', fieldtype: 'Small Text', label: __('Files to edit or create (one per line)'), reqd: 1 },
-            { fieldtype: 'Section Break', label: __('Relevant code'),
-              description: __('Optional. We search the codebase for what this task describes and pre-select the best files for the implementer to read first.') },
+            {
+                fieldtype: 'Section Break', label: __('Relevant code'),
+                description: __('Optional. We search the codebase for what this task describes and pre-select the best files for the implementer to read first.')
+            },
             { fieldname: 'find', fieldtype: 'Button', label: __('Find relevant code'), click: () => find_task_context(frm, dialog) },
             { fieldname: 'results', fieldtype: 'HTML' },
         ],
@@ -1296,7 +1320,7 @@ function setup_live_log_panel(frm) {
             + '</div>'
             + '<div class="agent-log-container"></div>'
             + '</div>';
-        
+
         var $panel = $(html);
 
         if ($anchor) {
@@ -1331,7 +1355,7 @@ function setup_live_log_panel(frm) {
         frm._log_history.forEach(function (data) {
             // We temporarily bypass the deduplication check in append_log_entry for this re-population
             var old_ids = frm._last_entry_ids;
-            frm._last_entry_ids = []; 
+            frm._last_entry_ids = [];
             append_log_entry(frm, data);
             frm._last_entry_ids = old_ids;
         });
@@ -1340,11 +1364,11 @@ function setup_live_log_panel(frm) {
 
 function append_log_entry(frm, data) {
     if (!frm._log_history) frm._log_history = [];
-    
+
     // Check if this specific log entry is already in history to avoid duplicates after reload
     var entry_id = (data.timestamp || '') + (data.type || '') + (data.tool_name || '') + (data.preview || '').substring(0, 50);
     if (frm._last_entry_ids && frm._last_entry_ids.indexOf(entry_id) !== -1) return;
-    
+
     frm._log_history.push(data);
     if (!frm._last_entry_ids) frm._last_entry_ids = [];
     frm._last_entry_ids.push(entry_id);

@@ -5,12 +5,19 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 
+from ampower_koda.agent import hd_client
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.execution_contract import load_plan
 from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdown
 
 
 class AgentRequest(Document):
+    @frappe.whitelist()
+    def get_hd_ticket_url(self):
+        if not self.source_hd_ticket:
+            frappe.throw(_("This request has no Source HD Ticket."))
+        return hd_client.get_hd_ticket_url(self.source_hd_ticket)
+        
     def before_insert(self):
         if not self.owner:
             self.owner = frappe.session.user

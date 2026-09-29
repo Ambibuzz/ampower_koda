@@ -93,6 +93,17 @@ def fetch_hd_ticket(ticket_id: str) -> dict:
         "description": _strip_html(description or ""),
     }
 
+def get_hd_ticket_url(ticket_id: str) -> str:
+    """Build the Helpdesk portal URL for a ticket, based on how HD is connected."""
+    mode, base_url, _api_key, _api_secret = _get_hd_config()
+    origin = base_url if mode != "Same Site" else frappe.utils.get_url()
+    if not origin:
+        frappe.throw(
+            _("Helpdesk connection is not configured. Set HD Base URL in Agent Settings.")
+        )
+    return f"{origin.rstrip('/')}/helpdesk/tickets/{ticket_id}"
+
+
 def set_pending_draft_reply(ticket_id: str, content: str) -> None:
     """Stages a suggested reply as HD Ticket.custom_koda_pending_draft, for
     the agent portal to surface as an 'Insert as draft' banner -- never
