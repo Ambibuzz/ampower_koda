@@ -144,8 +144,18 @@ frappe.pages['hd-ticket-intake'].on_page_load = function (wrapper) {
                 var data = r.message;
 
                 if (data.status === 'not_actionable') {
-                    show_result('hdti-badge-info', data.ticket_type || 'not actionable',
-                        frappe.utils.escape_html(data.reply_to_ticket || ''));
+                    var reply_html = frappe.utils.escape_html(data.reply_to_ticket || '');
+                    if (route_ticket && data.reply_to_ticket) {
+                        reply_html += '<div style="margin-top:16px;">' +
+                            '<button class="btn btn-default btn-sm hdti-link" id="hd-ticket-insert-draft">' +
+                            __('Insert as draft on ticket') + '</button></div>';
+                    }
+                    show_result('hdti-badge-info', data.ticket_type || 'not actionable', reply_html);
+
+                    page.wrapper.find('#hd-ticket-insert-draft').on('click', function () {
+                        localStorage.setItem('hdti_draft_reply_' + route_ticket, data.reply_to_ticket);
+                        window.location.href = '/helpdesk/tickets/' + route_ticket;
+                    });
                     return;
                 }
 

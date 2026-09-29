@@ -181,24 +181,7 @@ def _finalize_agent_request(subject: str, description: str, request_type: str,
         "redirect_url": f"/app/agent-request/{new_request.name}",
     }
 
-def _stage_reply_on_ticket(hd_ticket: str, reply_text: str) -> None:
-    """Posts an internal comment on the HD Ticket with Koda's suggested
-    reply, for the agent to review and optionally send -- never sent to
-    the customer automatically.
-    """
-    reply_html = frappe.utils.escape_html(reply_text).replace("\n", "<br>")
-    content = (
-        "<p><strong>\U0001F916 Suggested reply from Koda</strong> "
-        "(not sent automatically):</p>"
-        f"<p>{reply_html}</p>"
-    )
-    try:
-        hd_client.post_ticket_comment(hd_ticket, content)
-    except Exception:
-        frappe.log_error(
-            title="HD Ticket Intake: failed to stage suggested reply",
-            message=frappe.get_traceback(),
-        )
+
 
 
 @frappe.whitelist()
@@ -219,8 +202,6 @@ def execute_from_ticket(subject: str, description: str, source_hd_ticket: str = 
 
     request_type = TICKET_TYPE_TO_REQUEST_TYPE.get(ticket_type)
     if not request_type:
-        if source_hd_ticket and reply_to_ticket:
-            _stage_reply_on_ticket(source_hd_ticket, reply_to_ticket)
         return {
             "status": "not_actionable",
             "ticket_type": ticket_type,
