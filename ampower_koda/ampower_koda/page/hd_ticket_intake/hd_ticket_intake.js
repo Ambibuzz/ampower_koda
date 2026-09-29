@@ -147,15 +147,11 @@ frappe.pages['hd-ticket-intake'].on_page_load = function (wrapper) {
                     var reply_html = frappe.utils.escape_html(data.reply_to_ticket || '');
                     if (route_ticket && data.reply_to_ticket) {
                         reply_html += '<div style="margin-top:16px;">' +
-                            '<button class="btn btn-default btn-sm hdti-link" id="hd-ticket-insert-draft">' +
-                            __('Insert as draft on ticket') + '</button></div>';
+                            '<a href="/helpdesk/tickets/' + route_ticket + '" class="hdti-link">' +
+                            __('Open ticket') + ' \u2192</a></div>';
                     }
-                    show_result('hdti-badge-info', data.ticket_type || 'not actionable', reply_html);
 
-                    page.wrapper.find('#hd-ticket-insert-draft').on('click', function () {
-                        localStorage.setItem('hdti_draft_reply_' + route_ticket, data.reply_to_ticket);
-                        window.location.href = '/helpdesk/tickets/' + route_ticket;
-                    });
+                    show_result('hdti-badge-info', data.ticket_type || 'not actionable', reply_html);
                     return;
                 }
 

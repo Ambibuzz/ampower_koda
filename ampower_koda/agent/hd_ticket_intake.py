@@ -202,6 +202,11 @@ def execute_from_ticket(subject: str, description: str, source_hd_ticket: str = 
 
     request_type = TICKET_TYPE_TO_REQUEST_TYPE.get(ticket_type)
     if not request_type:
+        if source_hd_ticket and reply_to_ticket:
+            try:
+                hd_client.set_pending_draft_reply(source_hd_ticket, reply_to_ticket)
+            except Exception:
+                pass
         return {
             "status": "not_actionable",
             "ticket_type": ticket_type,
