@@ -19,6 +19,10 @@ fixtures = [
         "doctype": "HD Form Script",
         "filters": [["name", "=", "HD Ticket-Koda Update"]],
     },
+    {
+        "doctype": "HD Form Script",
+        "filters": [["name", "=", "HD Ticket-Send to Koda"]],
+    },
 ]
 
 doctype_js = {

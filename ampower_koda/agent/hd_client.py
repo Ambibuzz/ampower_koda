@@ -14,6 +14,7 @@ returns plain text -- HTML is stripped here, once, so every caller (KB's
 user_prompt, Agent Request.user_message) gets consistent plain text.
 """
 
+import json
 import re
 
 import frappe
@@ -102,6 +103,77 @@ def get_hd_ticket_url(ticket_id: str) -> str:
             _("Helpdesk connection is not configured. Set HD Base URL in Agent Settings.")
         )
     return f"{origin.rstrip('/')}/helpdesk/tickets/{ticket_id}"
+
+def build_send_to_koda_script() -> str:
+    """Build the client JS for the 'Send to Koda' HD Ticket action.
+
+    Same Site: the ticket and Koda share an origin, so the script uses the
+    browser's own window.location.origin -- no configuration needed and it
+    survives a domain change with no regeneration.
+    Same Bench / Remote: Koda is a different site, so the base URL can't be
+    read from the browser and is baked in from Agent Settings.koda_public_url
+    at generation time instead.
+    """
+    settings = frappe.get_single("Agent Settings")
+    mode = settings.hd_connection_mode or "Same Site"
+
+    if mode == "Same Site":
+        base_url_js = "window.location.origin"
+    else:
+        koda_url = (settings.koda_public_url or "").strip().rstrip("/")
+        if not koda_url:
+            frappe.throw(
+                _("Set Koda Public URL in Agent Settings before generating the "
+                  "'Send to Koda' button (HD Connection Mode is {0}).").format(mode)
+            )
+        base_url_js = json.dumps(koda_url)
+
+    return (
+        "function setupForm({ doc }) {\n"
+        "    let actions = [];\n"
+        '    if (doc.status === "Open") {\n'
+        "        actions.push({\n"
+        '            label: "Send to Koda",\n'
+        "            onClick: () => {\n"
+        f'                window.open({base_url_js} + "/app/hd-ticket-intake/" + doc.name, "_blank");\n'
+        "            },\n"
+        "        });\n"
+        "    }\n"
+        "    return { actions };\n"
+        "}"
+    )
+
+
+def push_send_to_koda_script(script_text: str) -> None:
+    """Write the generated 'Send to Koda' script to wherever HD Form Script lives."""
+    mode, base_url, api_key, api_secret = _get_hd_config()
+
+    if mode == "Same Site":
+        if not frappe.db.exists("HD Form Script", "HD Ticket-Send to Koda"):
+            frappe.throw(_("HD Form Script 'HD Ticket-Send to Koda' was not found."))
+        frappe.db.set_value("HD Form Script", "HD Ticket-Send to Koda", "script", script_text)
+        frappe.db.commit()
+    else:
+        if not (base_url and api_key and api_secret):
+            frappe.throw(
+                _("Helpdesk connection is not configured. Set HD Base URL, "
+                  "API Key and API Secret in Agent Settings.")
+            )
+
+        url = f"{base_url}/api/resource/HD Form Script/HD Ticket-Send to Koda"
+        headers = {"Authorization": f"token {api_key}:{api_secret}"}
+        payload = {"script": script_text}
+
+        try:
+            response = requests.put(url, json=payload, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            frappe.throw(_("Could not reach Helpdesk: {0}").format(e))
+
+        if response.status_code != 200:
+            frappe.throw(
+                _("Helpdesk returned an error updating the Send to Koda script "
+                  "({0}): {1}").format(response.status_code, response.text[:500])
+            )
 
 
 def set_pending_draft_reply(ticket_id: str, content: str) -> None:

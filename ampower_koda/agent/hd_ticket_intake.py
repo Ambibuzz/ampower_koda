@@ -25,7 +25,7 @@ from ampower_koda.agent import kb_client
 from ampower_koda.agent import hd_client
 from ampower_koda.agent.kb_client import KBNotFoundError
 from ampower_koda.agent.hd_client import HDNotFoundError
-from ampower_koda.agent.api import start_agent
+
 
 DOCTYPE_NAME = "Agent Request"
 
@@ -119,34 +119,10 @@ def _cache_repo(repository_name: str, github_repo_url: str, base_branch: str):
     frappe.db.commit()
 
 
-def _get_git_credential():
-    user = frappe.session.user
-    if not frappe.db.exists("Agent Git Credential", user):
-        frappe.throw(
-            _("You haven't connected a GitHub identity yet. Add one in "
-              "Agent Git Credential before running an agent.")
-        )
-
-    cred = frappe.get_doc("Agent Git Credential", user)
-    if not cred.is_active:
-        frappe.throw(
-            _("Your GitHub identity (Agent Git Credential) is marked inactive. "
-              "Reactivate it before running an agent.")
-        )
-
-    token = cred.get_password("github_access_token")
-    if not (cred.github_username and cred.github_email and token):
-        frappe.throw(_("Your Agent Git Credential is incomplete. Please fill "
-                        "in all fields before running an agent."))
-
-    return cred.github_username, cred.github_email, token
-
-
 def _finalize_agent_request(subject: str, description: str, request_type: str,
                              comment_for_developer: str, target_app_name: str,
                              github_repo_url: str, base_branch: str,
                              source_hd_ticket: str = None) -> dict:
-    github_username, github_email, github_token = _get_git_credential()
 
     description_html = frappe.utils.escape_html(description).replace("\n", "<br>")
     user_message = f"<h4>Original Ticket</h4><p>{description_html}</p>"
@@ -164,16 +140,12 @@ def _finalize_agent_request(subject: str, description: str, request_type: str,
         "target_app_name": target_app_name,
         "github_repo_url": github_repo_url,
         "base_branch": base_branch or "main",
-        "github_token": github_token,
-        "git_user_name": github_username,
-        "git_user_email": github_email,
         "ai_provider": settings.default_ai_provider,
         "ai_model": settings.default_ai_model,
         "source_hd_ticket": source_hd_ticket or "",
     }).insert(ignore_permissions=True)
     frappe.db.commit()
 
-    start_agent(new_request.name)
 
     return {
         "status": "ok",
@@ -243,6 +215,17 @@ def execute_from_ticket(subject: str, description: str, source_hd_ticket: str = 
     outcome["ticket_type"] = ticket_type
     outcome["reply_to_ticket"] = reply_to_ticket
     return outcome
+
+@frappe.whitelist()
+def regenerate_send_to_koda_script():
+    """(Re)build and push the 'Send to Koda' HD Form Script for the current
+    HD Connection Mode. Run this after changing Connection Mode or Koda
+    Public URL in Agent Settings.
+    """
+    script_text = hd_client.build_send_to_koda_script()
+    hd_client.push_send_to_koda_script(script_text)
+    return {"status": "ok"}
+
 
 @frappe.whitelist()
 def fetch_ticket_for_intake(hd_ticket: str):

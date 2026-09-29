@@ -35,6 +35,7 @@
         "hd_connection_section",
         "hd_connection_mode",
         "hd_base_url",
+        "koda_base_url",
         "hd_api_key",
         "hd_api_secret"
     ],
@@ -233,6 +234,13 @@
             "fieldtype": "Data",
             "label": "HD Base URL",
             "description": "Required for Same Bench and Remote. e.g. https://helpdesk.ambibuzz.com — no trailing slash.",
+            "depends_on": "eval:doc.hd_connection_mode != 'Same Site'"
+        },
+        {
+            "fieldname": "koda_base_url",
+            "fieldtype": "Data",
+            "label": "Koda Base URL",
+            "description": "Required for Same Bench and Remote. Base URL where this Koda instance is reachable, e.g. https://koda.ambibuzz.com — no trailing slash. Used to build the 'Send to Koda' button's link on tickets living on a different site.",
             "depends_on": "eval:doc.hd_connection_mode != 'Same Site'"
         },
         {

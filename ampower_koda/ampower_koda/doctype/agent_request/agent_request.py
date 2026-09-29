@@ -58,11 +58,14 @@ class AgentRequest(Document):
         if not (self.github_repo_url or "").strip():
             frappe.throw(_("GitHub Repo URL is required"))
 
-        token = self.github_token
+        # Left blank on insert: HD Ticket Intake creates the request without
+        # a git identity. It becomes mandatory again on every save after
+        # that, which is what gates the "Start Agent" button (it auto-saves
+        # first), so the user must fill it in before the agent can run.
         if not self.is_new():
             token = self.get_password("github_token", raise_exception=False)
-        if not token:
-            frappe.throw(_("GitHub Token is required"))
+            if not token:
+                frappe.throw(_("GitHub Token is required"))
 
         if not self.use_default_prompts:
             seen = set()
