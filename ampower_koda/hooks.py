@@ -15,6 +15,10 @@ fixtures = [
         "doctype": "Custom Field",
         "filters": [["name", "=", "HD Ticket-custom_koda_pending_draft"]],
     },
+    {
+        "doctype": "HD Form Script",
+        "filters": [["name", "=", "HD Ticket-Koda Update"]],
+    },
 ]
 
 doctype_js = {

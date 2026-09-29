@@ -1,0 +1,15 @@
+[
+ {
+  "apply_on_new_page": 0,
+  "apply_to": "Form",
+  "apply_to_customer_portal": 0,
+  "docstatus": 0,
+  "doctype": "HD Form Script",
+  "dt": "HD Ticket",
+  "enabled": 1,
+  "is_standard": 0,
+  "modified": "2026-09-29 18:10:11.545110",
+  "name": "HD Ticket-Koda Update",
+  "script": "function setupForm(ctx) {\n    var draft = ctx.doc.custom_koda_pending_draft;\n    if (!draft) {\n        return { actions: [] };\n    }\n    var preview = draft.split(/\\n+/).filter(Boolean).join(\"  •  \");\n    return {\n        actions: [\n            {\n                label: \"Koda Update\",\n                onClick: function () {\n                    ctx.$dialog({\n                        title: \"Koda has an update for this ticket\",\n                        message: preview,\n                        actions: [\n                            {\n                                label: \"Copy\",\n                                variant: \"solid\",\n                                onClick: function ({ close }) {\n                                    navigator.clipboard.writeText(draft);\n                                    ctx.toast.success(\"Copied to clipboard\");\n                                    close();\n                                },\n                            },\n                            {\n                                label: \"Dismiss\",\n                                variant: \"subtle\",\n                                onClick: function ({ close }) {\n                                    ctx.call(\"frappe.client.set_value\", {\n                                        doctype: \"HD Ticket\",\n                                        name: ctx.doc.name,\n                                        fieldname: \"custom_koda_pending_draft\",\n                                        value: \"\",\n                                    });\n                                    ctx.doc.custom_koda_pending_draft = \"\";\n                                    close();\n                                },\n                            },\n                        ],\n                    });\n                },\n            },\n        ],\n    };\n}"
+ }
+]
