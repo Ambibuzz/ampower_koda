@@ -30,6 +30,7 @@ from ampower_koda.agent.git_ops import (
     create_pull_request,
     worktree_signature,
 )
+from ampower_koda.agent import hd_client
 
 DOCTYPE_NAME = "Agent Request"
 
@@ -919,6 +920,29 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
             " | ".join(summary_parts) or "Deploy completed",
             **extra,
         )
+
+        if doc.source_hd_ticket and (branch_name or pr_url):
+            try:
+                lines = ["Hi,", "", "We've made progress on your request."]
+
+                change_summary = (doc.change_summary or "").strip()
+                if change_summary:
+                    change_summary = re.sub(r"(?m)^task[-_]?\d+:\s*", "- ", change_summary)
+                    lines += ["", "Summary of changes:", change_summary]
+
+                tech_lines = []
+                if branch_name:
+                    tech_lines.append(f"- Branch: {branch_name}")
+                if pr_url:
+                    tech_lines.append(f"- Pull request: {pr_url}")
+                if tech_lines:
+                    lines += ["", "Technical details:"] + tech_lines
+
+                hd_client.set_pending_draft_reply(
+                    doc.source_hd_ticket, "\n".join(lines)
+                )
+            except Exception:
+                log_agent_error("Agent Deploy Error", frappe.get_traceback())
 
     except Exception as e:
         tb = frappe.get_traceback()

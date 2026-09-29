@@ -93,6 +93,43 @@ def fetch_hd_ticket(ticket_id: str) -> dict:
         "description": _strip_html(description or ""),
     }
 
+def set_pending_draft_reply(ticket_id: str, content: str) -> None:
+    """Stages a suggested reply as HD Ticket.custom_koda_pending_draft, for
+    the agent portal to surface as an 'Insert as draft' banner -- never
+    posted or emailed automatically.
+    """
+    mode, base_url, api_key, api_secret = _get_hd_config()
+
+    if mode == "Same Site":
+        if not frappe.db.exists("HD Ticket", ticket_id):
+            raise HDNotFoundError(ticket_id)
+        frappe.db.set_value("HD Ticket", ticket_id, "custom_koda_pending_draft", content)
+        frappe.db.commit()
+    else:
+        if not (base_url and api_key and api_secret):
+            frappe.throw(
+                _("Helpdesk connection is not configured. Set HD Base URL, "
+                  "API Key and API Secret in Agent Settings.")
+            )
+
+        url = f"{base_url}/api/resource/HD Ticket/{ticket_id}"
+        headers = {"Authorization": f"token {api_key}:{api_secret}"}
+        payload = {"custom_koda_pending_draft": content}
+
+        try:
+            response = requests.put(url, json=payload, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            frappe.throw(_("Could not reach Helpdesk: {0}").format(e))
+
+        if response.status_code == 404:
+            raise HDNotFoundError(ticket_id)
+        if response.status_code != 200:
+            frappe.throw(
+                _("Helpdesk returned an error setting pending draft ({0}): {1}").format(
+                    response.status_code, response.text[:500]
+                )
+            )
+
 def post_ticket_comment(ticket_id: str, content: str) -> None:
     """Posts an internal HD Ticket Comment (never emailed to the customer).
     Used for staging a suggested reply an agent can review and choose to
