@@ -1,167 +1,188 @@
-# Ampower Koda- AI Coding Agent for Frappe
+# Ampower Koda: AI Coding Agent for Frappe
 
-AI Coding Agent for Frappe apps. Describe a bug fix, feature request, or improvement -- the agent reads the target app codebase, creates a plan, implements the changes, and opens a pull request on GitHub.
+Koda builds changes to your Frappe apps from a plain-language request. It investigates the app, proposes a plan for you to approve, implements it, checks the result against your live site, and opens a pull request on GitHub. You approve every step that changes anything.
 
 
 ## Key Features
 
-- **Live Monitoring**: Track agent progress in real-time with an auto-scrolling log console and visual status dashboard.
-- **Human-in-the-loop**: Full control over every phase. Review and edit implementation plans and bench commands before they run.
-- **Smart Exploration**: Powered by LangGraph, the agent performs deep codebase analysis to minimize hallucinations.
-- **Koda IDE**: Browse the changed files, edit code in a built-in editor, view diffs, and save, deploy, or push changes without leaving Frappe.
-- **Git Native**: Automatically manages branches and creates clean Pull Requests on GitHub.
-- **Multi-Model Support**: Choose between OpenAI, Google Gemini, or Anthropic Claude.
+- **Tested on your site**: Koda checks the real database schema, runs the endpoints it wrote, runs tests and opens pages in a headless browser before it reports done.
+- **Human in the loop**: you approve the plan, the bench commands and the push. Plans can be edited or revised with feedback before anything is written.
+- **Independent review**: a separate review checks every acceptance criterion against the current source and the test results, and sends defects back for repair.
+- **One continuous session**: investigation, planning, implementation and review share one cached conversation, which keeps context and cost down.
+- **Koda IDE**: browse the changed files, edit them, view diffs, deploy and push without leaving Frappe.
+- **Git native**: every request works on its own branch and ends in a pull request.
+- **Live monitoring**: a status dashboard and live log show each step, with token, cache and cost figures.
+- **Multiple providers**: OpenAI, Google Gemini, Anthropic Claude and OpenRouter.
 
-
-## Installation
-```
-cd frappe-bench
-bench get-app ampower_koda
-bench --site your-site install-app ampower_koda
-bench migrate
-bench restart
-```
 
 ## Requirements
 
-- Frappe v15 or later
+- Frappe v15 or v16
 - Python 3.10+
-- One of: OpenAI API key, Google AI Studio (Gemini) API key, or Anthropic (Claude) API key
-- GitHub personal access token with repo scope
+- Node.js 18.18+ and npm
+- An API key for OpenAI, Google AI Studio (Gemini), Anthropic (Claude) or OpenRouter
+- A GitHub personal access token with repo scope
+- On Linux, sudo once, for the browser's system libraries
 
-Python dependencies :
 
-- langchain
-- langgraph
+## Installation
+
+```
+cd frappe-bench
+bench get-app ampower_koda                          # Python packages, Playwright included
+cd apps/ampower_koda && npm ci && cd ../..          # ESLint, for JavaScript checks
+bench --site your-site install-app ampower_koda     # also downloads Chromium (about 150 MB)
+bench restart
+```
+
+On Linux, install the browser's system libraries once:
+
+```
+cd frappe-bench
+sudo ./env/bin/playwright install-deps chromium
+```
+
+When a request starts, Koda names any check this bench cannot run yet. Those checks are reported as unavailable, and everything else works.
+
+### Updating
+
+```
+cd frappe-bench/apps/ampower_koda
+git pull
+npm ci
+cd ../..
+bench setup requirements --python
+bench migrate                                       # also downloads Chromium if it is missing
+bench restart
+```
+
+### Using a separate Playwright install
+
+Set `KODA_PLAYWRIGHT_PYTHONPATH` (its site-packages) and `PLAYWRIGHT_BROWSERS_PATH`, or `KODA_VERIFICATION_LAB` to a directory holding `python/` and `browsers/`. Koda then uses that install and skips the Chromium download.
 
 
 ## Setup
 
-1. Open Agent Settings from the search bar.
-2. Check Enable AI Agent.
-3. Enter your API key for the provider you want to use (OpenAI, Gemini, or Claude).
-4. Optionally set a default provider and model.
+1. Open **Agent Settings** from the search bar.
+2. Check **Enable AI Agent**.
+3. Enter the API key for your provider.
+4. Optionally set a default provider and model. With OpenAI, the model list is loaded live from your account, newest first.
 5. Save.
-
-
-## How It Works
-
-Each request goes through a multi-step pipeline with human approval gates. You can monitor the progress in real-time via the **Live Log Panel** and the visual **Status Dashboard** at the top of each request.
-
-    1. Explore    -- agent reads the target app codebase
-    2. Plan       -- agent creates a detailed implementation plan
-    3. Review     -- you review and optionally edit the plan, then approve
-    4. Implement  -- agent writes the code changes
-    5. Verify     -- agent reviews its own implementation
-    6. Bench      -- you see the exact bench commands and approve them
-    7. Push       -- you review branch details and approve the push
-    8. Done       -- pull request is created on GitHub
 
 
 ## Creating a Request
 
-1. Go to Agent Request list (search for it or find it under the AI Agents module).
-2. Click New.
-3. Fill in:
-   - Title -- short summary of what you need.
-   - Type -- Bug Fix, Feature Request, or Improvement.
-   - Description -- detailed explanation of the change.
-   - Provider and Model -- pick your AI provider and model.
-   - Target App Name -- the Frappe app directory name (e.g. ampower_task_manager).
-   - GitHub Repo URL -- full URL of the repository.
-   - GitHub Token -- personal access token.
-   - Base Branch -- the branch to base changes on (e.g. develop or main).
-4. Save the document.
-5. Click Start Agent.
+1. Open the **Agent Request** list and click **New**.
+2. Fill in:
+   - **Title**: a short summary.
+   - **Type**: Bug Fix, Reports & analytics, DocTypes & data model, Forms & desk UI, Server & business logic, Documents & output, Integrations, Platform & maintenance or ERPNext-flavored.
+   - **Description**: what you need, in as much detail as you have.
+   - **Provider and Model**.
+   - **Target App Name**: the app's directory name (e.g. `ampower_task_manager`).
+   - **GitHub Repo URL**, **GitHub Token** and **Base Branch**.
+3. Save, then click **Start Agent**.
 
-### Persistence
-The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in Agent Settings as the encrypted default).
+Your target app, repository, provider, model, base branch, branch prefix and Git identity are remembered and pre-filled on your next request. The GitHub token is not; enter it on each request or store it in Agent Settings as the encrypted default.
 
-## Approval Steps
 
-Plan Approval:
-After the agent explores the codebase and creates a plan, the status changes to Awaiting Approval. Read the plan in the Agent Plan section. You can edit it directly -- it is a Markdown editor. Click Approve Plan to proceed, or Reject Plan to cancel.
+## How It Works
 
-Bench Command Approval:
-After implementation and code review, the agent computes which bench commands are needed (migrate, build, clear-cache, restart). The status changes to Awaiting Bench Approval. Each command is shown as an **editable checklist** -- you can uncheck commands you want to skip, or edit the command strings directly before approving them.
+    1. Investigate  -- Koda reads the app and, where useful, looks at real records
+    2. Plan         -- tasks, files and acceptance criteria         (Awaiting Approval)
+    3. Implement    -- Koda writes the change on its own branch
+    4. Verify       -- tests, endpoint calls and browser checks; failures are repaired
+    5. Review       -- an independent review of every criterion; defects go back to repair
+    6. Bench        -- you approve the bench commands               (Awaiting Bench Approval)
+    7. Push         -- you approve the push                         (Awaiting Push Approval)
+    8. Done         -- the pull request is open on GitHub
 
-Push Approval:
-After bench commands run and changes are committed to a branch, the status changes to Awaiting Push Approval. You can test the changes on your instance first. Review the branch and repository details, then click Approve Push to commit, push, and create the pull request.
+If repair cannot fix everything, the work is still delivered, with the open findings marked **UNRESOLVED** in the change summary.
+
+
+## Approvals
+
+**Plan.** Read the plan in the Agent Plan section. Edit it directly, or click **Revise Plan** and describe what to change. Then **Approve Plan** or **Reject Plan**. Each task names the files it changes and the criteria it must meet.
+
+**Bench commands.** Koda lists the commands the change needs (migrate, build, clear-cache, restart) as an editable checklist. Untick or edit them, then approve.
+
+**Push.** Test the change on your site first. Then **Approve Push** to commit, push and open the pull request, or **Reject Push**.
+
+### Other actions
+
+- **Submit Follow-up Fix**: describe what is still wrong after delivery; Koda continues on the same branch.
+- **Resume Execution**: continue a failed or cancelled run from its last checkpoint.
+- **Re-run Agent**: start the request over.
+- **Execute Existing Plan**: implement the saved plan without investigating again.
+- **Checkout Base Branch**: discard this request's uncommitted changes and return to the base branch. Changes that belong to another request or to you are never discarded.
+- **Cancel**: stop a running request.
+
+Each target app has one checkout, so a new request cannot start while another request's uncommitted work is checked out. Finish, push or check out the base branch on that request first.
+
+
+## Verification
+
+Koda proves a change by running it, not by reading it:
+
+- **call_method** runs a function of the app, or a read-only database query, on the live site as Administrator.
+- **run_tests** runs the tests in the target app's `.koda/tests` (Python `unittest` against the live site, and Node `*.test.cjs`) plus any integration commands in `.koda/verification.json`.
+- **check_page** opens a page or form in a headless browser, drives its controls and reports errors, failed calls and what is shown.
+
+While these run, database writes are rolled back; file writes, background jobs and email are discarded; and commits and child processes are refused. Calls to external services are not contained, so Koda does not run functions that post to them. Tests must call the real code and may patch only external services; a test that patches the module it tests is rejected. A test that passes is kept as a regression test.
+
+
+## Cost and Usage
+
+Each request records its tokens, cache reads and estimated cost. OpenRouter reports the billed cost directly. For other providers the cost is estimated from token usage at list prices; a model without a known price shows 0. When a request passes its spend limit, Koda logs it and keeps less evidence in context.
+
+
+## Configuration
+
+Per-app settings live in the target app's `.koda/config.toml`:
+
+```toml
+[context]
+input_tokens = 150000   # working context budget for every phase
+
+[rerank]
+enabled = true          # rank code with a dedicated reranker; uses the OpenRouter key in Agent Settings
+model = "cohere/rerank-v3.5"
+```
+
+Without an OpenRouter key, retrieval uses local ranking only.
+
+### Custom prompts
+
+To override Koda's instructions for one request, open the **Prompts** tab, uncheck **Use Default Prompts** and add rows for System, Understand, Plan, Implement, Review or Follow-up prompts. Any prompt you do not override uses the default.
+
+
+## Koda IDE
+
+Once a request has a branch or a diff, choose **Open Koda IDE** from the Actions menu to:
+
+- browse the changed files, with added, modified and deleted badges;
+- edit any file in a code editor with light and dark themes;
+- switch between **Code** and **Diff** views;
+- **Save** edits to the request's branch;
+- **Deploy** the selected bench commands;
+- **Push** the branch and open the pull request.
 
 
 ## Compliance
 
-Our AI Agent operations are designed with strict compliance and security measures in mind. All sensitive tokens are securely stored and encrypted, and every action requires explicit human approval to ensure full oversight.
+Tokens are stored encrypted, secret files are never shown to the model, and every change to your site or repository needs explicit approval.
 
 <img width="854" height="480" alt="1775651869174" src="https://github.com/user-attachments/assets/f39d1226-ab20-49f8-8d2c-d279f463faf2" />
 
 
-## Buttons Available at All Times
-
-These buttons appear in the Actions dropdown whenever the agent is not actively running:
-
-- Checkout Base Branch -- switch back to the base branch and discard uncommitted changes.
-- Run Bench Commands -- manually run migrate, build, clear-cache, and restart.
-- Re-run Agent -- start over from scratch (explore, plan, implement).
-- Execute Existing Plan -- skip exploration and use the existing plan.
-
-
-## Configuration Fields
-
-Each request carries its own configuration:
-
-- Target App Name -- directory name of the Frappe app to modify.
-- GitHub Repo URL -- https://github.com/org/repo format.
-- GitHub Token -- personal access token (stored encrypted).
-- Base Branch -- branch to base changes on.
-- Branch Prefix -- prefix for agent-created branches (default: ai-agent/).
-- Git User Name / Email -- identity for commits.
-
-These fields (except the GitHub Token) are remembered across requests using user settings.
-
-
-## Custom Prompt Configuration
-
-For advanced use cases, you can override the agent's default logic on a per-request basis:
-
-1. Open an **Agent Request**.
-2. Go to the **Prompts** tab.
-3. Uncheck **Use Default Prompts**.
-4. In the **Custom Prompts** table, add one or more overrides:
-   - **System Prompt**: Global identity and constraints.
-   - **Understand Prompt**: How the agent explores the codebase.
-   - **Plan Prompt**: How the agent synthesizes findings into a task list.
-   - **Implement Prompt**: Instructions for the file-editing phase.
-   - **Review Prompt**: Criteria for self-review and verification.
-
-If a prompt type is not explicitly added to the table, the agent will fall back to its internal system default for that phase.
-
-## Koda IDE
-
-Once a request has an agent branch or a generated diff, open the **Koda IDE** from the Actions dropdown on the Agent Request (**Open Koda IDE**). The IDE lets you:
-
-- Browse the changed files in a file explorer, with change badges (added / modified / deleted).
-- Edit any file in a full code editor with syntax highlighting and a light/dark theme toggle.
-- Switch between **Code** and **Diff** views to inspect exactly what changed.
-- **Save** edits directly to the agent branch on disk.
-- **Deploy** the selected bench commands (migrate, build, clear-cache, restart).
-- **Push** the branch and create a pull request on GitHub.
-
-Open tabs can be closed via the close (×) control that appears on hover.
-
 ## Data Security
 
-Please note that we use LLMs, and the data (repositories) will be processed by an LLM. We do not consider this a data security concern, as this is how agentic workflows typically operate. To perform tasks on your data, the LLM must be able to access and read the relevant information. Appropriate security controls and data handling practices should still be followed to ensure the protection of sensitive information.
+Koda sends the code it reads to the AI provider you choose; an agent cannot work on code it cannot read. Apply your usual controls for sensitive repositories.
 
-## Supported AI Providers
-
-1. OpenAI
-2. Google
-3. Anthropic
 
 ## In-App Help
 
-For more detailed guidance and tips, search for **Koda Docs** in your Frappe search bar.
+Search for **Koda Docs** in the Frappe search bar.
+
 
 ## License
 

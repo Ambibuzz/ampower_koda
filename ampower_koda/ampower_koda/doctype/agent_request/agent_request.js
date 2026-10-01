@@ -453,7 +453,36 @@ function style_form(frm) {
 // of how that request was run, and rewriting it on open would edit history.
 function set_model_options_for_provider(frm, reset) {
     var provider = frm.doc.ai_provider || 'OpenAI';
-    var entries = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
+    with_provider_models(provider, function (entries) {
+        // The provider may have changed while the list was loading.
+        if ((frm.doc.ai_provider || 'OpenAI') === provider) apply_model_options(frm, provider, entries, reset);
+    });
+}
+
+// OpenAI's models are listed live (newest first, cached server-side), so a new
+// model is offered without a code change; the built-in list is the fallback.
+function with_provider_models(provider, done) {
+    var fallback = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
+    if (provider !== 'OpenAI') return done(fallback);
+    if (window.koda_live_models) return done(window.koda_live_models);
+    frappe.call({
+        method: 'ampower_koda.agent.api.get_provider_models',
+        args: { provider: provider },
+        callback: function (r) {
+            var ids = (r.message || {}).models || [];
+            if (!ids.length) return done(fallback);
+            var labels = {};
+            fallback.forEach(function (m) { labels[m.value] = m.label; });
+            window.koda_live_models = ids.map(function (id) {
+                return { value: id, label: labels[id] || (id + ': live from OpenAI') };
+            });
+            done(window.koda_live_models);
+        },
+        error: function () { done(fallback); }
+    });
+}
+
+function apply_model_options(frm, provider, entries, reset) {
     var model_ids = entries.map(function (m) { return m.value; });
     var current = frm.doc.ai_model || '';
     var settings_model = default_model_for(frm, provider);
@@ -472,9 +501,11 @@ function set_model_options_for_provider(frm, reset) {
         frm.set_value('ai_model', settings_model);
     }
 
-    var desc = entries.map(function (m) {
-        return '<b>' + m.value + '</b>: ' + m.label.split(': ')[1];
-    }).join(' &nbsp;|&nbsp; ');
+    var desc = entries === window.koda_live_models
+        ? __('Live list from OpenAI, newest first ({0} models).', [entries.length])
+        : entries.map(function (m) {
+            return '<b>' + m.value + '</b>: ' + m.label.split(': ')[1];
+        }).join(' &nbsp;|&nbsp; ');
     frm.set_df_property('ai_model', 'description', desc);
 }
 

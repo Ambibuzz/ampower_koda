@@ -3,6 +3,7 @@
 # execution setup and the independent review. session.py runs a request through
 # them as one conversation; bench and deploy run in executor.py.
 
+import ast
 import hashlib
 import html
 import json
@@ -173,6 +174,37 @@ CLIENT_SOURCE_SUFFIXES = (".js", ".css", ".html", ".vue")
 def _server_calls(app_name: str, source: str) -> list[str]:
     """Dotted whitelisted-method paths of this app that a client source calls."""
     return _re.findall(rf"\b{_re.escape(app_name)}(?:\.[A-Za-z_][A-Za-z0-9_]*)+", source or "")
+
+
+def _whitelisted_functions(source: str | None) -> dict[str, str]:
+    """Module-level @frappe.whitelist functions of a Python source: name -> source text."""
+    if not source:
+        return {}
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    return {node.name: ast.get_source_segment(source, node) or ""
+            for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any("whitelist" in ast.unparse(decorator) for decorator in node.decorator_list)}
+
+
+def _uncalled_whitelisted(app_name: str, baseline: dict, changed_paths: list[str], read_current,
+                          called: list[str]) -> list[str]:
+    """Dotted paths of whitelisted methods this execution added or changed that call_method never ran."""
+    missing = []
+    for path in changed_paths:
+        if not path.endswith(".py") or "/.koda/" in f"/{path}" or path.rsplit("/", 1)[-1].startswith("test"):
+            continue
+        before = _whitelisted_functions(baseline.get(path))
+        module = path[:-3].replace("/", ".")
+        for name, text in _whitelisted_functions(read_current(path)).items():
+            if before.get(name) == text:
+                continue
+            dotted, tail = f"{app_name}.{module}", f"{module.rsplit('.', 1)[-1]}.{name}"
+            if not any(m == f"{dotted}.{name}" or m.endswith("." + tail) for m in called):
+                missing.append(f"{dotted}.{name}")
+    return missing
 # Room to write a whole file in one call, with the reasoning that precedes it.
 # Output is billed as generated, so a high ceiling costs nothing unused.
 MODEL_ROUND_OUTPUT_TOKENS = 32000
@@ -886,7 +918,7 @@ def _request_spend_pressure(state: dict, request_name: str) -> str:
 
 def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_moves=None,
                 delete_paths=(), verification_contract=None, verification_observer=None, copied_files=None,
-                session=None, reader=None):
+                called_methods=None, session=None, reader=None):
     """Build LangChain tools bound to a specific app_name.
 
     The catalogue is the same in every phase (tools precede messages in cache keys),
@@ -1086,6 +1118,8 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         kwargs, problem = _json_object_argument(arguments, "arguments")
         if problem:
             return "CALL_FAILED: " + problem
+        if called_methods is not None:  # a traceback is still a run: review asks only about methods never run
+            called_methods.append(method.strip())
         return verification.call_method(app_name, method, kwargs, env=_get_bench_env(),
                                         limit=READER_INPUT_CHARS if purpose.strip() else verification.MAX_CALL_OUTPUT)
 
@@ -2135,6 +2169,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             verification_contract = _prepare_verification_contract(state)
             checkpoint.update(verification_contract=verification_contract)
         copied_files = dict(state.get("copied_files") or {})
+        called_methods = list(state.get("called_methods") or [])
         reader = tool_reader(provider, model, request_name)
         tools = _make_tools(
             app_name, read_only=read_only_tools,
@@ -2143,6 +2178,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             verification_contract=verification_contract,
             verification_observer=observe_verification,
             copied_files=copied_files,
+            called_methods=called_methods,
             session=session,
             reader=reader,
         )
@@ -2185,6 +2221,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             "_write_baseline": before,
             "_file_moves": file_moves,
             "copied_files": copied_files,
+            "called_methods": called_methods,
             "verification_contract": verification_contract,
             'verification_progress': verified['value'],
             'verification_receipts': verified['receipts'],
@@ -2554,7 +2591,7 @@ def prepare_execution_node(state: dict) -> dict:
             "plan_object": plan, "execution_tasks": tasks,
             "task_results": [], "execution_baseline": {},
             "file_moves": list(state.get("prior_file_moves") or []) if state.get("is_follow_up") else [], "plan_amendments": 0,
-            "copied_files": {}, "test_repair_rounds": 0,
+            "copied_files": {}, "called_methods": [], "test_repair_rounds": 0,
             "plan_scope_repairs": scope_repairs,
             "task_completion": {}, "turn_exhausted": False,
             "review_attempts": 0, "review_notes": "", "review_passed": False,
@@ -3164,6 +3201,16 @@ def review_node(state: dict) -> dict:
             path: revision(reviewed_content.get(path)) for path in paths
         }, ensure_ascii=True)
         prompt += "\n\n## STATIC CHECKS\n" + health.summary()
+        uncalled = _uncalled_whitelisted(state["target_app_name"], baseline, changed_paths,
+                                         lambda p: reviewed_content.get(p, _read_current(state, p)),
+                                         list(state.get("called_methods") or []))
+        if uncalled:
+            prompt += (
+                "\n\n## CHANGED WHITELISTED METHODS NEVER RUN\n" + "\n".join(f"- {m}" for m in uncalled)
+                + "\nNo call_method in this request ran these. Run each one with call_method before judging a "
+                "criterion that depends on it (what it returns, who may call it, what it refuses); one that posts "
+                "to an external service is the exception. A criterion that depends on a method nobody ran is "
+                "unmet: say it was not run.")
         prompt += "\n\n## EXECUTED BEHAVIORAL CHECKS\n" + json.dumps(
             _model_receipts(updates.get("verification_receipts", [])), ensure_ascii=True)
         prompt += (

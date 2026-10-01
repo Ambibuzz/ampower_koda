@@ -16,7 +16,7 @@ from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.execution_contract import load_plan, read_snapshot
 from ampower_koda.agent import session as koda_session
 from ampower_koda.agent import tools as agent_tools
-from ampower_koda.agent import verification
+from ampower_koda.agent import render_check, verification
 from ampower_koda.agent.checkpoint import ExecutionJournal, restore_checkpoint, cleanup_temporaries
 from ampower_koda.agent.run_control import (
     managed_job, current_run, check_active, set_request_value, run_context, RunStopped,
@@ -393,7 +393,10 @@ def run_planning_phase(request_name: str, plan_feedback: str = "") -> None:
             )
             if revert_msg:
                 _update_status(request_name, user, "Queued", revert_msg)
-            _update_status(request_name, user, "Understanding", "Exploring codebase...")
+            gaps = render_check.missing_tooling()
+            _update_status(request_name, user, "Understanding", "Exploring codebase..." + (
+                " Some checks will end UNRESOLVED until this bench is set up: " + "; ".join(gaps) + "."
+                if gaps else ""))
 
         graph = koda_session.build_planning_graph()
         initial = {

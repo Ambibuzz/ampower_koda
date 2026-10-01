@@ -1009,6 +1009,14 @@ def validate_code(app_name: str, path: str) -> str:
                 )
                 return f"VALIDATION_ERROR: {e}"
 
+        elif path.endswith(".json"):
+            # The review's own check: parses, and a Frappe record carries the keys migrate needs.
+            from ampower_koda.agent.checks import _json_checks
+            failed = [r for r in _json_checks(app_name, [path]) if not r.passed]
+            if failed:
+                return f"JSON_ERROR in {path}: {failed[0].detail}"
+            return f"VALID: {path} is valid JSON with the keys its record type needs."
+
         return f"SKIP: Validation not supported for this file type: {path}"
     except Exception as ex:
         return _tool_error("validate_code", ex, f"VALIDATION_FAILED: Error: {ex}")

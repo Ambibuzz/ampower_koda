@@ -40,6 +40,7 @@ class AgentState(TypedDict, total=False):
     execution_baseline: dict  # path -> content before this execution wrote it; review diffs against it
     file_moves: list[dict]  # verified source/destination pairs reported by the rename tool
     copied_files: dict  # destination -> reference for copy_file copies; rewritten only by edits
+    called_methods: list[str]  # dotted paths call_method ran in this execution; review lists changed ones never run
     test_repair_rounds: int  # repairs failing tests have triggered; past the limit they are reported
     task_completion: dict
     task_summary: str

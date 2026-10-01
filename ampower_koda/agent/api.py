@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 from functools import wraps
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from ampower_koda.agent.execution_contract import load_plan
 from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdown
 from ampower_koda.agent.executor import (
     _generate_patch_diff,
+    _is_request_branch,
+    _uncommitted_paths,
     _update_status,
     bench_branch_refusal,
     normalize_bench_selection,
@@ -673,6 +676,22 @@ def checkout_base_branch(request_name: str):
     if not app_name:
         frappe.throw(_("Target App Name is not set."))
 
+    # checkout_base resets and cleans whatever is checked out. Uncommitted work
+    # is discarded only on this request's own branch: anywhere else it is another
+    # request's pending implementation or the user's own work.
+    current = get_current_branch(app_name)
+    own = current != base_branch and _is_request_branch(
+        current, request_name, (doc.branch_prefix or "ai-agent/").strip(), (doc.branch_name or "").strip())
+    if not own:
+        dirty = _uncommitted_paths(get_repo_root(app_name))
+        if dirty:
+            shown = ", ".join(dirty[:10]) + (f" (and {len(dirty) - 10} more)" if len(dirty) > 10 else "")
+            frappe.throw(_(
+                "Branch '{0}' has uncommitted changes that do not belong to this request: {1}. "
+                "Open the request that owns that branch and check out the base branch there, or commit "
+                "or stash the changes. Nothing was discarded."
+            ).format(current or "(unknown)", shown))
+
     ok, msg = checkout_base(app_name, base_branch)
     if not ok:
         # Recorded too: a failure can come after the reset already discarded work,
@@ -801,6 +820,54 @@ def get_model_defaults():
         "provider": (settings.default_ai_provider or "OpenAI").strip(),
         "model": (settings.default_ai_model or "").strip(),
     }
+
+
+# Tool-calling text families on /v1/models; everything else there (embeddings, audio, images,
+# moderation, legacy completions, chatgpt-* without tool calls) cannot drive Koda.
+_OPENAI_CHAT_MODEL = re.compile(r"^(gpt-(?!3)|o\d|codex)")
+_OPENAI_NOT_CHAT = re.compile(r"audio|realtime|transcribe|tts|image|search|embedding|moderation|instruct")
+_OPENAI_SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")  # dated pins of an alias that is listed anyway
+OPENAI_MODELS_CACHE_SECONDS = 6 * 3600
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def get_provider_models(provider: str = "OpenAI", refresh: int = 0):
+    """The provider's current models, newest first, for the model pickers.
+
+    Only OpenAI is listed live (GET /v1/models with the key in Agent Settings),
+    so a new model is offered the day it ships instead of after a code change.
+    Any other provider, or a failed fetch, returns no models and the form keeps
+    its built-in list. Model ids only; no secrets are returned.
+    """
+    if not (frappe.has_permission(DOCTYPE_NAME, "read") or frappe.has_permission("Agent Settings", "read")):
+        frappe.throw(_("Not permitted to list models."), frappe.PermissionError)
+    if (provider or "").strip() != "OpenAI":
+        return {"models": []}
+    cache_key = "koda:openai_models"
+    if not int(refresh or 0):
+        cached = frappe.cache().get_value(cache_key)
+        if cached:
+            return {"models": cached}
+    settings = frappe.get_single("Agent Settings")
+    api_key = settings.get_password("openai_api_key", raise_exception=False) or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {"models": [], "error": "No OpenAI API key in Agent Settings."}
+    base_url = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    try:
+        import requests
+
+        response = requests.get(f"{base_url}/models", headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+        response.raise_for_status()
+        rows = response.json().get("data") or []
+    except Exception as exc:  # noqa: BLE001 -- the form falls back to its built-in list
+        return {"models": [], "error": f"Could not list OpenAI models: {type(exc).__name__}"}
+    models = [row["id"] for row in sorted(rows, key=lambda row: int(row.get("created") or 0), reverse=True)
+              if isinstance(row.get("id"), str) and _OPENAI_CHAT_MODEL.match(row["id"])
+              and not _OPENAI_NOT_CHAT.search(row["id"]) and not _OPENAI_SNAPSHOT.search(row["id"])]
+    if models:
+        frappe.cache().set_value(cache_key, models, expires_in_sec=OPENAI_MODELS_CACHE_SECONDS)
+    return {"models": models}
 
 
 @frappe.whitelist()

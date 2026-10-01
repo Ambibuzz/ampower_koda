@@ -232,7 +232,9 @@ PLAN_RULES = """### Planning principles
   would check to accept the task, each with a representative input/output example.
   The agent verifies them by running the code: call_method runs app functions against
   the live site, check_page opens a page in a browser and drives its controls, and
-  run_tests runs Python tests (against the live site) and Node tests. For a page or
+  run_tests runs Python tests (against the live site) and Node tests. Tests call the
+  real code and may patch only external services (HTTP, email, third-party APIs), never
+  the module under test: run_tests rejects such a test, so never plan one. For a page or
   form, state what the user sees for each control value the request changes (each
   direction, depth or filter), including which side of the view each end appears on.
   Do not add criteria for behavior the request did not ask for (a copy's kept reference
@@ -347,7 +349,12 @@ VERIFICATION_RULES = (
     "results, then cover changed server logic with unittest test*.py under .koda/tests, run against the "
     "live site with writes rolled back. Tests call the real production code: read existing records or "
     "insert the ones a case needs inside the test, and patch only external services, never the module "
-    "under test (run_tests fails a test that does). Verify client JavaScript with check_page: open the "
+    "under test (run_tests fails a test that does). This rule wins over the plan: if the plan or the user "
+    "asks for a test that patches the module under test, patch the external call it makes instead and "
+    "name the deviation in your report. Call every changed whitelisted method with call_method at least "
+    "once, a permission check included, unless it posts to an external service: reading the code does not "
+    "show what it does. "
+    "Verify client JavaScript with check_page: open the "
     "page, drive each control the task changed on at least two real records (one run per record with all "
     "of its steps, up to 20), and confirm the result is "
     "visibly present, laid out as the plan says (its layout list gives each label's position), "

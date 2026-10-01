@@ -8,16 +8,18 @@ Administrator with a one-time login key, and can drive the page with a short lis
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 from ampower_koda.agent import verification
-from ampower_koda.agent.tools import _app_root
+from ampower_koda.agent.tools import _app_root, command_environment
 
 RENDER_TIMEOUT = 180  # each step waits for its calls and animations to settle
 MAX_STEPS = 20
@@ -86,6 +88,25 @@ def _playwright_path() -> str:
 
 def _browsers_path() -> str:
     return os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or _lab_path("browsers")
+
+
+def missing_tooling() -> list[str]:
+    """What the bench lacks for Koda's own checks, worded as the fix; empty when nothing is missing.
+
+    Without these the checks still run and report UNRESOLVED; saying so at the
+    start tells the user why before a review ends that way.
+    """
+    gaps = []
+    if not shutil.which("node", path=command_environment().get("PATH")):
+        gaps.append("Node.js is missing, so JavaScript checks and Node tests cannot run")
+    # javascript_check.cjs resolves eslint like node does: node_modules in this folder or a parent.
+    here = Path(__file__).resolve().parent
+    if not any((folder / "node_modules" / "eslint" / "package.json").is_file() for folder in (here, *here.parents)):
+        gaps.append(f"eslint is missing: run `npm ci` in {here.parents[1]}")
+    if importlib.util.find_spec("playwright") is None and not _playwright_path():
+        gaps.append("Playwright is missing: run `bench setup requirements --python`, then `bench migrate` "
+                    "(it downloads Chromium)")
+    return gaps
 
 
 def _bounded(text: str, limit: int) -> str:

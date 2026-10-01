@@ -24,8 +24,9 @@ from ampower_koda.agent.run_control import check_active
 from ampower_koda.agent.query_schema import query_fields
 
 REQUIRED_DOCTYPE_KEYS = ("doctype", "name", "module")
-REQUIRED_REPORT_KEYS = ("doctype", "report_name", "ref_doctype")
-REQUIRED_PAGE_KEYS = ("doctype", "page_name")
+REQUIRED_REPORT_KEYS = ("doctype", "name", "report_name", "ref_doctype", "report_type", "module")
+REQUIRED_PAGE_KEYS = ("doctype", "name", "page_name", "module")
+REQUIRED_PRINT_FORMAT_KEYS = ("doctype", "name", "doc_type", "module")
 
 # Which required-key set applies, keyed by the JSON's own "doctype" value —
 # this is the same field Frappe itself uses to know what kind of record it is.
@@ -33,7 +34,13 @@ _REQUIRED_KEYS_BY_DOCTYPE = {
     "DocType": REQUIRED_DOCTYPE_KEYS,
     "Report": REQUIRED_REPORT_KEYS,
     "Page": REQUIRED_PAGE_KEYS,
+    "Print Format": REQUIRED_PRINT_FORMAT_KEYS,
 }
+
+# A record file Frappe syncs on migrate sits at <kind>/<name>/<name>.json; its
+# folder says what it must be even when the file itself forgot its "doctype".
+_RECORD_FOLDERS = {"doctype": "DocType", "report": "Report", "page": "Page", "print_format": "Print Format"}
+_RECORD_PATH = re.compile(r"(?:^|/)(doctype|report|page|print_format)/([^/]+)/\2\.json$")
 
 
 class CheckResult:
@@ -223,6 +230,13 @@ def _json_checks(app_name: str, paths: list[str]) -> list[CheckResult]:
             results.append(CheckResult(f"json:{path}", False, f"invalid JSON: {e}"))
             continue
 
+        folder = _RECORD_PATH.search(path.replace("\\", "/"))
+        expected = _RECORD_FOLDERS[folder.group(1)] if folder else ""
+        if expected and (not isinstance(data, dict) or data.get("doctype") != expected):
+            found = data.get("doctype") if isinstance(data, dict) else type(data).__name__
+            results.append(CheckResult(f"json:{path}", False,
+                                       f'a {expected} record file needs "doctype": "{expected}" (found {found!r})'))
+            continue
         if not isinstance(data, dict) or "doctype" not in data:
             # Not a Frappe metadata file (e.g. a plain config/data JSON) —
             # valid JSON is all that's expected of it.
@@ -231,6 +245,11 @@ def _json_checks(app_name: str, paths: list[str]) -> list[CheckResult]:
 
         if not isinstance(data["doctype"], str) or not data["doctype"].strip():
             results.append(CheckResult(f"json:{path}", False, "doctype must be a non-empty string"))
+            continue
+        bad_roles = [row for row in data.get("roles") or [] if not (isinstance(row, dict) and row.get("role"))]
+        if bad_roles:
+            results.append(CheckResult(f"json:{path}", False,
+                                       'every "roles" row must be an object with a "role", e.g. {"role": "System Manager"}'))
             continue
         required = _REQUIRED_KEYS_BY_DOCTYPE.get(data["doctype"])
         if required is None:
