@@ -73,13 +73,8 @@ def _number(row, key: str) -> float:
         value = getattr(row, key, 0)
     return max(0.0, float(value or 0))
 
-
-# USD per million tokens: (uncached input, cache read, output, cache write), list prices.
-# A name matches exactly or as a dated snapshot ("gpt-5-mini-2025-08-07" is gpt-5-mini), never
-# by bare prefix: "gpt-5.1-codex-mini" is not gpt-5. A model missing here costs 0.0: an
-# unknown price is not guessed.
 MODEL_PRICES_PER_MILLION = {
-    "gpt-6-luna": (0.125, 0.01, 0.50, 0.125),
+    "gpt-6-luna": (0.10, 0.01, 0.50, 0.125),
     "gpt-5": (1.25, 0.125, 10.00, 1.25),
     "gpt-5-mini": (0.25, 0.025, 2.00, 0.25),
     "gpt-5-nano": (0.05, 0.005, 0.40, 0.05),
@@ -89,7 +84,15 @@ MODEL_PRICES_PER_MILLION = {
     "gpt-4o-mini": (0.15, 0.075, 0.60, 0.15),
     "claude-sonnet-4": (3.00, 0.30, 15.00, 3.75),
     "claude-sonnet-4-5": (3.00, 0.30, 15.00, 3.75),
+    "claude-sonnet-4-6": (3.00, 0.30, 15.00, 3.75),
+    "claude-sonnet-5": (2.00, 0.20, 10.00, 2.50),
+    "claude-opus-4-5": (5.00, 0.50, 25.00, 6.25),
     "claude-haiku-4-5": (1.00, 0.10, 5.00, 1.25),
+}
+
+# Models whose whole request is billed at a higher tier past an input size: (threshold, prices).
+LONG_CONTEXT_PRICES_PER_MILLION = {
+    "gpt-6-luna": (272_000, (0.20, 0.02, 0.75, 0.25)),
 }
 
 
@@ -117,7 +120,6 @@ def estimated_cost(model: str, usage: dict) -> float:
     base = re.sub(r"-\d{4}-?\d{2}-?\d{2}$", "", name)  # a dated snapshot is priced as its model
     if base not in MODEL_PRICES_PER_MILLION or not isinstance(usage, dict):
         return 0.0
-    uncached, read_price, output_price, write_price = MODEL_PRICES_PER_MILLION[base]
     details = usage.get("input_token_details") or {}
     try:
         input_tokens = max(0, int(usage.get("input_tokens") or 0))
@@ -126,6 +128,9 @@ def estimated_cost(model: str, usage: dict) -> float:
         output = max(0, int(usage.get("output_tokens") or 0))
     except (TypeError, ValueError):
         return 0.0
+    threshold, long_prices = LONG_CONTEXT_PRICES_PER_MILLION.get(base, (0, None))
+    prices = long_prices if long_prices and input_tokens > threshold else MODEL_PRICES_PER_MILLION[base]
+    uncached, read_price, output_price, write_price = prices
     fresh = input_tokens - read - write
     return round((fresh * uncached + read * read_price + write * write_price + output * output_price)
                  / 1_000_000, 8)
