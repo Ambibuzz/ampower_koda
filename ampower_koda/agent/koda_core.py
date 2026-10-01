@@ -3,58 +3,58 @@
 
 ``agent/core`` is pure: it imports nothing from ``frappe``, ``langchain`` or
 ``langgraph``, and it reaches no network. Everything it needs from outside
-arrives through four small seams, and this module is all four of them plus the
-one function the graph calls::
+arrives through small interfaces implemented here, plus the explore helper's
+entry point::
 
-    understand(state) -> Understanding
+    understand(question=..., app_name=..., llm=..., provider=...) -> Understanding
 
-**What the core does that the old explore loop did not.** The previous
-understanding node was an LLM with five read tools and a history trimmer. This
-one adds, in the order a turn uses them: a tree-sitter index of the whole app, a
-PageRank'd repo map in the cached prefix, a per-message retrieval pass that runs
-*before* the model says anything, a ranked ``search`` that fuses BM25 with graph
-proximity, an append-only ledger so a finding survives its own tool result, and
-hot/cold elision that turns an old result into ``[search "x" -> L14]`` instead of
-dropping it. The trimmer is replaced by a fold that summarises a turn *before*
-anything is deleted.
+A turn uses a tree-sitter index of the app, a per-message retrieval pass, a
+ranked ``search`` (BM25 plus graph proximity), an append-only ledger, hot/cold
+elision of old results, and a fold that summarises before anything is deleted.
 
-**Four seams, and why each is here rather than there.**
+**Provider and workspace interfaces.**
 
 ``ChatModel``       one provider request per round. Only this class knows what
                     ``cache_control`` is spelled like.
 ``UtilityModel``    the fold and compaction summariser. Optional: without it a
                     session simply never folds, and says so in ``notes``.
+``Reranker``        OpenRouter's dedicated relevance endpoint, used only for the
+                    user's task-context suggestions; agent turns rank locally.
 ``ToolHost``        the tools the core cannot implement against a read-only
-                    workspace. In this phase that is ``read_doctype_schema``
-                    and nothing else — every writing tool is declined, so the
-                    understanding phase is read-only *structurally* rather than
-                    by review.
+                    workspace: only ``read_doctype_schema``. Every writing tool
+                    is declined, so the explore helper is read-only by construction.
 ``Workspace``       already implemented by the core's ``LocalWorkspace``, over
                     the app root Frappe resolves.
 
-**A session is expensive once and free afterwards.** Cold start indexes the app;
-on this repository that is well under a second, but it is not free, and the
-`Session` it produces is a frozen value that carries the index, the map, the
-retriever and the ledger. It cannot go into LangGraph state — that state is
-JSON-persisted — so it lives in a process-local cache keyed by request name, and
-a cache miss simply pays for cold start again. Nothing is *wrong* after a miss;
-it is slower.
+Each explore call starts a fresh conversation. The cold-start build per app root is
+kept (while the checkout is unchanged), so explore, context suggestions and
+starting points share one index instead of each paying a cold start.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
+import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 import frappe
 from ampower_koda.agent.errors import log_agent_error
+from ampower_koda.agent.cache_usage import persist_usage, provider_cost
+from ampower_koda.agent import recovery
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent.prompt_caching import mark_message, native_cache_messages, openai_breakpoints, terminal_model
+from ampower_koda.agent.run_control import check_active, MODEL_TIME_RESERVE
+from ampower_koda.agent.reranking import OpenRouterReranker
+from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
+from ampower_koda.agent.core.budget.request import estimate_messages
+from ampower_koda.agent.core.config.merge import merge_config
+from ampower_koda.agent.core.config.load import CONFIG_PATH, resolve_config
 from ampower_koda.agent.core import (
     ROLE_PROMPT,
     LocalWorkspace,
@@ -64,6 +64,8 @@ from ampower_koda.agent.core import (
     ToolCall,
     ToolOutcome,
     TurnUsage,
+    allocate,
+    brief,
     open_session,
     run_turn,
     search,
@@ -72,7 +74,8 @@ from ampower_koda.agent.core.constants import DEFAULT_ARCHITECT_MODEL
 from ampower_koda.agent.git_ops import get_repo_root, run_git, worktree_signature
 from ampower_koda.agent.core.contracts.escalation import SideUsage
 from ampower_koda.agent.core.contracts.model import Completion
-from ampower_koda.agent.core.retrieval.tokenize import split_words
+from ampower_koda.agent.core.retrieval.excerpts import excerpt
+from ampower_koda.agent.core.retrieval.query import plain_query
 from ampower_koda.agent.core.tools.catalogue import CATALOGUE
 
 #: Frappe doctype the graph's request rows live in.
@@ -99,16 +102,14 @@ DOCTYPE_FIELD_KEYS = ("fieldname", "fieldtype", "label", "options", "reqd")
 #: Rows of a doctype's field table handed back before truncating.
 DOCTYPE_FIELD_ROWS = 200
 
-#: This adapter runs a bounded planning investigation, not an open-ended repo
-#: chat. Independent tools may be emitted together, so sixteen rounds leave
-#: ample room without exposing the core's sixty-round emergency ceiling.
-UNDERSTANDING_MAX_ROUNDS = 16
-UNDERSTANDING_MAX_OUTPUT_TOKENS = 4_096
+#: Rounds for one bounded explore pass: enough to read a feature in full, well
+#: under the core's sixty-round emergency ceiling.
+UNDERSTANDING_MAX_ROUNDS = 24
+#: Reasoning shares this cap with the summary, which may run to ~1200 words.
+UNDERSTANDING_MAX_OUTPUT_TOKENS = 8_192
 
 
-# ---------------------------------------------------------------------------
 # Seam 1 — the conversational model
-# ---------------------------------------------------------------------------
 
 
 class LangChainChatModel:
@@ -119,17 +120,9 @@ class LangChainChatModel:
     class turns that into LangChain messages and turns the reply back into a
     :class:`ModelTurn`.
 
-    **It never raises.** A turn arrives here with up to sixty rounds of reads
-    behind it, and an exception thrown out of round forty-one discards all of
-    them. Every failure becomes ``ModelTurn(failed=True)``, which the loop
-    records as the answer and returns with the session intact.
-
-    **It publishes what it sends.** The realtime feed the Agent Request form
-    reads used to be written by the tool loop, which no longer exists here. The
-    driver is the right replacement: it sees every request, so on each round it
-    publishes the transcript blocks that appeared since the last one. That is
-    strictly more truthful than publishing at call time — what shows in the UI
-    is what the model was actually shown.
+    It never raises: every failure becomes ``ModelTurn(failed=True)``, so the
+    loop keeps the session. Each round it publishes the transcript's new tool
+    blocks to the form's realtime feed.
     """
 
     def __init__(self, llm, provider: str, request_name: str = "", spent: int = 0) -> None:
@@ -137,28 +130,31 @@ class LangChainChatModel:
         self.provider = (provider or "").strip()
         self.request_name = request_name
         self.rounds = 0
+        # Seeded with earlier spend: it is written to the row as the running total.
         self.total_tokens = spent
-        """Seeded with what earlier phases already spent. The number is written
-        straight to the request row, and a phase that started its count at zero
-        would overwrite the running total with its own share of it."""
-
+        # Why the last call failed; session ``notes`` also carry ordinary remarks.
         self.failure = ""
-        """Why the last call failed, for the caller that has to report it.
-
-        Kept here rather than dug out of the turn's ``notes``, which also carry
-        ordinary session remarks — "co-change memory unavailable" is the first
-        of them on any tree without a git log, and reporting *that* as the
-        reason a request failed sends someone to look at the wrong thing."""
-        self._published = 0
+        self._published: set[tuple[str, str]] = set()
+        # Read off the client, so the cache decision uses the id actually called.
         self.model_id = _model_id(llm)
-        """The model, for the cache decision. Read off the client rather than
-        passed in, so it is the id actually being called."""
-        self._bound = llm.bind_tools(_tool_schemas()) if hasattr(llm, "bind_tools") else llm
+        self._schemas = _tool_schemas()
+        self._bound = llm.bind_tools(self._schemas) if hasattr(llm, "bind_tools") else llm
+        self._calibrator = TokenCalibrator()
+        self._request_estimate = 0
+        self._request_limit = 0
+        self._cache_request_kind = "initial"
 
-    # -- the port -----------------------------------------------------------
+    # the port
+
+    def estimate_request(self, request: ModelRequest) -> int:
+        raw = estimate_messages(self._messages(request), self._schemas)
+        return max(raw, self._calibrator.estimate(raw))
 
     def respond(self, request: ModelRequest) -> ModelTurn:
+        check_active(reserve=MODEL_TIME_RESERVE)
         self.rounds += 1
+        self._cache_request_kind = ("forced_final" if request.force_terminal else
+                                    "initial" if self.rounds == 1 else "continuation")
         self._publish_new_blocks(request.transcript)
 
         try:
@@ -166,72 +162,98 @@ class LangChainChatModel:
         except Exception as error:  # pragma: no cover - defensive; see class docstring
             return self._failed("could not build the request", error)
 
-        model = self.llm if request.force_terminal else self._bound
+        self._request_estimate = estimate_messages(messages, self._schemas)
+        self._request_limit = request.input_tokens_limit
+        measured = max(self._request_estimate, self._calibrator.estimate(self._request_estimate))
+        if request.input_tokens_limit and measured > request.input_tokens_limit:
+            return self._failed("context budget exceeded", ValueError(
+                f"estimated {measured:,} input tokens, limit {request.input_tokens_limit:,}"))
+
+        model = (terminal_model(self.llm, self._schemas, self._bound, provider=self.provider)
+                 if request.force_terminal else self._bound)
+        options = {}
+        if self.provider == "OpenRouter":
+            extra = dict(getattr(self.llm, "extra_body", None) or {})
+            session_id = extra.get("session_id") or self.request_name or request.plan.session_id
+            if session_id:
+                options["extra_body"] = {**extra, "session_id": session_id}
+        check_active(reserve=MODEL_TIME_RESERVE)
         try:
-            reply = model.invoke(messages, max_tokens=request.max_tokens)
+            reply = model.invoke(messages, max_tokens=request.max_tokens, **options)
         except TypeError:
             # Not every LangChain provider accepts a per-call max_tokens.
             try:
-                reply = model.invoke(messages)
+                reply = model.invoke(messages, **options)
             except Exception as error:
                 return self._failed("the model call failed", error)
         except Exception as error:
             return self._failed("the model call failed", error)
 
+        check_active()
         return self._turn(reply)
 
-    # -- request ------------------------------------------------------------
+    # request
 
     def _messages(self, request: ModelRequest) -> list:
-        """System blocks, the conversation, then the tail — in that order.
+        """System blocks, then the conversation — in that order.
 
-        The tail is last and is never cached: it is the session state, the
-        ledger and this message's working set, and it changes every round. That
-        asymmetry is the point of the whole cache plan — the expensive stable
-        half sits above a boundary and is read, and the volatile half below it
-        is cheap because it is small.
+        Retrieval and memory snapshots are recorded in history rather than
+        sent as a trailing message, so message-end cache entries stay reusable.
         """
         messages: list = [self._system(request)]
-        messages.extend(_replay(request.transcript))
-        if request.plan.tail:
-            messages.append(HumanMessage(content=request.plan.tail))
-        return messages
+        markers = {}
+        if _takes_cache_control(self.model_id):
+            for marker in (request.plan.previous_marker, request.plan.marker):
+                if marker is not None:
+                    markers[marker.index] = marker.ttl
+        messages.extend(_replay(request.transcript, markers))
+        return native_cache_messages(messages, self.provider)
 
     def _system(self, request: ModelRequest):
         """The system blocks, with a cache breakpoint where the plan asks for one.
 
-        Anthropic takes an explicit ``cache_control`` marker; OpenAI and DeepSeek
-        cache long stable prefixes on their own; everything else gets one plain
-        string. In all three cases the *text* is identical, so the plan's
-        boundaries only ever change the price.
-
-        The choice is made on the **model**, not on the provider name. An
-        Anthropic model reached through OpenRouter is spelled
-        ``anthropic/claude-sonnet-4`` with ``provider == "OpenRouter"``, and
-        keying on the provider sent it the uncached path — so the one model
-        family that *requires* an explicit marker was the one family that never
-        got one, and every round paid full price for the whole prefix.
+        Anthropic uses ``cache_control``; GPT-5.6+ uses explicit system
+        boundaries alongside implicit conversation caching. Older OpenAI and
+        DeepSeek models cache stable prefixes automatically. The choice is made
+        on the model id, so Anthropic models reached through OpenRouter still
+        get ``cache_control``.
         """
         blocks = [block for block in request.plan.blocks if not block.is_empty]
         if not blocks:
             return SystemMessage(content=ROLE_PROMPT)
-        if not _takes_cache_control(self.model_id):
+        openai = openai_breakpoints(self.provider, self.model_id)
+        if not _takes_cache_control(self.model_id) and not openai:
             return SystemMessage(content="\n\n".join(block.text for block in blocks))
 
         content = []
         for block in blocks:
             part = {"type": "text", "text": block.text}
-            if block.breakpoint:
-                part["cache_control"] = {"type": "ephemeral"}
+            if block.breakpoint and block.ttl != "none":
+                if openai:
+                    # Keep implicit caching for the rolling conversation; at
+                    # most two explicit system boundaries plus its latest one.
+                    part["prompt_cache_breakpoint"] = {"mode": "explicit"}
+                else:
+                    part["cache_control"] = {"type": "ephemeral", "ttl": block.ttl}
             content.append(part)
         return SystemMessage(content=content)
 
-    # -- reply --------------------------------------------------------------
+    # reply
 
     def _turn(self, reply) -> ModelTurn:
         usage = _usage(reply)
+        cost = provider_cost(reply)
+        actual_input = usage.input_tokens + usage.cache_read + usage.cache_write
+        self._calibrator = self._calibrator.observe(self._request_estimate, actual_input)
         self.total_tokens += usage.observed
-        _persist_tokens(self.request_name, self.total_tokens)
+        _persist_tokens(
+            self.request_name,
+            self.total_tokens,
+            input_tokens=actual_input,
+            cache_read_tokens=usage.cache_read,
+            cache_write_tokens=usage.cache_write,
+            cost_delta=cost,
+        )
 
         text = _text_of(reply)
         if text:
@@ -245,6 +267,15 @@ class LangChainChatModel:
             output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read,
             cache_write_tokens=usage.cache_write,
+            cache_phase="understanding",
+            cache_request_kind=self._cache_request_kind,
+            cache_read_ratio=round(usage.cache_read / max(1, actual_input), 4),
+            cache_new_input_tokens=max(0, actual_input - usage.cache_read),
+            provider_cost=cost,
+            context_input_tokens=actual_input,
+            context_estimated_tokens=self._request_estimate,
+            input_budget_tokens=self._request_limit,
+            upstream_provider=(getattr(reply, "response_metadata", None) or {}).get("upstream_provider"),
         )
 
         calls = tuple(
@@ -259,7 +290,10 @@ class LangChainChatModel:
             text=text,
             calls=calls,
             usage=usage,
-            stopped_at_limit=_hit_output_limit(reply),
+            stopped_at_limit=recovery.hit_output_limit(reply),
+            provider_context_json=(json.dumps({key: reply.additional_kwargs[key]
+                for key in ('reasoning_details', 'reasoning') if key in getattr(reply, 'additional_kwargs', {})})
+                if any(key in getattr(reply, 'additional_kwargs', {}) for key in ('reasoning_details', 'reasoning')) else ''),
         )
 
     def _failed(self, detail: str, error: Exception) -> ModelTurn:
@@ -270,12 +304,17 @@ class LangChainChatModel:
         )
         return ModelTurn(text=f"[{detail}: {error}]", failed=True, detail=f"{detail}: {error}")
 
-    # -- progress -----------------------------------------------------------
+    # progress
 
     def _publish_new_blocks(self, transcript) -> None:
-        """Publish the transcript blocks added since the previous round."""
-        blocks = transcript.blocks
-        for block in blocks[self._published :]:
+        """Stable call IDs keep progress correct after history shrinks."""
+        for block in transcript.blocks:
+            if block.kind not in ("tool_use", "tool_result"):
+                continue
+            key = (block.kind, block.call_id)
+            if key in self._published:
+                continue
+            self._published.add(key)
             if block.kind == "tool_use":
                 _publish(
                     self.request_name, "tool_call",
@@ -286,10 +325,9 @@ class LangChainChatModel:
                     self.request_name, "tool_result",
                     tool_name=block.tool, result_preview=block.text[:500], round=self.rounds,
                 )
-        self._published = len(blocks)
 
 
-def _replay(transcript) -> list:
+def _replay(transcript, markers=None) -> list:
     """The transcript as LangChain messages, pairs kept together.
 
     A ``tool_use`` block becomes an ``AIMessage`` carrying one tool call, and its
@@ -298,20 +336,26 @@ def _replay(transcript) -> list:
     works right up until the worker restarts, and a resumed session would then
     replay its tool calls with no arguments at all.
 
-    Consecutive calls in one round each get their own ``AIMessage``. One message
-    with several calls is the tidier wire format and it is not worth the risk
-    here: the core emits calls in strict emission order and every provider
-    accepts a one-call-per-message sequence, while grouping requires the driver
-    to reconstruct round boundaries the transcript does not record.
+    Rounds carrying provider reasoning retain their original parallel call group.
+    Legacy transcripts without that metadata keep their one-call message shape.
     """
     messages: list = []
-    for block in transcript.blocks:
+    grouped = set()
+    calls_by_id = {block.call_id: block for block in transcript.blocks if block.kind == 'tool_use'}
+    for index, block in enumerate(transcript.blocks):
+        before = len(messages)
         if block.kind == "tool_use":
-            messages.append(AIMessage(content="", tool_calls=[{
-                "name": block.tool,
-                "args": _arguments(block),
-                "id": block.call_id,
-            }]))
+            if block.call_id in grouped:
+                continue
+            call_blocks = [block]
+            provider_context = {}
+            if block.provider_context_json and block.parallel_call_ids and all(i in calls_by_id for i in block.parallel_call_ids):
+                call_blocks = [calls_by_id[i] for i in block.parallel_call_ids]
+                grouped.update(block.parallel_call_ids)
+                provider_context = json.loads(block.provider_context_json)
+            messages.append(AIMessage(content='', tool_calls=[{
+                'name': call.tool, 'args': _arguments(call), 'id': call.call_id,
+            } for call in call_blocks], additional_kwargs=provider_context))
         elif block.is_result:
             messages.append(ToolMessage(content=block.text or "(no output)",
                                         tool_call_id=block.call_id))
@@ -320,6 +364,8 @@ def _replay(transcript) -> list:
                 HumanMessage(content=block.text) if block.role == "user"
                 else AIMessage(content=block.text)
             )
+        if markers and index in markers and len(messages) > before:
+            messages[-1] = mark_message(messages[-1], markers[index])
     return messages
 
 
@@ -343,11 +389,8 @@ def _arguments(block) -> dict:
 def _tool_schemas() -> list[dict]:
     """The frozen catalogue as provider tool schemas.
 
-    Built from ``CATALOGUE`` and nowhere else. Every parameter is a string here
-    because the core's specs describe parameters positionally — ``"glob?"``,
-    ``"target = anchor|symbol|span"`` — and inventing a JSON-Schema type per
-    parameter would be this module asserting something the catalogue never said.
-    The description carries the real contract, including the caps.
+    Built from ``CATALOGUE`` and nowhere else. Parameters are strings except the
+    ``NUMERIC_PARAMETERS``; the description carries the real contract, including the caps.
     """
     schemas = []
     for spec in CATALOGUE:
@@ -372,7 +415,7 @@ def _tool_schemas() -> list[dict]:
 #: Parameters a provider should send as numbers. Everything else is a string —
 #: the tools coerce, and a schema that guessed richer types than the catalogue
 #: states would be this module asserting something the catalogue never said.
-NUMERIC_PARAMETERS = frozenset({"start", "end"})
+NUMERIC_PARAMETERS = frozenset({"start", "end", "offset"})
 
 
 def _parameter_type(name: str) -> str:
@@ -396,10 +439,8 @@ def _text_of(reply) -> str:
 def _usage(reply) -> TurnUsage:
     """What the round cost, split the way the core's two budgets need it.
 
-    Cache reads are pulled out of the input count rather than left in it. The
-    loop re-sends its whole prefix every round, so a meter that charged reads at
-    full price grew with the square of the round count — an 80k ceiling closed
-    on round four of a nominal sixty.
+    Cache reads and writes are pulled out of the input count, so re-sending the
+    cached prefix each round is not charged at full price.
     """
     metadata = getattr(reply, "usage_metadata", None) or {}
     details = metadata.get("input_token_details") or {}
@@ -414,23 +455,7 @@ def _usage(reply) -> TurnUsage:
     )
 
 
-def _hit_output_limit(reply) -> bool:
-    """Whether the reply stopped because it ran out of output budget.
-
-    Worth detecting rather than ignoring: the loop offers two continuations and
-    then says plainly that it was cut off, and a truncated answer read as a
-    complete one is the failure that makes a cut-off worse than an error.
-    """
-    metadata = getattr(reply, "response_metadata", None) or {}
-    reason = str(
-        metadata.get("finish_reason") or metadata.get("stop_reason") or ""
-    ).lower()
-    return reason in ("length", "max_tokens", "model_length")
-
-
-# ---------------------------------------------------------------------------
 # Seam 2 — the utility model
-# ---------------------------------------------------------------------------
 
 
 class LangChainUtility:
@@ -447,11 +472,10 @@ class LangChainUtility:
         self.request_name = request_name
 
     def complete(self, system: str, user: str, *, max_tokens: int) -> Completion:
+        check_active(reserve=MODEL_TIME_RESERVE)
+        messages = [SystemMessage(content=system), HumanMessage(content=user)]
         try:
-            reply = self.llm.invoke([
-                SystemMessage(content=system),
-                HumanMessage(content=user),
-            ])
+            reply = self.llm.invoke(messages, max_tokens=max_tokens)
         except Exception as error:
             log_agent_error(
                 "Koda core: utility model",
@@ -459,6 +483,7 @@ class LangChainUtility:
             )
             return Completion(failed=True, detail=str(error))
 
+        check_active()
         usage = _usage(reply)
         return Completion(
             text=_text_of(reply)[: max_tokens * 8],
@@ -470,9 +495,7 @@ class LangChainUtility:
         )
 
 
-# ---------------------------------------------------------------------------
 # Seam 3 — the tool host
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -491,14 +514,12 @@ class UnderstandingHost:
 
     app_name: str
     request_name: str = ""
-    refused: list = field(default_factory=list)
 
     def call(self, name: str, arguments) -> ToolOutcome:
         if name == "read_doctype_schema":
             return self._doctype(str(arguments.get("doctype") or ""))
 
-        reason = DECLINED.get(name, f"{name} is not available in the understanding phase")
-        self.refused.append(name)
+        reason = DECLINED.get(name, f"{name} is not available to the explore helper")
         return ToolOutcome(text=f"[declined: {reason}]", ok=False)
 
     def _doctype(self, doctype: str) -> ToolOutcome:
@@ -546,97 +567,152 @@ class UnderstandingHost:
         )
 
 
-# ---------------------------------------------------------------------------
-# The session cache
-# ---------------------------------------------------------------------------
-
-_SESSIONS: dict[str, Session] = {}
 _SESSIONS_LOCK = threading.Lock()
 
-#: Sessions held in this worker before the oldest is dropped. Small: a session
-#: holds an index of a whole app, and a worker serving eleven requests at once
-#: is not the shape this runs in.
-MAX_CACHED_SESSIONS = 10
+
+# Shared retrieval for a task the user is writing by hand
 
 
-def _cached(request_name: str) -> Session | None:
-    with _SESSIONS_LOCK:
-        return _SESSIONS.get(request_name)
+@lru_cache(maxsize=16)
+def _rerank_client(site: str, api_key: str, model: str, timeout: float) -> OpenRouterReranker:
+    """Keep result caches separate by site, credentials, model and deadline."""
+    return OpenRouterReranker(api_key=api_key, model=model, timeout_seconds=timeout)
 
 
-def _remember(request_name: str, session: Session) -> None:
-    """Hold the session for the next turn of the same request.
-
-    Process-local on purpose. A ``Session`` carries the index, the repo map and
-    the retriever, none of which are JSON, so it cannot ride in LangGraph state —
-    and a cache that spanned workers would have to serialise all three. A miss
-    costs one cold start and loses nothing: the ledger and transcript are
-    rebuilt from the request row, and cold start on this tree is sub-second.
-    """
-    if not request_name:
-        return
-    with _SESSIONS_LOCK:
-        _SESSIONS[request_name] = session
-        while len(_SESSIONS) > MAX_CACHED_SESSIONS:
-            _SESSIONS.pop(next(iter(_SESSIONS)))
-
-
-def forget_session(request_name: str) -> None:
-    """Drop a request's cached session. Call when a request finishes."""
-    with _SESSIONS_LOCK:
-        _SESSIONS.pop(request_name, None)
+def _reranker_for(session: Session, model: str) -> OpenRouterReranker | None:
+    """The dedicated reranker for ``model``, or ``None`` when disabled or unconfigured."""
+    config = session.context.config.rerank
+    if not config.enabled:
+        return None
+    site = str(getattr(getattr(frappe, "local", None), "site", "") or "")
+    try:
+        settings = frappe.get_single("Agent Settings")
+        api_key = settings.get_password("openrouter_api_key") or ""
+    except Exception:
+        # Outside a Frappe site, the standard environment key supports
+        # scripts. A site never borrows another site's process-global key.
+        api_key = "" if site else os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key.strip():
+        return None
+    return _rerank_client(site, api_key.strip(), model, config.timeout_seconds)
 
 
-# ---------------------------------------------------------------------------
-# Model-free retrieval for a task the user is writing by hand
-# ---------------------------------------------------------------------------
+def _with_reranker(session: Session) -> Session:
+    """Inject the service at the host boundary; the core imports no HTTP client."""
+    client = _reranker_for(session, session.context.config.rerank.model)
+    return replace(session, retriever=replace(session.retriever, reranker=client))
 
-#: One read-only session per app root, reused while the checkout is unchanged.
-#: Keyed separately from ``_SESSIONS`` because those carry a request's transcript.
+
+def _without_reranker(session: Session) -> Session:
+    """The session with local ranking only: no paid reranking request."""
+    if getattr(session.retriever, "reranker", None) is None:
+        return session
+    return replace(session, retriever=replace(session.retriever, reranker=None))
+
+
+#: One read-only session per app root, reused while the checkout is unchanged; held without
+#: the reranker, which is attached per call. Explore, find_code and starting points share it.
 _APP_SESSIONS: dict[str, tuple[str, Session]] = {}
+#: One lock per app root, so concurrent callers on a changed checkout share one cold start.
+_COLD_STARTS: dict[str, threading.Lock] = {}
 
 
 def _tree_key(app_name: str) -> str:
     """HEAD plus a content hash of every uncommitted change, tracked or not.
 
     ``git status`` would not do: a file that is already modified keeps the same
-    status line as it changes again, and the session would go stale.
+    status line as it changes again, and the session would go stale. Empty when
+    HEAD cannot be read: without it no change could be told apart, so nothing is held.
+    ``.koda/config.toml`` is hashed too: it is usually gitignored, so the worktree
+    signature misses it, and an edit (a new redaction glob) must rebuild the index.
     """
     repo_root = get_repo_root(app_name)
     ok, head = run_git(["rev-parse", "HEAD"], cwd=repo_root)
-    return f"{head.strip() if ok else ''}:{worktree_signature(repo_root)}"
-
-
-def remember_app_session(app_name: str, session: Session) -> None:
-    """Hold a session for model-free searches while the checkout is unchanged."""
+    if not ok:
+        return ""
     try:
-        entry = (_tree_key(app_name), session)
-    except Exception:
-        return  # not a git checkout, or git unavailable: fall back to cold start
-    with _SESSIONS_LOCK:
-        _APP_SESSIONS[_app_root(app_name)] = entry
+        config = hashlib.sha1(Path(_app_root(app_name), CONFIG_PATH).read_bytes()).hexdigest()
+    except OSError:
+        config = ""
+    return f"{head.strip()}:{worktree_signature(repo_root)}:{config}"
 
 
-def _app_session(app_name: str) -> Session:
+def _for_model(session: Session, model: str) -> Session:
+    """The held index and retriever, with ``model``'s window and budget and no turn state.
+
+    Only the window depends on the model, and nothing cold start builds reads it,
+    so re-resolving the config and budget is all a different caller needs.
+    """
+    config = resolve_config(session.workspace, _overrides(model), [])
+    return Session(
+        workspace=session.workspace,
+        model_id=model,
+        context=replace(session.context, config=config),
+        retriever=session.retriever,
+        budget=allocate(
+            config.context.window_tokens,
+            ledger_override=config.context.ledger_soft_tokens,
+            memory_tokens=config.context.memory_tokens,
+            input_tokens=config.context.input_tokens,
+        ),
+        notes=session.notes,
+    )
+
+
+def _app_session(app_name: str, *, rerank: bool = True, model: str = DEFAULT_ARCHITECT_MODEL) -> Session:
+    """The app's held session for ``model``; a cold start only when the checkout changed."""
     root = _app_root(app_name)
-    key = _tree_key(app_name)
     with _SESSIONS_LOCK:
-        held = _APP_SESSIONS.get(root)
-    if held is not None and held[0] == key:
-        return held[1]
-    session = open_session(LocalWorkspace(root_path=Path(root)))
-    with _SESSIONS_LOCK:
-        _APP_SESSIONS[root] = (key, session)
-    return session
+        cold_start = _COLD_STARTS.setdefault(root, threading.Lock())
+    with cold_start:
+        key = _tree_key(app_name)
+        with _SESSIONS_LOCK:
+            held = _APP_SESSIONS.get(root)
+        if key and held is not None and held[0] == key:
+            session = _for_model(held[1], model)
+        else:
+            session = open_session(LocalWorkspace(root_path=Path(root)), model=model, overrides=_overrides(model))
+            if key:
+                with _SESSIONS_LOCK:
+                    _APP_SESSIONS[root] = (key, session)
+    return _with_reranker(session) if rerank else _without_reranker(session)
 
 
-def suggest_context(app_name: str, query: str, *, limit: int = 12) -> list[dict]:
+def suggest_context(app_name: str, query: str, *, limit: int = 12, rerank: bool = True) -> list[dict]:
     """Rank code spans for a task description with the retriever planning used.
 
-    No model call. Cold start on a large app takes tens of seconds, which is why
+    No chat call. Cold start on a large app takes tens of seconds, which is why
     the API runs this in a job and streams the result back over realtime.
+    ``rerank=False`` skips the paid reranker, whose spend the cost ledger cannot see.
     """
-    return suggestions_for(_app_session(app_name), query, limit=limit)
+    return suggestions_for(_app_session(app_name, rerank=rerank), query, limit=limit)
+
+
+def starting_points(app_name: str, message: str, *, request_name: str = "") -> str:
+    """Where a request most likely starts: three files and their best definitions, before any model call.
+
+    Two dedicated rerank calls over the held app index (about half a cent), booked on
+    the request's cost. Never raises: on any failure the investigation starts as before.
+    """
+    if not app_name or not message.strip():
+        return ""
+    try:
+        session = _app_session(app_name, rerank=False)
+        client = _reranker_for(session, session.context.config.rerank.brief_model)
+        spent = client.cost if client is not None else 0.0
+        result = brief(session.retriever, message, reranker=client)
+        cost = (client.cost - spent) if client is not None else 0.0
+        if request_name and cost > 0:
+            tokens = int(frappe.db.get_value(DOCTYPE_NAME, request_name, "tokens_used") or 0)
+            persist_usage(request_name, tokens, cost_delta=cost)
+        _publish(request_name, "starting_points", files=[point.path for point in result.points],
+                 reranked=result.reranked, rerank_calls=result.rerank_calls, cost=round(cost, 6),
+                 notes=list(result.notes))
+        return result.text
+    except Exception:
+        log_agent_error("Koda core: starting points",
+                        f"request={request_name}\napp={app_name}\n{frappe.get_traceback()}")
+        return ""
 
 
 def suggestions_for(session: Session, query: str, *, limit: int = 12) -> list[dict]:
@@ -646,64 +722,26 @@ def suggestions_for(session: Session, query: str, *, limit: int = 12) -> list[di
     same location dedup ``working_set_for`` does before the model's first round —
     kept as structured hits rather than its rendered ``path:start-end`` lines.
     """
+    query = plain_query(query)
     index = session.retriever.index
     seen: set[tuple[str, int, int]] = set()
     out: list[dict] = []
-    for hit in search(session.retriever, query, limit=limit).hits:
+    limit = max(1, min(limit, 50))
+    for hit in search(session.retriever, query, limit=min(50, limit * 3)).hits:
         chunk = hit.chunk
         definition = _enclosing_definition(index, chunk.path, chunk.span.start, chunk.span.end, chunk.identity)
         start, end = (definition.extent.start, definition.extent.end) if definition else (chunk.span.start, chunk.span.end)
         if (chunk.path, start, end) in seen:
             continue
         seen.add((chunk.path, start, end))
-        score = hit.score * (NAME_MATCH_BOOST if _names_file(query, chunk.path) else 1.0)
         out.append({
             "path": chunk.path, "start": start, "end": end,
             "symbol": definition.qualified_name if definition else (chunk.identity or ""),
-            "snippet": _headline(chunk.body), "score": round(score, 3), "note": hit.note,
+            "snippet": excerpt(chunk.body, query), "score": round(hit.score, 3), "note": hit.note,
         })
-    out.sort(key=lambda ref: -ref["score"])
+        if len(out) >= limit:
+            break
     return out
-
-
-NAME_MATCH_BOOST = 1.5
-MIN_NAME_PHRASE_CHARS = 6
-
-
-def _names_file(query: str, path: str) -> bool:
-    """Whether the query spells out the file's name, as words or as a token.
-
-    "the Document Traceability client script" names ``document_traceability.js``
-    but the lexical scorer cannot tell: ``document`` and ``traceability`` are in
-    nearly every chunk of that app, so their weight is close to zero, and the
-    ranking is decided by whichever look-alike file has the shorter chunk.
-    Short stems (``api``, ``utils``) are ignored; they name nothing.
-    """
-    phrase = " ".join(split_words(Path(path).stem))
-    if len(phrase) < MIN_NAME_PHRASE_CHARS:
-        return False
-    return phrase in " ".join(split_words(query))
-
-
-_DEFINITION_LINE = re.compile(
-    r"^\s*(?:async\s+def|def|class|function|frappe\.ui\.form\.on|frappe\.pages)\b"
-    r"|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:function|\()"
-)
-_NOISE_LINE = re.compile(r'^\s*(?:#|//|/\*|\*|"""|\'\'\'|\)|\]|\}|$)')
-
-
-def _headline(body: str, limit: int = 120) -> str:
-    """The line a person would recognise the chunk by.
-
-    A window rarely starts on anything meaningful — a closing bracket, a
-    licence comment — so prefer the first definition inside it, then the first
-    line that is neither blank nor punctuation nor a comment.
-    """
-    lines = body.splitlines()
-    chosen = next((line for line in lines if _DEFINITION_LINE.match(line)), None)
-    if chosen is None:
-        chosen = next((line for line in lines if not _NOISE_LINE.match(line)), "")
-    return chosen.strip()[:limit]
 
 
 def _enclosing_definition(index, path: str, start: int, end: int, identity: str = ""):
@@ -735,42 +773,33 @@ def _enclosing_definition(index, path: str, start: int, end: int, identity: str 
 MAX_WIDEN_LINES = 200
 
 
-# ---------------------------------------------------------------------------
-# The one function the graph calls
-# ---------------------------------------------------------------------------
+# The explore helper's pass
 
 
 @dataclass(frozen=True)
 class Understanding:
-    """What one understanding pass produced."""
+    """What one explore pass produced; ``tokens`` is the request's running total after it."""
 
     summary: str
-    explored_paths: tuple[str, ...] = ()
-    tools_called: tuple[str, ...] = ()
-    rounds: int = 0
     tokens: int = 0
-    notes: tuple[str, ...] = ()
     error: str = ""
     stop_reason: str = ""
 
     @property
     def ok(self) -> bool:
+        """An answer, or findings salvaged from the ledger; an empty model reply with none is not."""
         return not self.error and bool(self.summary.strip())
 
     @property
     def why(self) -> str:
-        """Why this pass produced nothing, in the caller's words rather than none.
-
-        Only ``stop_reason == "error"`` used to reach the graph, so a turn that
-        ran out of rounds or was stopped by a late tool call arrived with an
-        empty ``error`` and was reported as "produced no output" - the one
-        message that says nothing about the cause.
-        """
+        """Why this pass produced nothing: the error, or where the turn stopped."""
         if self.error:
             return self.error
+        if self.stop_reason == "empty":
+            return "the helper returned an empty answer and established no findings"
         if self.stop_reason and self.stop_reason != "answered":
-            return f"Understanding phase stopped: {self.stop_reason}"
-        return "Understanding phase produced no output"
+            return f"the helper stopped: {self.stop_reason}"
+        return "the helper produced no answer"
 
 
 def understand(
@@ -784,17 +813,18 @@ def understand(
     retrieval_query: str = "",
     utility_llm=None,
     spent: int = 0,
+    rerank: bool = True,
 ) -> Understanding:
-    """Run one full core turn and return the summary the plan phase needs.
+    """Run one full core turn for the explore helper and return its answer.
 
-    Everything §1–§17 does happens inside :func:`run_turn`: cold start, the
-    working set, prompt assembly with its cache plan, the round loop, tools, the
-    ledger, elision, the fold and compaction. What this function adds is the
-    four seams and the translation back to the flat ``understanding_summary``
-    string the rest of the graph already knows how to read.
+    Cold start happens in :func:`open_session`, once per checkout state (see
+    :func:`_app_session`); everything else — the working
+    set, prompt assembly with its cache plan, the round loop, tools, the ledger,
+    elision under input pressure, pressure summarisation and the fold — happens
+    inside :func:`run_turn`. What this function adds is the provider interfaces.
+    ``rerank=False`` skips the paid reranking request.
 
-    Never raises. The graph's nodes short-circuit on ``state["error"]``, so a
-    failure has to arrive as a value or the whole request dies on a traceback.
+    Never raises: a failure arrives as a value, never as a traceback.
     """
     chat = None
     host = UnderstandingHost(app_name=app_name, request_name=request_name)
@@ -803,13 +833,8 @@ def understand(
         chat = LangChainChatModel(
             llm, provider=provider, request_name=request_name, spent=spent
         )
-        session = _cached(request_name)
-        if session is None:
-            session = open_session(
-                LocalWorkspace(root_path=Path(_app_root(app_name))),
-                model=chat.model_id,
-                overrides=_overrides(chat.model_id),
-            )
+        # The app's held index while the checkout is unchanged; a fresh conversation either way.
+        session = _app_session(app_name, rerank=rerank, model=chat.model_id)
         result = run_turn(
             question,
             session=session,
@@ -833,22 +858,12 @@ def understand(
             stop_reason="error",
         )
 
-    _remember(request_name, result.session)
-    # The index this turn just built is exactly what a task-suggestion search
-    # needs; keeping it under the app key saves the next click a cold start.
-    remember_app_session(app_name, result.session)
-    notes = tuple(result.notes)
-    if host.refused:
-        notes = (*notes, f"declined: {', '.join(sorted(set(host.refused)))}")
-
+    total_tokens = chat.total_tokens + result.side_usage.total_tokens
+    _persist_tokens(request_name, total_tokens)
     return Understanding(
         summary=result.answer,
-        explored_paths=_opened(result.session),
-        tools_called=tuple(result.calls),
-        rounds=result.rounds,
-        tokens=chat.total_tokens,
-        notes=notes,
-        error=chat.failure if result.stop_reason == "error" else "",
+        tokens=total_tokens,
+        error=(chat.failure or result.answer) if result.stop_reason == "error" else "",
         stop_reason=result.stop_reason,
     )
 
@@ -868,8 +883,8 @@ def _app_root(app_name: str) -> str:
 def _model_id(llm) -> str:
     """The model id, for the cache-limit table the prompt assembler consults.
 
-    Only the *family* in the string matters — the core makes no model calls, it
-    only needs to know how wide a block has to be before caching it pays, and a
+    Only the *family* in the string matters here: this table determines how
+    wide a block has to be before caching it pays, and a
     version suffix does not change that. Falls back to the core's default, whose
     table is the conservative one.
     """
@@ -891,6 +906,7 @@ MODEL_WINDOWS = {
     "qwen/qwen-2.5-coder": 32_000,
     "gpt-4o-mini": 128_000,
     "gpt-5": 400_000,
+    "gpt-6": 1_050_000,  # luna, sol, astra (OpenRouter model list, 2026-09)
     "gemini-2.0-flash": 1_000_000,
     "gemini-2.5-pro": 1_000_000,
     "claude-3-5": 200_000,
@@ -912,14 +928,19 @@ def _window_for(model_id: str) -> int:
 
 
 def _overrides(model_id: str) -> dict | None:
-    """Cold-start config for this model, or ``None`` for the core's defaults.
-
-    Only the window is set, because every other budget is derived from it — and
-    the derivation is the core's business, not this module's. Handing over one
-    measured number is a different act from second-guessing the allocator.
-    """
+    """The model's context window, when this host knows it."""
     window = _window_for(model_id)
     return {"context": {"window_tokens": window}} if window else None
+
+
+def request_limits(app_name: str, model_id: str) -> tuple[int, int]:
+    """Resolve the same window and input ceiling for planning and execution."""
+    if app_name:
+        workspace = LocalWorkspace(root_path=Path(_app_root(app_name)))
+        config = resolve_config(workspace, _overrides(model_id), [])
+    else:
+        config = merge_config(_overrides(model_id))
+    return config.context.window_tokens, config.context.input_tokens
 
 
 def _role_prompt(system_prompt: str) -> str:
@@ -934,24 +955,6 @@ def _role_prompt(system_prompt: str) -> str:
     return f"{house}\n\n{ROLE_PROMPT}" if house else ROLE_PROMPT
 
 
-def _opened(session: Session) -> tuple[str, ...]:
-    """Paths the turn actually read, from the ledger's span entries.
-
-    The ledger rather than a regex over the answer. A path scraped out of prose
-    is a path the model *mentioned*, which is a different and much weaker claim
-    than one it opened — and the span entries are the same set that would gate
-    editing.
-    """
-    paths: list[str] = []
-    for entry in session.ledger.live():
-        if entry.kind != "span":
-            continue
-        for ref in entry.refs:
-            if ref.path not in paths:
-                paths.append(ref.path)
-    return tuple(paths)
-
-
 def _publish(request_name: str, log_type: str, **payload) -> None:
     """One realtime event. Silent on failure — a log is not worth a turn."""
     if not request_name:
@@ -960,7 +963,8 @@ def _publish(request_name: str, log_type: str, **payload) -> None:
         user = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
         frappe.publish_realtime(
             "agent_log",
-            {"request_name": request_name, "type": log_type, **payload},
+            # A unique id: the form deduplicates on it, and two calls to one tool in a second differ.
+            {"request_name": request_name, "type": log_type, "event_id": os.urandom(16).hex(), **payload},
             user=user,
         )
     except Exception:
@@ -970,14 +974,4 @@ def _publish(request_name: str, log_type: str, **payload) -> None:
         )
 
 
-def _persist_tokens(request_name: str, total: int) -> None:
-    if not request_name:
-        return
-    try:
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "tokens_used", int(total))
-        frappe.db.commit()
-    except Exception:
-        log_agent_error(
-            "Koda core: persist token usage",
-            f"request={request_name}\n{frappe.get_traceback()}",
-        )
+_persist_tokens = persist_usage  # module-level seam that tests replace

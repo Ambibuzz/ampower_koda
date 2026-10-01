@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import posixpath
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..contracts.agent import ToolHost, ToolOutcome
 from ..contracts.ledger import Ledger
@@ -13,7 +14,9 @@ from ..errors import CoreError
 from ..globs import compile_globs
 from ..ledger.recall import rehydrate
 from ..retrieval.engine import Retriever, search
+from ..retrieval.excerpts import excerpt
 from ..workspace.ports import Workspace
+from ..workspace.redaction import redaction_matcher
 from .results import cap_chars, cap_rows
 
 SEARCH_HITS = 10
@@ -24,7 +27,11 @@ GLOB_PATHS = 100
 OUTLINE_ROWS = 120
 SYMBOL_ROWS = 150
 REFS_ROWS = 100
-READ_LINES = 400
+READ_LINES = 600
+READ_DEFAULT_LINES = 80
+# About 4k tokens: enough that a long file takes few chained reads.
+READ_CHARS = 16_000
+TOOL_RESULT_CHARS = 8_000
 EXPLORE_CHARS = 6_500
 
 NOT_WIRED = "[{tool} is not wired in this host — nothing was executed]"
@@ -49,10 +56,15 @@ def run_tool(
 ) -> ToolOutcome:
     """Dispatch one call. Returns a value in every case, including the bad ones."""
     handler = _HANDLERS.get(name)
-    if handler is None:
-        return (host or NullHost()).call(name, arguments)
     try:
-        return handler(arguments, retriever, workspace, ledger)
+        outcome = (handler(arguments, retriever, workspace, ledger) if handler is not None
+                   else (host or NullHost()).call(name, arguments))
+        # read bounds itself to READ_CHARS; every other result is capped here.
+        if name != "read" and len(outcome.text) > TOOL_RESULT_CHARS:
+            capped = cap_chars(outcome.text, TOOL_RESULT_CHARS)
+            return replace(outcome, text=capped.text + "\nRequest a narrower range or query for omitted details.",
+                           truncated=True, dropped=capped.dropped, entry_text="")
+        return outcome
     except (CoreError, OSError, ValueError, KeyError) as error:
         return ToolOutcome(text=f"[error: {name} — {error}]", ok=False)
 
@@ -65,20 +77,22 @@ def _search(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG001
 
     result = search(retriever, query, limit=SEARCH_HITS)
     if result.is_empty:
-        return ToolOutcome(text=f'search "{query}": 0 hits')
+        notes = "\n[" + "; ".join(result.notes) + "]" if result.notes else ""
+        return ToolOutcome(text=f'search "{query}": 0 hits' + notes)
 
-    rows = [f'search "{query}": {len(result.hits)} hits, confidence {result.confidence:.2f}']
-    rows += [_hit_row(hit) for hit in result.hits]
+    method = "dedicated reranker" if result.reranked else "local retrieval"
+    rows = [f'search "{query}": {len(result.hits)} hits ({method}), lexical coverage {result.confidence:.2f}']
+    rows += [_hit_row(hit, query) for hit in result.hits]
     if result.notes:
         rows.append(f"[{'; '.join(result.notes)}]")
     return ToolOutcome(text=cap_chars("\n".join(rows), SEARCH_CHARS).text)
 
 
-def _hit_row(hit) -> str:  # noqa: ANN001
+def _hit_row(hit, query: str = "") -> str:  # noqa: ANN001
     symbol = f" {hit.symbol}" if hit.symbol else ""
     note = f"  [{hit.note}]" if hit.note else ""
-    excerpt = _first_line(hit.chunk.body)
-    return f"{hit.location} [{hit.score:.3f}]{symbol} — {excerpt}{note}"
+    text = excerpt(hit.chunk.body, query, max_chars=300)
+    return f"{hit.location} [{hit.score:.3f}]{symbol} — {text}{note}"
 
 
 def _explore(arguments, retriever, workspace, ledger):  # noqa: ANN001
@@ -210,18 +224,22 @@ def _definition(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG00
 
 
 def _read(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG001
-    """A span, a symbol, or a whole small file. Path-only reads are allowed
-    here and capped, because the discriminated union upstream is a schema
-    concern and this layer would rather return 400 lines than an error.
-    """
+    """Bounded source spans; oversized individual lines can be paged by offset."""
     path = str(arguments.get("path", "")).strip()
     symbol = str(arguments.get("symbol", "")).strip()
 
-    if symbol and not path:
+    if symbol:
         table = definitions_by_name(retriever.index)
-        found = table.get(symbol) or table.get(symbol.rsplit(".", 1)[-1]) or ()
+        found = table.get(symbol) or ()
+        if path:
+            found = tuple(item for item in found if item[0] == path)
         if not found:
-            return ToolOutcome(text=f'read "{symbol}": no such symbol', ok=False)
+            scope = f" in {path}" if path else ""
+            return ToolOutcome(text=f'read "{symbol}": no such symbol{scope}', ok=False)
+        if len(found) > 1:
+            choices = "; ".join(f"{p}:{d.extent.start}-{d.extent.end} {d.qualified_name}" for p, d in found[:10])
+            return ToolOutcome(text=f'read "{symbol}": ambiguous; use a qualified symbol and path, '
+                                    f'or explicit lines without symbol. Candidates: {choices}', ok=False)
         path, definition = found[0]
         span = definition.extent
         arguments = {**arguments, "start": span.start, "end": span.end}
@@ -229,19 +247,67 @@ def _read(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG001
     if not path:
         return ToolOutcome(text="[error: read needs a path or a symbol]", ok=False)
 
+    pattern = _redacted(path, retriever, workspace)
+    if pattern is not None:
+        return ToolOutcome(text=f"[error: {path} matches the redaction pattern {pattern} "
+                                "(secrets are never read)]", ok=False)
+
     lines = split_lines(workspace.read_bytes(path).decode("utf-8", errors="replace"))
     start = max(1, int(arguments.get("start", 1) or 1))
-    end = int(arguments.get("end", 0) or len(lines))
+    end = int(arguments.get("end", 0) or (start + READ_DEFAULT_LINES - 1))
     end = min(end, start + READ_LINES - 1, len(lines))
     if start > len(lines):
         return ToolOutcome(text=f"[error: {path} has {len(lines)} lines]", ok=False)
 
-    body = "\n".join(f"{n:>5}  {lines[n - 1]}" for n in range(start, end + 1))
-    more = f"\n… {len(lines) - end} more line(s) (truncated)" if end < len(lines) else ""
+    if end < start:
+        return ToolOutcome(text="[error: end must be at or after start]", ok=False)
+    offset = max(0, int(arguments.get("offset", 0) or 0))
+    if offset >= len(lines[start - 1]) and offset:
+        return ToolOutcome(text="[error: offset is past the selected line]", ok=False)
+    if offset:
+        end = start
+    allowance = max(1, READ_CHARS - 2 * len(path) - 250)
+    rows = []
+    used = 0
+    shown_end = start
+    partial = bool(offset)
+    more = ""
+    for number in range(start, end + 1):
+        content = lines[number - 1][offset if number == start else 0:]
+        row = f"{number:>5}  {content}"
+        if used + len(row) + 1 > allowance:
+            if rows:
+                break
+            take = max(1, allowance - 8)
+            rows.append(f"{number:>5}  {content[:take]}")
+            partial = True
+            more = (f"\n[Line {number} excerpt, character offset {offset}; truncated. Continue with "
+                    f"read(path={path!r}, start={number}, end={number}, offset={offset + take}).]")
+            break
+        rows.append(row)
+        used += len(row) + 1
+        shown_end = number
+    if not more and shown_end < len(lines):
+        more = (f"\n[Excerpt; {len(lines) - shown_end} more lines. Continue with read(path={path!r}, "
+                f"start={shown_end + 1}); request every further range you need as parallel read calls "
+                "in this same turn.]")
+    if partial and not more:
+        more = f"\n[Line {start} excerpt from character offset {offset}.]"
     return ToolOutcome(
-        text=f"{path}:{start}-{end}\n{body}{more}",
-        entry_text=f"{path}:{start}-{end}",
+        text=f"{path}:{start}-{shown_end}\n" + "\n".join(rows) + more,
+        entry_text="" if partial else f"{path}:{start}-{shown_end}",
+        truncated=partial or shown_end < len(lines),
     )
+
+
+def _redacted(path: str, retriever: Retriever, workspace: Workspace) -> str | None:
+    """The pattern that redacts ``path``, or ``None``. Redaction guards reads too,
+    not only the index: a file skipped as ``redacted`` could still be read by path."""
+    normalised = posixpath.normpath(path.replace("\\", "/"))
+    skipped = retriever.index.skipped.get(normalised)
+    if skipped is not None and skipped.reason == "redacted":
+        return skipped.detail.removeprefix("matched ")
+    return redaction_matcher(workspace)(normalised)
 
 
 def _grep(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG001
@@ -317,14 +383,6 @@ def _recall(arguments, retriever, workspace, ledger):  # noqa: ANN001, ARG001
     return ToolOutcome(text=recalled.text, entry_text=f"recall {entry_id}")
 
 
-def _first_line(body: str) -> str:
-    for line in body.split("\n"):
-        stripped = line.strip()
-        if stripped:
-            return stripped[:120]
-    return ""
-
-
 _HANDLERS = {
     "search": _search,
     "explore": _explore,
@@ -337,5 +395,3 @@ _HANDLERS = {
     "glob": _glob,
     "recall": _recall,
 }
-
-BUILT_IN: frozenset[str] = frozenset(_HANDLERS)

@@ -9,7 +9,7 @@ from ..constants import (
     MIRROR_MIN_SHARED_FRACTION,
     VENDOR_DIRECTORIES,
 )
-from ..contracts.repo_map import MirrorSet
+from ..contracts.mirrors import MirrorSet
 
 
 def detect_mirrors(paths: Iterable[str]) -> MirrorSet:

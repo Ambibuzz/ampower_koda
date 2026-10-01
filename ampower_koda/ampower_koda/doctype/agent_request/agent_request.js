@@ -203,7 +203,8 @@ function render_status_dashboard(frm) {
             + '<strong>Review the plan todos</strong>'
             + '<p style="margin:6px 0 0;font-size:12px;color:var(--text-muted);">'
             + 'The plan describes <b>what</b> to build — not source code. '
-            + 'Edit todos if needed, then click <b>Approve Plan</b> to start implementation.</p>'
+            + 'Edit todos if needed, or use <b>Revise Plan</b> to answer its question in your own words; '
+            + 'then click <b>Approve Plan</b> to start implementation.</p>'
             + '</div>';
     }
 
@@ -226,9 +227,30 @@ function render_status_dashboard(frm) {
 
     var error_html = '';
     if (status === 'Failed' && frm.doc.error_log) {
-        var err_preview = (frm.doc.error_log || '').substring(0, 300);
+        var full_error = String(frm.doc.error_log || '');
+        var err_preview = full_error.substring(0, 300) + (full_error.length > 300 ? '…' : '');
         error_html = '<div class="agent-error-preview">'
             + '<strong>Error:</strong> ' + frappe.utils.escape_html(err_preview)
+            + (full_error.length > 300
+                ? ' <a class="agent-error-full">' + __('See the full error below') + '</a>'
+                : '')
+            + '</div>';
+    }
+
+    var cache_html = '';
+    var cache_input = Number(frm.doc.cache_input_tokens || 0);
+    if (cache_input > 0) {
+        var cache_read = Number(frm.doc.cache_read_tokens || 0);
+        var cache_hit = 100 * cache_read / cache_input;
+        cache_html = '<div class="agent-push-info" style="display:flex;gap:18px;flex-wrap:wrap;">'
+            + '<span><strong>Whole-run cache hit:</strong> ' + cache_hit.toFixed(1) + '%</span>'
+            + '<span><strong>New input:</strong> '
+            + Math.max(0, cache_input - cache_read).toLocaleString() + '</span>'
+            + '<span><strong>Cache writes:</strong> '
+            + Number(frm.doc.cache_write_tokens || 0).toLocaleString() + '</span>'
+            + (Number(frm.doc.cost_estimate || 0) > 0
+                ? '<span><strong>Provider cost:</strong> $' + Number(frm.doc.cost_estimate).toFixed(6) + '</span>'
+                : '')
             + '</div>';
     }
 
@@ -242,10 +264,15 @@ function render_status_dashboard(frm) {
         + bench_info_html
         + plan_info_html
         + push_info_html
+        + cache_html
         + error_html
         + '</div>';
 
     $(wrapper.wrapper).html(html);
+    // scroll_to_field also opens the collapsed Logs section.
+    $(wrapper.wrapper).find('.agent-error-full').on('click', function () {
+        frm.scroll_to_field('error_log');
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +384,12 @@ function style_form(frm) {
         border-radius: 6px;
         font-size: 12px;
         color: var(--red-700, #b91c1c);
-        max-height: 80px;
-        overflow: hidden;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+    }
+    .agent-error-full {
+        cursor: pointer;
+        font-weight: 600;
     }
 
     .agent-push-info {
@@ -422,7 +453,36 @@ function style_form(frm) {
 // of how that request was run, and rewriting it on open would edit history.
 function set_model_options_for_provider(frm, reset) {
     var provider = frm.doc.ai_provider || 'OpenAI';
-    var entries = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
+    with_provider_models(provider, function (entries) {
+        // The provider may have changed while the list was loading.
+        if ((frm.doc.ai_provider || 'OpenAI') === provider) apply_model_options(frm, provider, entries, reset);
+    });
+}
+
+// OpenAI's models are listed live (newest first, cached server-side), so a new
+// model is offered without a code change; the built-in list is the fallback.
+function with_provider_models(provider, done) {
+    var fallback = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
+    if (provider !== 'OpenAI') return done(fallback);
+    if (window.koda_live_models) return done(window.koda_live_models);
+    frappe.call({
+        method: 'ampower_koda.agent.api.get_provider_models',
+        args: { provider: provider },
+        callback: function (r) {
+            var ids = (r.message || {}).models || [];
+            if (!ids.length) return done(fallback);
+            var labels = {};
+            fallback.forEach(function (m) { labels[m.value] = m.label; });
+            window.koda_live_models = ids.map(function (id) {
+                return { value: id, label: labels[id] || (id + ': live from OpenAI') };
+            });
+            done(window.koda_live_models);
+        },
+        error: function () { done(fallback); }
+    });
+}
+
+function apply_model_options(frm, provider, entries, reset) {
     var model_ids = entries.map(function (m) { return m.value; });
     var current = frm.doc.ai_model || '';
     var settings_model = default_model_for(frm, provider);
@@ -441,9 +501,11 @@ function set_model_options_for_provider(frm, reset) {
         frm.set_value('ai_model', settings_model);
     }
 
-    var desc = entries.map(function (m) {
-        return '<b>' + m.value + '</b>: ' + m.label.split(': ')[1];
-    }).join(' &nbsp;|&nbsp; ');
+    var desc = entries === window.koda_live_models
+        ? __('Live list from OpenAI, newest first ({0} models).', [entries.length])
+        : entries.map(function (m) {
+            return '<b>' + m.value + '</b>: ' + m.label.split(': ')[1];
+        }).join(' &nbsp;|&nbsp; ');
     frm.set_df_property('ai_model', 'description', desc);
 }
 
@@ -481,8 +543,10 @@ function setup_action_buttons(frm) {
     var status = frm.doc.status;
     var running = ['Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing'];
     var can_start = ['Queued', 'Failed', 'Cancelled'].indexOf(status) !== -1;
+    // can_start + can_restart together must equal api.RESTARTABLE_STATUSES;
+    // start_agent refuses Awaiting Bench Approval, so it gets no Re-run button.
     var can_restart = status === 'Completed' || status === 'Awaiting Approval'
-        || status === 'Awaiting Bench Approval' || status === 'Awaiting Push Approval';
+        || status === 'Awaiting Push Approval';
 
     if (can_start) {
         frm.add_custom_button(__('Start Agent'), function () {
@@ -504,6 +568,10 @@ function setup_action_buttons(frm) {
     if (status === 'Awaiting Approval') {
         frm.add_custom_button(__('Approve Plan'), function () {
             approve_plan(frm);
+        }, __('Actions'));
+
+        frm.add_custom_button(__('Revise Plan'), function () {
+            revise_plan(frm);
         }, __('Actions'));
 
         frm.add_custom_button(__('Execute Existing Plan'), function () {
@@ -557,6 +625,17 @@ function setup_action_buttons(frm) {
     }
 
     var non_running = running.indexOf(status) === -1 && !frm.is_new();
+    if (['Failed', 'Cancelled'].indexOf(status) !== -1 && frm.doc.execution_checkpoint) {
+        frm.add_custom_button(__('Resume Execution'), function () {
+            frappe.call({
+                method: 'ampower_koda.agent.api.resume_execution',
+                args: { request_name: frm.doc.name },
+                freeze: true,
+                freeze_message: __('Resuming saved execution...'),
+                callback: function () { frm.reload_doc(); }
+            });
+        });
+    }
     if (non_running) {
         frm.add_custom_button(__('Checkout Base Branch'), function () {
             checkout_base_branch(frm);
@@ -569,7 +648,8 @@ function setup_action_buttons(frm) {
         }, __('Actions'));
     }
 
-    var followup_allowed = ['Queued', 'Completed', 'Failed', 'Cancelled', 'Awaiting Approval', 'Awaiting Push Approval'].indexOf(status) !== -1;
+    var followup_allowed = ['Queued', 'Completed', 'Failed', 'Cancelled', 'Awaiting Approval', 'Awaiting Bench Approval',
+        'Awaiting Push Approval'].indexOf(status) !== -1;
     if (followup_allowed && !frm.is_new()) {
         frm.add_custom_button(__('Submit Follow-up Fix'), function () {
             open_follow_up_dialog(frm);
@@ -645,7 +725,7 @@ function start_agent(frm) {
         });
     }
 
-    if (frm.dirty()) {
+    if (frm.is_dirty()) {
         frm.save().then(do_start);
     } else {
         do_start();
@@ -673,7 +753,7 @@ function execute_existing_plan(frm) {
                     }
                 });
             }
-            if (frm.dirty()) {
+            if (frm.is_dirty()) {
                 frm.save().then(do_execute);
             } else {
                 do_execute();
@@ -684,29 +764,81 @@ function execute_existing_plan(frm) {
 
 function approve_plan(frm) {
     frappe.confirm(
-        __('Approve this plan and start implementation?<br><br>The agent will implement and review each task, then request approval for bench commands.'),
+        __('Approve this plan and start implementation?<br><br>The agent will implement and review the plan, then request approval for bench commands.'),
         function () {
-            var plan_json = frm.doc.plan_json || '';
-            frappe.call({
-                method: 'ampower_koda.agent.api.approve_plan',
-                args: {
-                    request_name: frm.doc.name,
-                    plan_json: plan_json
-                },
-                freeze: true,
-                freeze_message: __('Starting execution...'),
-                callback: function (r) {
-                    if (r.message && r.message.status === 'ok') {
-                        frappe.show_alert({
-                            message: __('Plan approved: execution in progress...'),
-                            indicator: 'green'
-                        });
-                        frm.reload_doc();
+            function do_approve() {
+                var plan_json = frm.doc.plan_json || '';
+                frappe.call({
+                    method: 'ampower_koda.agent.api.approve_plan',
+                    args: {
+                        request_name: frm.doc.name,
+                        plan_json: plan_json
+                    },
+                    freeze: true,
+                    freeze_message: __('Starting execution...'),
+                    callback: function (r) {
+                        if (r.message && r.message.status === 'ok') {
+                            frappe.show_alert({
+                                message: __('Plan approved: execution in progress...'),
+                                indicator: 'green'
+                            });
+                            frm.reload_doc();
+                        }
                     }
-                }
-            });
+                });
+            }
+            // The worker reads the saved row; an unsaved switch (e.g. Browser
+            // Testing) would otherwise be lost by the reload after enqueue.
+            if (frm.is_dirty()) {
+                frm.save().then(do_approve);
+            } else {
+                do_approve();
+            }
         }
     );
+}
+
+function revise_plan(frm) {
+    // The agent continues the investigation that produced the plan instead of starting over.
+    var dialog = new frappe.ui.Dialog({
+        title: __('Revise Plan'),
+        fields: [{
+            fieldname: 'feedback',
+            fieldtype: 'Small Text',
+            label: __('What should the plan change?'),
+            reqd: 1,
+            description: __('Answer the plan\'s question or correct its reading; your edits to the todos are kept.')
+        }],
+        primary_action_label: __('Revise'),
+        primary_action: function (values) {
+            dialog.hide();
+            function send() {
+                frappe.call({
+                    method: 'ampower_koda.agent.api.revise_plan',
+                    args: {
+                        request_name: frm.doc.name,
+                        feedback: values.feedback,
+                        plan_json: frm.doc.plan_json || ''
+                    },
+                    freeze: true,
+                    freeze_message: __('Sending feedback...'),
+                    callback: function (r) {
+                        if (r.message && r.message.status === 'ok') {
+                            frappe.show_alert({ message: __('Revising the plan...'), indicator: 'blue' });
+                            frm.reload_doc();
+                        }
+                    }
+                });
+            }
+            // The revision job reads the saved row (prompt overrides included); the reload would drop edits.
+            if (frm.is_dirty()) {
+                frm.save().then(send);
+            } else {
+                send();
+            }
+        }
+    });
+    dialog.show();
 }
 
 function reject_plan(frm) {
@@ -731,9 +863,12 @@ function reject_plan(frm) {
 }
 
 function approve_bench(frm) {
-    var selected_cmds = [];
+    // null: the checklist is not on the page, so the saved pending list stands.
+    // An empty array is the user unchecking everything: skip the bench step.
+    var selected_cmds = null;
     var $list = $(frm.wrapper).find('#bench-cmd-list');
     if ($list.length) {
+        selected_cmds = [];
         $list.find('.bench-cmd-input').each(function () {
             var $input = $(this);
             var $check = $list.find('.bench-cmd-check[data-idx="' + $input.data('idx') + '"]');
@@ -742,37 +877,41 @@ function approve_bench(frm) {
             }
         });
     }
-    if (!selected_cmds.length) {
-        var fallback = [];
-        try { fallback = JSON.parse(frm.doc.pending_bench_commands || '[]'); } catch (e) { }
-        selected_cmds = fallback;
+    var shown_cmds = selected_cmds;
+    if (shown_cmds === null) {
+        shown_cmds = [];
+        try { shown_cmds = JSON.parse(frm.doc.pending_bench_commands || '[]'); } catch (e) { }
+        if (!shown_cmds.length) {
+            frappe.msgprint(__('No bench commands pending.'));
+            return;
+        }
     }
 
-    if (!selected_cmds.length) {
-        frappe.msgprint(__('No bench commands selected.'));
-        return;
+    var question;
+    if (shown_cmds.length) {
+        var preview = shown_cmds.map(function (c) {
+            return '<code style="display:block;padding:3px 8px;margin:2px 0;background:var(--gray-100);border-radius:3px;font-size:12px;">$ '
+                + frappe.utils.escape_html(c) + '</code>';
+        }).join('');
+        question = __('Run these commands?') + '<div style="margin:10px 0;">' + preview + '</div>';
+    } else {
+        question = __('Every bench command is unchecked. Skip the bench step and go straight to push approval?');
     }
-
-    var preview = selected_cmds.map(function (c) {
-        return '<code style="display:block;padding:3px 8px;margin:2px 0;background:var(--gray-100);border-radius:3px;font-size:12px;">$ '
-            + frappe.utils.escape_html(c) + '</code>';
-    }).join('');
 
     frappe.confirm(
-        __('Run these commands?') + '<div style="margin:10px 0;">' + preview + '</div>',
+        question,
         function () {
+            var args = { request_name: frm.doc.name };
+            if (selected_cmds !== null) args.commands = JSON.stringify(selected_cmds);
             frappe.call({
                 method: 'ampower_koda.agent.api.approve_bench',
-                args: {
-                    request_name: frm.doc.name,
-                    commands: JSON.stringify(selected_cmds)
-                },
+                args: args,
                 freeze: true,
                 freeze_message: __('Running bench commands...'),
                 callback: function (r) {
                     if (r.message && r.message.status === 'ok') {
                         frappe.show_alert({
-                            message: __('Bench commands approved: running...'),
+                            message: r.message.message || __('Bench commands approved: running...'),
                             indicator: 'blue'
                         });
                         frm.reload_doc();
@@ -914,31 +1053,15 @@ function show_post_checkout_bench_dialog(frm) {
                             commands: JSON.stringify(selected)
                         },
                         freeze: true,
-                        freeze_message: __('Running bench commands...'),
+                        freeze_message: __('Queuing bench commands...'),
                         callback: function (r2) {
                             if (!r2.message) { return; }
-                            // The output is shown whether or not the commands
-                            // worked. This used to render only on status 'ok',
-                            // so a run that failed showed nothing at all — the
-                            // one case where the log is worth reading.
-                            var failed = r2.message.failed || [];
-                            var header = failed.length
-                                ? '<p style="margin-bottom:8px;"><b>'
-                                    + __('{0} command(s) failed:', [failed.length])
-                                    + '</b><br>'
-                                    + frappe.utils.escape_html(failed.join('\n')).replace(/\n/g, '<br>')
-                                    + '</p>'
-                                : '';
-                            frappe.msgprint({
-                                title: failed.length
-                                    ? __('Bench Commands Failed')
-                                    : __('Bench Commands Output'),
-                                message: header
-                                    + '<pre style="max-height:400px;overflow:auto;font-size:12px;white-space:pre-wrap;">'
-                                    + frappe.utils.escape_html(r2.message.log || '(no output)')
-                                    + '</pre>',
-                                indicator: failed.length ? 'red' : 'green',
-                                wide: true
+                            // The commands run in a background job. The request
+                            // shows Building meanwhile, so status polling and the
+                            // live log follow it; receipts land in the bench log.
+                            frappe.show_alert({
+                                message: r2.message.message || __('Bench commands queued.'),
+                                indicator: 'blue'
                             });
                             frm.reload_doc();
                         }
@@ -1015,7 +1138,7 @@ function open_task_dialog(frm) {
             { fieldname: 'description', fieldtype: 'Small Text', label: __('Description'), reqd: 1,
               description: __('What changes, where, why, and which existing pattern to follow. No code.') },
             { fieldtype: 'Column Break' },
-            { fieldname: 'action', fieldtype: 'Select', label: __('Action'), options: ['MODIFY', 'CREATE'], default: 'MODIFY', reqd: 1 },
+            { fieldname: 'action', fieldtype: 'Select', label: __('Action'), options: ['MODIFY', 'CREATE', 'DELETE'], default: 'MODIFY', reqd: 1 },
             { fieldname: 'depends_on', fieldtype: 'MultiSelectPills', label: __('Depends on'),
               get_data: () => ids.map((id) => ({ value: id, description: '' })) },
             { fieldname: 'acceptance_criteria', fieldtype: 'Small Text', label: __('Acceptance criteria (one per line)'), reqd: 1 },
@@ -1238,7 +1361,10 @@ function setup_status_polling(frm) {
     }
 
     var active = ['Understanding', 'Planning', 'Implementing', 'Reviewing', 'Building', 'Pushing'];
-    if (active.indexOf(frm.doc.status) === -1) return;
+    // A queued request with a job is followed until the job starts or ends, so
+    // a worker that fails before its first update is not shown as Queued forever.
+    var queued_job = frm.doc.status === 'Queued' && !!(frm.doc.rq_job_id || frm.doc.agent_run_id);
+    if (active.indexOf(frm.doc.status) === -1 && !queued_job) return;
 
     var poll_interval = (frm.doc.status === 'Building' || frm.doc.status === 'Pushing') ? 5000 : 10000;
 
@@ -1341,8 +1467,11 @@ function setup_live_log_panel(frm) {
 function append_log_entry(frm, data) {
     if (!frm._log_history) frm._log_history = [];
     
-    // Check if this specific log entry is already in history to avoid duplicates after reload
-    var entry_id = (data.timestamp || '') + (data.type || '') + (data.tool_name || '') + (data.preview || '').substring(0, 50);
+    // Check if this specific log entry is already in history to avoid duplicates after reload.
+    // Publishers send a unique event_id; the display-text key is only for events without one.
+    var entry_id = data.event_id
+        ? 'id:' + data.event_id
+        : (data.timestamp || '') + (data.type || '') + (data.tool_name || '') + (data.preview || '').substring(0, 50);
     if (frm._last_entry_ids && frm._last_entry_ids.indexOf(entry_id) !== -1) return;
     
     frm._log_history.push(data);
@@ -1377,17 +1506,32 @@ function append_log_entry(frm, data) {
     } else if (data.type === 'token_usage') {
         var input_tokens = Number(data.input_tokens || 0);
         var cached_tokens = Number(data.cache_read_tokens || 0);
+        var cache_write_tokens = Number(data.cache_write_tokens || 0);
+        var cache_new_input_tokens = Number(data.cache_new_input_tokens || 0);
         var output_tokens = Number(data.output_tokens || 0);
         var context_tokens = data.context_chars ? Math.ceil(Number(data.context_chars) / 3.6) : 0;
+        var full_input = Number(data.context_input_tokens || 0);
+        var estimated_input = Number(data.context_estimated_tokens || context_tokens);
         var pieces = [];
-        if (input_tokens) pieces.push('input ' + input_tokens.toLocaleString());
+        if (full_input) pieces.push('context ' + full_input.toLocaleString());
+        else if (estimated_input) pieces.push('context ~' + estimated_input.toLocaleString());
+        if (input_tokens) pieces.push('uncached input ' + input_tokens.toLocaleString());
         if (cached_tokens) pieces.push('cached ' + cached_tokens.toLocaleString());
+        if (cache_write_tokens) pieces.push('cache write ' + cache_write_tokens.toLocaleString());
+        if (cache_new_input_tokens) pieces.push('new input ' + cache_new_input_tokens.toLocaleString());
+        if (data.cache_read_ratio !== undefined && data.cache_read_ratio !== null) {
+            pieces.push('whole-call hit ' + (Number(data.cache_read_ratio) * 100).toFixed(1) + '%');
+        }
+        if (Number(data.provider_cost || 0) > 0) {
+            pieces.push('cost $' + Number(data.provider_cost).toFixed(6));
+        }
         if (output_tokens) pieces.push('output ' + output_tokens.toLocaleString());
-        if (context_tokens) pieces.push('context ~' + context_tokens.toLocaleString());
+        if (data.input_budget_tokens) pieces.push('budget ' + Number(data.input_budget_tokens).toLocaleString());
+        if (data.upstream_provider) pieces.push('via ' + String(data.upstream_provider));
         html = '<div style="color:var(--text-muted);margin-bottom:3px;padding-left:14px;">'
             + ts + '\u25C7 round ' + frappe.utils.escape_html(String(data.round || '?'))
             + ': ' + frappe.utils.escape_html(pieces.join(' \u00B7 ') || String(data.tokens_this_round || 0) + ' tokens')
-            + ' <b>(total ' + Number(data.tokens_total || 0).toLocaleString() + ')</b>'
+            + ' <b>(cumulative ' + Number(data.tokens_total || 0).toLocaleString() + ')</b>'
             + '</div>';
     } else if (data.type === 'duplicate_tool_call') {
         html = '<div style="color:var(--orange-500);margin-bottom:3px;padding-left:14px;">'

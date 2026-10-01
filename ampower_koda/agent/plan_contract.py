@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import copy
+import difflib
 import posixpath
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 
 
 MAX_PLAN_TASKS = 12
 MAX_TASK_CONTEXT_REFS = 6
-VALID_ACTIONS = {"MODIFY", "CREATE"}
+VALID_ACTIONS = {"MODIFY", "CREATE", "DELETE"}
 _TASK_ID = re.compile(r"TODO [1-9][0-9]*")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
@@ -42,7 +45,7 @@ PLAN_JSON_SCHEMA = {
                     "title": {"type": "string"},
                     "goal": {"type": "string"},
                     "description": {"type": "string"},
-                    "action": {"type": "string", "enum": ["MODIFY", "CREATE"]},
+                    "action": {"type": "string", "enum": ["MODIFY", "CREATE", "DELETE"]},
                     "files": {"type": "array", "items": {"type": "string"}},
                     "context_refs": {
                         "type": "array",
@@ -73,6 +76,49 @@ PLAN_JSON_SCHEMA = {
         },
     },
     "required": ["overview", "scope", "assumptions", "risks", "tasks"],
+}
+
+
+PLAN_PATCH_OPS = ("set_action", "add_file", "add_context_ref", "remove_context_ref")
+
+PLAN_PATCH_SCHEMA = {
+    "title": "PlanPatch",
+    "description": (
+        "Edits that repair a rejected plan in place. Every edit names the op and "
+        "only the fields that op reads; leave the rest empty (\"\", [], 0)."
+    ),
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "edits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": list(PLAN_PATCH_OPS),
+                        "description": (
+                            "set_action(task_id, value MODIFY|CREATE|DELETE). "
+                            "add_file(task_id, path). "
+                            "add_context_ref(task_id, path, start, end, symbol, why). "
+                            "remove_context_ref(task_id, path)."
+                        ),
+                    },
+                    "task_id": {"type": "string", "description": "TODO N."},
+                    "path": {"type": "string"},
+                    "value": {"type": "string"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                    "symbol": {"type": "string"},
+                    "why": {"type": "string"},
+                },
+                "required": ["op", "task_id", "path", "value", "start", "end", "symbol", "why"],
+            },
+        },
+    },
+    "required": ["edits"],
 }
 
 
@@ -158,7 +204,7 @@ def _task(raw, index: int, issues: list[str]) -> dict:
         issues.append(f"{label}.id must use the format TODO N")
     action = _text(raw.get("action"), f"{label}.action", issues)
     if action and action not in VALID_ACTIONS:
-        issues.append(f"{label}.action must be MODIFY or CREATE")
+        issues.append(f"{label}.action must be MODIFY, CREATE or DELETE")
 
     files = _string_list(raw.get("files"), f"{label}.files", issues, required=True)
     files = [_path(path, f"{label}.files[{i}]", issues) for i, path in enumerate(files)]
@@ -214,8 +260,12 @@ def _task(raw, index: int, issues: list[str]) -> dict:
     }
 
 
-def validate_plan(raw, *, path_exists: Callable[[str], bool] | None = None) -> dict:
-    """Validate and dependency-order a complete plan."""
+def validate_plan(raw) -> dict:
+    """Validate and dependency-order a complete plan.
+
+    Structure only: a task's ``files`` are a starting point, not a write
+    permission, so paths are never checked against the disk here.
+    """
     issues: list[str] = []
     root_keys = {"overview", "scope", "assumptions", "risks", "tasks"}
     if not isinstance(raw, dict):
@@ -252,7 +302,6 @@ def validate_plan(raw, *, path_exists: Callable[[str], bool] | None = None) -> d
         "risks": _string_list(raw.get("risks"), "plan.risks", issues),
         "tasks": tasks,
     }
-
     id_to_index: dict[str, int] = {}
     for index, task in enumerate(tasks):
         key = task["id"].casefold()
@@ -313,39 +362,6 @@ def validate_plan(raw, *, path_exists: Callable[[str], bool] | None = None) -> d
             placed.add(index)
             pending.remove(index)
 
-    # Track planned file creation so later dependent tasks see the correct state.
-    if path_exists is not None and len(ordered) == len(tasks):
-        planned_state: dict[str, bool] = {}
-
-        def exists_at_step(path: str) -> bool:
-            if path not in planned_state:
-                planned_state[path] = bool(path_exists(path))
-            return planned_state[path]
-
-        for index in ordered:
-            task = tasks[index]
-            existing_refs = 0
-            for ref in task["context_refs"]:
-                if ref["path"] and exists_at_step(ref["path"]):
-                    existing_refs += 1
-                elif ref["path"] and not (
-                    task["action"] == "CREATE" and ref["path"] in task["files"]
-                ):
-                    issues.append(
-                        f"{task['id']}: context path does not exist at task start: {ref['path']}"
-                    )
-            if task["context_refs"] and not existing_refs:
-                issues.append(f"{task['id']}: no context_ref points to a file available at task start")
-
-            for path in task["files"]:
-                exists = exists_at_step(path)
-                if task["action"] == "MODIFY" and not exists:
-                    issues.append(f"{task['id']}: MODIFY path does not exist at task start: {path}")
-                if task["action"] == "CREATE" and exists:
-                    issues.append(f"{task['id']}: CREATE path already exists at task start: {path}")
-                if task["action"] == "CREATE":
-                    planned_state[path] = True
-
     if issues:
         raise PlanValidationError(issues)
     plan["tasks"] = [tasks[index] for index in ordered]
@@ -396,3 +412,312 @@ def plan_to_markdown(plan: dict) -> str:
     if plan.get("risks"):
         lines.append("## Risks\n" + "\n".join(f"- {item}" for item in plan["risks"]))
     return "\n\n".join(lines).strip()
+
+
+# Repair: patch a rejected plan instead of regenerating it
+
+@dataclass(frozen=True, slots=True)
+class PatchResult:
+    """The patched plan plus what did not apply, for the next repair round."""
+
+    plan: dict
+    applied: int = 0
+    rejected: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeCompletion:
+    plan: dict
+    repairs: tuple[str, ...] = ()
+
+
+def _canonicalize_task_paths(tasks: list[dict], path_exists: Callable[[str], bool], *,
+                             prefix: str, start: int = 0,
+                             task_id: str = "") -> list[tuple[str, dict[str, str]]]:
+    """Remove one proven-redundant app prefix from task paths in place."""
+    changed = []
+    for index, task in enumerate(tasks):
+        if index < start or (task_id and task["id"] != task_id):
+            continue
+        replacements = {}
+        for path in [*task["files"], *[ref["path"] for ref in task["context_refs"]]]:
+            if path_exists(path):
+                continue
+            if not path.startswith(prefix):
+                continue
+            candidate = path[len(prefix):]
+            if candidate and path_exists(candidate):
+                replacements[path] = candidate
+        if not replacements:
+            continue
+        task["files"] = [replacements.get(path, path) for path in task["files"]]
+        for ref in task["context_refs"]:
+            ref["path"] = replacements.get(ref["path"], ref["path"])
+        changed.append((task["id"], replacements))
+    return changed
+
+
+def ground_plan_references(plan: dict, path_exists: Callable[[str], bool], *, app_name: str) -> dict:
+    """Resolve a proven package-root mismatch before the plan is approved.
+
+    New destinations remain advisory. Existing context references must resolve,
+    or be supplied by an earlier dependency. A proven root correction on a peer
+    also applies to a new sibling under that same root, never to unrelated paths.
+    """
+    result = copy.deepcopy(plan)
+    prefix = app_name.strip('/') + '/' if app_name else ''
+    transforms: dict[str, set[str]] = {}
+    replacements = {}
+    for task in result['tasks']:
+        for ref in task['context_refs']:
+            source = ref['path']
+            if path_exists(source) or not prefix:
+                continue
+            candidates = {prefix + source}
+            if source.startswith(prefix):
+                candidates.add(source[len(prefix):])
+            found = [p for p in candidates if path_exists(p)]
+            if len(found) != 1:
+                continue
+            target = found[0]
+            replacements[source] = target
+            if target == prefix + source:
+                old_root = source.split('/')[0] + '/'
+                transforms.setdefault(old_root, set()).add(prefix + old_root)
+            elif source == prefix + target:
+                # Keep the next directory in the key so a correction for
+                # app/public/... cannot rewrite app/doctype/... as a side effect.
+                new_root = target.split('/')[0] + '/'
+                transforms.setdefault(prefix + new_root, set()).add(new_root)
+    def resolve(path):
+        if path_exists(path):
+            return path
+        if path in replacements:
+            return replacements[path]
+        matches = {next(iter(targets)) + path[len(root):]
+                   for root, targets in transforms.items()
+                   if len(targets) == 1 and path.startswith(root)}
+        return next(iter(matches)) if len(matches) == 1 else path
+    for task in result['tasks']:
+        task['files'] = [resolve(p) for p in task['files']]
+        for ref in task['context_refs']:
+            ref['path'] = resolve(ref['path'])
+    issues, earlier = [], {}
+    for task in result['tasks']:
+        supplied = set().union(*(earlier.get(dep.casefold(), set()) for dep in task['depends_on']))
+        for ref in task['context_refs']:
+            if not path_exists(ref['path']) and ref['path'] not in supplied:
+                issues.append(f"{task['id']}: context reference {ref['path']!r} does not exist. "
+                              "Use the exact verified path from the codebase findings.")
+        earlier[task['id'].casefold()] = set(task['files']) | supplied
+    if issues:
+        raise PlanValidationError(issues)
+    # Root corrections may reveal duplicate paths/dependency conflicts.
+    return validate_plan(result)
+
+
+def complete_rename_file_scope(
+    plan: dict, path_exists: Callable[[str], bool], *, app_name: str = "", start: int = 0, task_id: str = "",
+) -> ScopeCompletion:
+    """Complete the file inventory for an explicit rename already in the plan.
+
+    Recognize only a direct `Rename/Move <known source> to <destination>`
+    instruction in approved task text. Blocker reports are never authority for
+    new paths. Ambiguous prose, existing destinations, and conflicting exclusions
+    stay with ordinary plan repair. This function changes no files or criteria.
+    """
+    result = copy.deepcopy(plan)
+    notices = []
+    prefix = app_name.rstrip("/") + "/" if app_name else ""
+    if prefix:
+        for changed_task, replacements in _canonicalize_task_paths(
+            result.get("tasks", []), path_exists, prefix=prefix, start=start, task_id=task_id,
+        ):
+            notices.append(
+                f"{changed_task}: removed redundant app prefix from "
+                + ", ".join(f"{source} -> {target}" for source, target in replacements.items())
+            )
+    target = r'''(?:`([^`\r\n]+)`|"([^"\r\n]+)"|'([^'\r\n]+)'|((?:[\w.@+-]+/)*[\w@+()-][\w.@+()-]*\.[A-Za-z0-9]{1,10}))(?=$|[\s,;.])'''
+    for index, task in enumerate(result.get("tasks", [])):
+        if index < start or (task_id and task["id"] != task_id):
+            continue
+        known = dict.fromkeys([*task["files"], *[ref["path"] for ref in task["context_refs"]]])
+        texts = [task["description"], task["goal"], *task["acceptance_criteria"]]
+        pairs = set()
+        for source in known:
+            if not path_exists(source):
+                continue
+            # Prose often includes the app name, while `files` is app-relative.
+            # Strip it only when the known source proves that prefix redundant.
+            aliases = [(source, "")]
+            if prefix and not path_exists(prefix + source):
+                aliases.append((prefix + source, prefix))
+            for displayed_source, redundant_prefix in aliases:
+                instruction = re.compile(
+                    r"^\s*(?:[-*]\s+)?(?i:rename|move)\s+(?:(?i:the|existing|file|script|from)\s+)*"
+                    + r"[`\"']?" + re.escape(displayed_source) + r"[`\"']?\s+(?i:to|as)\s+" + target,
+                )
+                for text in texts:
+                    for line in text.splitlines():
+                        line = re.sub(r"\\([_*`])", r"\1", line)
+                        match = instruction.match(line)
+                        if not match or re.search(r"\b(?:not|never|instead)\b", line, re.IGNORECASE):
+                            continue
+                        destination = next(part for part in match.groups() if part is not None)
+                        if redundant_prefix:
+                            if not destination.startswith(redundant_prefix):
+                                continue
+                            destination = destination[len(redundant_prefix):]
+                        issues = []
+                        canonical = _path(destination, "rename destination", issues)
+                        if issues or destination.endswith(("/", "\\")) or not canonical or canonical == source:
+                            continue
+                        if path_exists(canonical):
+                            continue
+                        excluded = plan.get("scope", {}).get("out", [])
+                        if any(source in item or canonical in item or re.search(r"\brenam\w*\b", item, re.IGNORECASE)
+                               for item in excluded):
+                            continue
+                        pairs.add((source, canonical))
+        if len(pairs) != 1:
+            continue
+        source, destination = next(iter(pairs))
+        missing = [path for path in (source, destination) if path not in task["files"]]
+        if not missing and task["action"] == "CREATE":
+            continue
+        task["files"].extend(missing)
+        task["action"] = "CREATE"
+        notices.append(f"{task['id']}: completed declared rename scope {source} -> {destination}")
+    return ScopeCompletion(plan=result, repairs=tuple(notices))
+
+
+def apply_plan_patch(plan: dict, patch: dict) -> PatchResult:
+    """Apply plan-domain edits to the raw plan the model produced.
+
+    Works on the *unvalidated* dict so ``validate_plan`` runs again in full
+    afterwards; this function checks only what it needs to locate the target.
+    An edit that cannot be applied is reported, not raised: the loop feeds the
+    reports back with the remaining validation issues, and the model gets one
+    combined list rather than a crash on its first slip.
+    """
+    result = copy.deepcopy(plan) if isinstance(plan, dict) else {}
+    tasks = result.get("tasks")
+    if not isinstance(tasks, list):
+        return PatchResult(plan=result, rejected=("patch: plan.tasks is not a list; cannot patch",))
+    edits = patch.get("edits") if isinstance(patch, dict) else None
+    if not isinstance(edits, list):
+        return PatchResult(plan=result, rejected=("patch: no edits array returned",))
+
+    applied = 0
+    rejected: list[str] = []
+    for number, edit in enumerate(edits, start=1):
+        try:
+            _apply_edit(result, edit if isinstance(edit, dict) else {})
+            applied += 1
+        except (_EditError, ValueError, TypeError) as exc:
+            op = edit.get("op", "?") if isinstance(edit, dict) else "?"
+            rejected.append(f"patch edit {number} ({op}): {exc}")
+    return PatchResult(plan=result, applied=applied, rejected=tuple(rejected))
+
+
+class _EditError(ValueError):
+    pass
+
+
+def _find_task(tasks: list, task_id: str) -> dict:
+    wanted = (task_id or "").strip().casefold()
+    for task in tasks:
+        if isinstance(task, dict) and str(task.get("id", "")).strip().casefold() == wanted:
+            return task
+    raise _EditError(f"unknown task {task_id!r}")
+
+
+def _as_list(task: dict, key: str) -> list:
+    value = task.get(key)
+    if not isinstance(value, list):
+        value = []
+        task[key] = value
+    return value
+
+
+def _apply_edit(plan: dict, edit: dict) -> None:
+    op = str(edit.get("op") or "")
+    if op not in PLAN_PATCH_OPS:
+        raise _EditError(f"unknown op {op!r}")
+    task = _find_task(plan["tasks"], str(edit.get("task_id") or ""))
+    if op == "set_action":
+        task["action"] = str(edit.get("value") or "").strip().upper()
+        return
+    path = str(edit.get("path") or "").strip()
+    if not path:
+        raise _EditError(f"{op} needs path")
+    if op == "add_file":
+        files = _as_list(task, "files")
+        if path not in files:
+            files.append(path)
+    elif op == "add_context_ref":
+        _as_list(task, "context_refs").append({
+            "path": path,
+            "start": int(edit.get("start") or 0),
+            "end": int(edit.get("end") or 0),
+            "symbol": str(edit.get("symbol") or ""),
+            "why": str(edit.get("why") or ""),
+        })
+    else:
+        refs = _as_list(task, "context_refs")
+        kept = [r for r in refs if not (isinstance(r, dict) and r.get("path") == path)]
+        if len(kept) == len(refs):
+            raise _EditError(f"{path!r} not in context_refs")
+        task["context_refs"] = kept
+
+
+def _path_key(path: str) -> str:
+    return re.sub(r"[\s_\-]+", "", path.replace("\\", "/").casefold())
+
+
+def nearest_paths(path: str, candidates: Iterable[str], *, limit: int = 3) -> list[str]:
+    """Existing files a planner most likely meant by ``path``.
+
+    Spaces, underscores and hyphens are ignored, so ``sales_invoice.js`` finds
+    ``sales _invoice.js``; a bare suffix finds its prefixed form. Ranked, and
+    cut off below a similarity a human would still call "the same file".
+    """
+    wanted = _path_key(path)
+    if not wanted:
+        return []
+    wanted_base = wanted.rsplit("/", 1)[-1]
+    scored: list[tuple[float, str]] = []
+    for candidate in candidates:
+        key = _path_key(candidate)
+        if not key:
+            continue
+        if key == wanted:
+            score = 1.0
+        elif key.endswith("/" + wanted) or wanted.endswith("/" + key):
+            score = 0.95
+        else:
+            ratio = difflib.SequenceMatcher(None, wanted, key).ratio()
+            base = key.rsplit("/", 1)[-1]
+            score = 0.85 + ratio * 0.1 if base == wanted_base else ratio
+        if score >= 0.75:
+            scored.append((score, candidate))
+    scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    return [candidate for _, candidate in scored[:limit]]
+
+
+def repair_feedback(issues: Iterable[str]) -> str:
+    """The message that asks the planner to fix a rejected plan: every validation issue, verbatim."""
+    lines = ["Validation rejected the plan. Issues:"]
+    lines.extend(f"- {issue}" for issue in issues)
+    lines.append("")
+    lines.append(
+        "Use paths exactly as they exist on disk, character for character. If the "
+        "mismatch between a planned path and the real file is itself the defect "
+        "being fixed, keep the task and plan the rename or CREATE explicitly "
+        "instead of pointing the task at the wrong file."
+    )
+    lines.append(
+        "Return only the edits that resolve these issues, as PlanPatch edits. "
+        "Do not restate or rewrite tasks that are not affected."
+    )
+    return "\n".join(lines)

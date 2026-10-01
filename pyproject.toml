@@ -15,7 +15,14 @@ dependencies = [
     "langchain-anthropic>=0.3.0",
     "tree-sitter>=0.23.0",
     "tree-sitter-language-pack>=0.7.0",
+    "tomli>=2.0; python_version < \"3.11\"",
+    # check_page (browser verification); Chromium is downloaded on install and migrate
+    "playwright>=1.40",
 ]
+
+[project.optional-dependencies]
+# Kept so existing `pip install ampower_koda[browser]` commands still work.
+browser = ["playwright>=1.40"]
 
 [build-system]
 requires = ["flit_core >=3.4,<4"]

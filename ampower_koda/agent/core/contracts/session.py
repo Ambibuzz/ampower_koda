@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from ..config.schema import CoreConfig
-from .repo_map import RepoMap
 from .repository import RepositoryIndex
 
 
@@ -50,13 +49,6 @@ class SessionContext:
     index: RepositoryIndex
     memory: RepoMemory = field(default_factory=RepoMemory)
     cochange: CoChangeMemory = field(default_factory=CoChangeMemory)
-
-    repo_map: RepoMap = field(default_factory=RepoMap)
-    """Frozen for the session, and first in the cached prefix. Held here rather
-    than rebuilt per turn because rewriting it invalidates every byte
-    downstream of it — see
-    :func:`~ampower_koda.agent.core.repomap.build.repersonalize_once` for the
-    single rewrite that is permitted."""
 
     overlaid: tuple[str, ...] = ()
     """Paths whose analysis came from an overlay rather than from disk. Kept so

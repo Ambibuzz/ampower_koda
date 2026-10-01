@@ -1,4 +1,4 @@
-"""The three expansion legs: structure, graph, and history."""
+"""The expansion legs: related, structure, graph, and history."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from ..contracts.repository import RepositoryIndex
 from ..contracts.retrieval import Hit, LegResult
 from ..contracts.session import CoChangeMemory
 from ..graph.edges import CodeGraph
+from .excerpts import best_chunks
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,10 +41,13 @@ class Seed:
 
 
 def seeds_from(hits: Sequence[Hit], limit: int = STRUCTURAL_MAX_SEEDS) -> tuple[Seed, ...]:
-    """The top hits, as seeds. Deduplicated by ``(path, symbol)``, order kept."""
+    """Represent distinct files first, then additional symbols if space remains."""
     seen: set[tuple[str, str]] = set()
     seeds: list[Seed] = []
+    first: dict[str, Hit] = {}
     for hit in hits:
+        first.setdefault(hit.path, hit)
+    for hit in (*first.values(), *hits):
         key = (hit.path, hit.symbol)
         if key in seen:
             continue
@@ -52,6 +56,21 @@ def seeds_from(hits: Sequence[Hit], limit: int = STRUCTURAL_MAX_SEEDS) -> tuple[
         if len(seeds) >= limit:
             break
     return tuple(seeds)
+
+
+def related_leg(seeds: Sequence[Seed], index: RepositoryIndex, graph: CodeGraph,
+                *, query: str = "", limit: int = 24) -> LegResult:
+    """Reserve candidate opportunities for explicit feature/test relationships."""
+    scored: dict[str, tuple[float, Chunk]] = {}
+    kinds = {"feature", "rpc", "registration", "route", "test"}
+    for seed in seeds:
+        for edge in (*graph.out_edges(seed.path), *graph.in_edges(seed.path)):
+            if edge.kind not in kinds:
+                continue
+            target = edge.target if edge.source == seed.path else edge.source
+            for rank, chunk in enumerate(best_chunks(index, target, query, symbol=edge.symbol)):
+                _keep(scored, chunk, seed.weight * edge.weight / (rank + 1))
+    return LegResult(leg="related", hits=_rank(scored, limit))
 
 
 def structural_leg(
@@ -101,7 +120,7 @@ def _chunks_for(index: RepositoryIndex, path: str, symbol: str, bare: str) -> tu
         for chunk in analysis.chunks
         if chunk.identity in (symbol, bare) or chunk.identity.endswith(f".{bare}")
     )
-    return matching or analysis.chunks[:1]
+    return matching or best_chunks(index, path, bare, symbol=bare)
 
 
 def _referencing(index: RepositoryIndex, name: str) -> tuple[str, ...]:
@@ -119,11 +138,15 @@ def graph_leg(
     *,
     depth: int = GRAPH_DEPTH,
     keep: int = GRAPH_KEEP,
+    query: str = "",
 ) -> LegResult:
     """A weighted walk over typed edges, both directions, from the seed files."""
     best: dict[str, float] = {}
-    frontier: dict[str, float] = {seed.path: seed.weight for seed in seeds}
+    frontier: dict[str, float] = {}
+    for seed in seeds:
+        frontier[seed.path] = max(frontier.get(seed.path, 0.0), seed.weight)
     best.update(frontier)
+    symbols: dict[str, str] = {}
 
     for hop in range(depth):
         decay = 1.0 if hop == 0 else GRAPH_HOP_DECAY
@@ -139,6 +162,7 @@ def graph_leg(
                 if score > best.get(neighbour, 0.0):
                     best[neighbour] = score
                     following[neighbour] = score
+                    symbols[neighbour] = edge.symbol
 
         widest = sorted(following.items(), key=lambda item: (-item[1], item[0]))
         frontier = dict(widest[:GRAPH_EXPAND_LIMIT])
@@ -150,9 +174,8 @@ def graph_leg(
     for path, value in best.items():
         if path in seeded:
             continue
-        analysis = index.files.get(path)
-        if analysis and analysis.chunks:
-            _keep(scored, analysis.chunks[0], value)
+        for rank, chunk in enumerate(best_chunks(index, path, query, symbol=symbols.get(path, ""))):
+            _keep(scored, chunk, value / (rank + 1))
 
     return LegResult(leg="graph", hits=_rank(scored, keep))
 
@@ -163,6 +186,7 @@ def history_leg(
     cochange: CoChangeMemory,
     *,
     limit: int = HISTORY_NEIGHBOURS,
+    query: str = "",
 ) -> LegResult:
     """Files that this repository's own commits say belong with the seeds."""
     if not cochange.neighbours:
@@ -175,9 +199,8 @@ def history_leg(
         for neighbour, weight in cochange.for_file(seed.path, limit=limit):
             if neighbour in seeded:
                 continue
-            analysis = index.files.get(neighbour)
-            if analysis and analysis.chunks:
-                _keep(scored, analysis.chunks[0], seed.weight * weight)
+            for rank, chunk in enumerate(best_chunks(index, neighbour, query)):
+                _keep(scored, chunk, seed.weight * weight / (rank + 1))
 
     return LegResult(leg="history", hits=_rank(scored, limit))
 

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any
+from dataclasses import dataclass, field, fields
+from math import isfinite
 
 from ..constants import (
     COCHANGE_HALF_LIFE_DAYS,
@@ -11,19 +11,14 @@ from ..constants import (
     COCHANGE_MAX_FILES_PER_COMMIT,
     COCHANGE_MAX_NEIGHBOURS,
     DEFAULT_ARCHITECT_MODEL,
-    DEFAULT_REDACT_GLOBS,
     DEFAULT_SEARCH_LIMIT,
     DEFAULT_WINDOW_TOKENS,
-    ESCALATION_CONFIDENT,
-    ESCALATION_MID_MARGIN,
-    ESCALATION_WEAK,
-    FANOUT_MAX,
-    MAP_MAX_TOKENS,
     MAX_INDEX_FILE_BYTES,
     MAX_SEARCH_LIMIT,
     MEMORY_MAX_TOKENS,
 )
 from ..errors import ConfigError
+from ..budget.request import DEFAULT_INPUT_TOKENS
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +49,9 @@ class ContextConfig:
     memory_tokens: int = MEMORY_MAX_TOKENS
     """Shared across all repository memory files, not per file."""
 
-    map_tokens: int = MAP_MAX_TOKENS
+    input_tokens: int = DEFAULT_INPUT_TOKENS
+    """Full-input cleanup threshold, capped by model capacity and reply space.
+    History stays intact below it; pressure cleanup targets two thirds of it."""
 
     ledger_soft_tokens: int = 0
     """0 lets the allocator decide. A non-zero value is an explicit override and
@@ -64,10 +61,10 @@ class ContextConfig:
     def validate(self) -> None:
         if self.window_tokens <= 0:
             raise ConfigError("context.window_tokens", "must be positive")
+        if self.input_tokens <= 0:
+            raise ConfigError("context.input_tokens", "must be positive")
         if self.memory_tokens < 0:
             raise ConfigError("context.memory_tokens", "cannot be negative")
-        if self.map_tokens < 0:
-            raise ConfigError("context.map_tokens", "cannot be negative")
         if self.ledger_soft_tokens < 0:
             raise ConfigError("context.ledger_soft_tokens", "cannot be negative")
 
@@ -88,11 +85,11 @@ class RetrievalConfig:
     """How wide a search reaches."""
 
     limit: int = DEFAULT_SEARCH_LIMIT
-    """Hits returned to the caller. The candidate pool behind it is 40-60 wide
-    and costs nothing, because candidates never enter the prompt."""
+    """Hits returned to the caller. Candidate generation is local; dedicated
+    reranking has its own bounded request and never enters the chat prompt."""
 
     expand: bool = True
-    """Run the structural, graph and history legs when the query is anchored.
+    """Run the structural, graph and history legs from retrieved candidates.
     Turning it off leaves a purely lexical retriever, which is a useful thing to
     be able to measure against."""
 
@@ -102,36 +99,35 @@ class RetrievalConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class EscalationConfig:
-    """When a weak search may spend a model call on *vocabulary*."""
+class RerankConfig:
+    """Bounded dedicated reranking, independent of the conversational model."""
 
     enabled: bool = True
-    """The master switch. Off means no escalation and no model call, ever, and
-    the ladder becomes one comparison and an early return."""
+    model: str = "cohere/rerank-v3.5"
+    candidates: int = 60
+    per_file: int = 3
+    query_chars: int = 4000
+    document_chars: int = 3000
+    timeout_seconds: float = 5.0
+    min_score: float = 0.1
+    """A model-specific relevance floor, not a probability of correctness."""
 
-    fan_out: bool = False
-    """The ``expand`` rung: up to four rewrites along four angles. See above."""
-
-    confident: float = ESCALATION_CONFIDENT
-    weak: float = ESCALATION_WEAK
-    mid_margin: float = ESCALATION_MID_MARGIN
-
-    max_rewrites: int = FANOUT_MAX
-    """Rewrites per fan-out call, and therefore *extra searches* per fan-out
-    call. Turning it down is supported; turning it up past
-    :data:`~…constants.FANOUT_MAX` is not, because that constant is the measured
-    point where merge cost stops being negligible beside one more search."""
+    brief_model: str = "cohere/rerank-4-pro"
+    """The starting-points brief: one call over file cards, one over their definitions."""
 
     def validate(self) -> None:
-        if not 0.0 <= self.weak <= self.confident <= 1.0:
-            raise ConfigError(
-                "escalation.weak",
-                "must satisfy 0 ≤ weak ≤ confident ≤ 1 — the bands cannot cross",
-            )
-        if not 0.0 <= self.mid_margin <= 1.0:
-            raise ConfigError("escalation.mid_margin", "must be between 0 and 1")
-        if not 1 <= self.max_rewrites <= FANOUT_MAX:
-            raise ConfigError("escalation.max_rewrites", f"must be between 1 and {FANOUT_MAX}")
+        if not self.model.strip():
+            raise ConfigError("rerank.model", "cannot be empty")
+        if not self.brief_model.strip():
+            raise ConfigError("rerank.brief_model", "cannot be empty")
+        for name, low, high in (("candidates", 1, 100), ("per_file", 1, 10),
+                                ("query_chars", 256, 8000), ("document_chars", 256, 8000)):
+            if not low <= getattr(self, name) <= high:
+                raise ConfigError(f"rerank.{name}", f"must be between {low} and {high}")
+        if not isfinite(self.timeout_seconds) or not 0 < self.timeout_seconds <= 30:
+            raise ConfigError("rerank.timeout_seconds", "must be greater than 0 and at most 30")
+        if not isfinite(self.min_score) or not 0 <= self.min_score <= 1:
+            raise ConfigError("rerank.min_score", "must be between 0 and 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,10 +158,12 @@ class HistoryConfig:
 class SecurityConfig:
     """What never leaves the machine."""
 
-    redact_globs: tuple[str, ...] = DEFAULT_REDACT_GLOBS
-    """Matched before a file is read for parsing. A redacted file is refused,
-    not reported absent — see
-    :class:`~ampower_koda.agent.core.errors.RedactedFileError`."""
+    redact_globs: tuple[str, ...] = ()
+    """Appended to the built-in ``DEFAULT_REDACT_GLOBS``, never replacing them:
+    ``["*.pem"]`` once replaced them and made ``.env`` an ordinary indexed file.
+    Matched before a file is read for parsing. A redacted file is skipped at
+    discovery and reported with reason ``redacted``, not silently absent, and
+    the read tools refuse it."""
 
     def validate(self) -> None:
         if any(not glob.strip() for glob in self.redact_globs):
@@ -178,10 +176,10 @@ class CoreConfig:
 
     indexing: IndexingConfig = field(default_factory=IndexingConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
-    escalation: EscalationConfig = field(default_factory=EscalationConfig)
     history: HistoryConfig = field(default_factory=HistoryConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    rerank: RerankConfig = field(default_factory=RerankConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
 
     def __post_init__(self) -> None:
@@ -195,20 +193,3 @@ class CoreConfig:
 def config_defaults() -> CoreConfig:
     """Return a fresh, fully defaulted config."""
     return CoreConfig()
-
-
-def as_mapping(config: Any) -> dict[str, Any]:
-    """Render a config (or group) as nested plain dicts."""
-    if not is_dataclass(config):
-        raise ConfigError("<root>", f"not a config dataclass: {type(config).__name__}")
-
-    result: dict[str, Any] = {}
-    for spec in fields(config):
-        value = getattr(config, spec.name)
-        if is_dataclass(value):
-            result[spec.name] = as_mapping(value)
-        elif isinstance(value, tuple):
-            result[spec.name] = list(value)
-        else:
-            result[spec.name] = value
-    return result

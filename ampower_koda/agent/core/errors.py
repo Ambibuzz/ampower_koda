@@ -16,15 +16,6 @@ class ConfigError(CoreError):
         self.reason = reason
 
 
-class RedactedFileError(CoreError):
-    """A redacted path was requested."""
-
-    def __init__(self, path: str, pattern: str) -> None:
-        super().__init__(f"{path!r} is redacted by {pattern!r}")
-        self.path = path
-        self.pattern = pattern
-
-
 class WorkspaceError(CoreError):
     """The workspace port could not satisfy a read."""
 
@@ -41,7 +32,3 @@ class ParseError(CoreError):
         super().__init__(f"{path!r}: {reason}")
         self.path = path
         self.reason = reason
-
-
-class CacheError(CoreError):
-    """A cache entry could not be read or written."""

@@ -26,12 +26,18 @@ class Commit:
 
 
 def git_log_arguments(config: HistoryConfig) -> tuple[str, ...]:
-    """The exact read-only git invocation this module can parse."""
+    """The exact read-only git invocation this module can parse.
+
+    The workspace may be a subfolder of the repository (a Frappe app's inner
+    package), so ``--relative`` makes git print paths relative to the folder it
+    runs in, matching index paths, and drops changes outside it.
+    """
     return (
         "log",
         f"-n{config.max_commits}",
         GIT_LOG_FORMAT,
         "--name-only",
+        "--relative",
         "--no-merges",
         "--no-renames",
     )

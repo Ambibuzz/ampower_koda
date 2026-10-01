@@ -83,12 +83,11 @@ def fold_turn(
 def _next_turn(transcript: Transcript, folded: int) -> str | None:
     """The rendered text of the next turn to digest, or ``None``."""
     starts = transcript.turn_starts
-    local = transcript.local_turn(folded)
-    if local < 0 or len(starts) <= KEEP_RAW_TURNS or local >= len(starts) - KEEP_RAW_TURNS:
+    if folded < 0 or len(starts) <= KEEP_RAW_TURNS or folded >= len(starts) - KEEP_RAW_TURNS:
         return None
 
-    start = starts[local]
-    end = starts[local + 1] if local + 1 < len(starts) else len(transcript.blocks)
+    start = starts[folded]
+    end = starts[folded + 1] if folded + 1 < len(starts) else len(transcript.blocks)
     return _render(transcript, start, end)
 
 

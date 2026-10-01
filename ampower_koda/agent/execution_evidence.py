@@ -95,15 +95,25 @@ class SourceMemory:
     def invalidate(self):
         self.entries.clear()
 
-    def render(self, retained_rounds):
+    def render(self, retained_rounds, max_chars=None):
         blocks = []
         for key, (path, digest, result, number) in list(self.entries.items()):
+            if number in retained_rounds:
+                continue
             try:
                 current = revision(self.read_current(path))
             except (OSError, ValueError):
                 current = None
             if current != digest:
                 del self.entries[key]
-            elif number not in retained_rounds:
+            else:
                 blocks.append(f"{path} SHA256 {digest}\n{result}")
-        return "\n".join(blocks)
+        if max_chars is None:
+            return "\n".join(blocks)
+        kept = []
+        used = 0
+        for block in reversed(blocks):
+            if used + len(block) + 1 <= max_chars:
+                kept.append(block)
+                used += len(block) + 1
+        return "\n".join(reversed(kept))

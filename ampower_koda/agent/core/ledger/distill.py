@@ -26,6 +26,8 @@ TOOL_KINDS: Mapping[str, LedgerKind] = {
 }
 
 _ANCHOR = re.compile(r"\b([\w./-]+\.[A-Za-z0-9]{1,6}):(\d+)(?:-(\d+))?\b")
+_STATED_COUNT = re.compile(r'^\w+ ".*": (\d+) (?:hits|matches|file\(s\)|path\(s\))')
+_IN_FILES = re.compile(r"matches in (\d+) file\(s\)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +116,9 @@ def _grep_shape(arguments: Mapping[str, object], result: str) -> str:
         return "0 matches"
     if str(arguments.get("mode", "")) == "files":
         return f"{count} file(s)"
-    files = len({line.split(":", 1)[0] for line in _content_lines(result) if ":" in line})
+    stated = _IN_FILES.search(result.split("\n", 1)[0])
+    files = int(stated.group(1)) if stated else len(
+        {line.split(":", 1)[0] for line in _content_lines(result)[1:] if ":" in line})
     return f"{count} matches in {files or 1} file(s)"
 
 
@@ -155,5 +159,13 @@ def _lines(result: str) -> int:
 
 
 def _count(result: str) -> int:
-    """How many results this output represents."""
-    return _lines(result)
+    """How many results this output represents: the count its header states.
+
+    search, grep and glob open with ``<tool> "<query>": N hits|matches|file(s)|path(s)``;
+    counting lines would add the header, notes, truncation markers and excerpt bodies.
+    """
+    stated = _STATED_COUNT.search(result.split("\n", 1)[0])
+    if stated:
+        return int(stated.group(1))
+    return len([line for line in _content_lines(result)
+                if not (line.startswith("[") or line.startswith("… +"))])

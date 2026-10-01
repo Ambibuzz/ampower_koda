@@ -11,7 +11,6 @@ from ..tokens import estimate_tokens
 from .escalation import SideUsage
 from .ledger import Ledger
 from .prompt import CachePlan, TranscriptMarker
-from .repo_map import FileRanks, RepoMap
 from .session import SessionContext
 from .transcript import Transcript
 from .working_set import WorkingSet
@@ -73,6 +72,8 @@ class ModelTurn:
 
     failed: bool = False
     detail: str = ""
+    provider_context_json: str = field(default='', repr=False)
+    """Opaque provider continuation fields, never rendered as user-facing prose."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +89,8 @@ class ModelRequest:
     """Send ``tool_choice: none``. The loop has decided this is the last round
     and is asking for prose; offering tools would invite a call it will then
     have to refuse."""
+
+    input_tokens_limit: int = 0
 
     @property
     def system_text(self) -> str:
@@ -152,8 +155,6 @@ class Session:
     """The built :class:`~…retrieval.engine.Retriever`. Untyped here only to
     keep this contracts module free of a dependency on the retrieval package."""
 
-    ranks: FileRanks
-    repo_map: RepoMap
     budget: ContextBudget
 
     ledger: Ledger = field(default_factory=Ledger)
@@ -163,8 +164,6 @@ class Session:
     fourth turn."""
 
     marker: TranscriptMarker | None = None
-    guard: object = None
-    """The compaction :class:`~…elide.compact.ThrashGuard`."""
 
     edited: tuple[str, ...] = ()
     turn: int = 0
@@ -184,7 +183,7 @@ class TurnResult:
     rounds: int = 0
     usage: TurnUsage = TurnUsage()
     side_usage: SideUsage = SideUsage()
-    """Escalation, fold and compaction calls — charged separately because the
+    """Fold and history-summary calls — charged separately because the
     loop cannot see them in its own request/response pair."""
 
     calls: tuple[str, ...] = ()

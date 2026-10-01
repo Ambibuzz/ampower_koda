@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+import threading
+from collections.abc import Sequence
 
-from ..errors import RedactedFileError
+from ..config.load import CONFIG_PATH, resolve_config
+from ..config.schema import CoreConfig
+from ..constants import DEFAULT_REDACT_GLOBS
 from ..globs import GlobMatcher, compile_globs
+from .ports import Workspace
 
 RedactionMatcher = GlobMatcher
 """Takes a relative path; returns the pattern that redacts it, or ``None``."""
@@ -16,24 +20,30 @@ def compile_redaction(patterns: Sequence[str]) -> RedactionMatcher:
     return compile_globs(patterns)
 
 
-def refuse_if_redacted(matcher: RedactionMatcher, path: str) -> None:
-    """Raise if ``path`` is redacted."""
-    pattern = matcher(path)
-    if pattern is not None:
-        raise RedactedFileError(path, pattern)
+def redaction_globs(config: CoreConfig) -> tuple[str, ...]:
+    """Built-in patterns plus the configured ones: a config adds, never replaces."""
+    return DEFAULT_REDACT_GLOBS + config.security.redact_globs
 
 
-def partition(
-    matcher: RedactionMatcher,
-    paths: Iterable[str],
-) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-    """Split ``paths`` into ``(allowed, [(redacted_path, pattern), …])``."""
-    allowed: list[str] = []
-    redacted: list[tuple[str, str]] = []
-    for path in paths:
-        pattern = matcher(path)
-        if pattern is None:
-            allowed.append(path)
-        else:
-            redacted.append((path, pattern))
-    return tuple(allowed), tuple(redacted)
+_REDACTION: dict[str, tuple[str, RedactionMatcher]] = {}
+"""Root → (config file stamp, matcher). One entry per app root, so it stays small."""
+_REDACTION_LOCK = threading.Lock()
+
+
+def redaction_matcher(workspace: Workspace) -> RedactionMatcher:
+    """The redaction discovery applies, for tools that read a file by path.
+
+    Same defaults, same ``.koda/config.toml``: the index is not the only way a
+    file reaches the model. Cached per root and config-file stamp, because
+    every read asks and the file rarely changes.
+    """
+    stat = workspace.stat(CONFIG_PATH)
+    stamp = stat.key() if stat is not None else ""
+    with _REDACTION_LOCK:
+        cached = _REDACTION.get(workspace.root)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    matcher = compile_redaction(redaction_globs(resolve_config(workspace, None, [])))
+    with _REDACTION_LOCK:
+        _REDACTION[workspace.root] = (stamp, matcher)
+    return matcher

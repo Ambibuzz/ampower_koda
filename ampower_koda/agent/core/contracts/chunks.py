@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from ..constants import NON_INDEXABLE_ROLES
@@ -37,9 +37,11 @@ class Chunk:
     every term those lines contain toward zero, quietly making the whole
     repository's ranking worse."""
 
-    digest: str = ""
+    digest: str = field(default="", init=False)
     """Content hash over ``(path, span, identity, body)``. Computed here rather
-    than by the builder so no code path can construct a chunk without one."""
+    than by the builder so no code path can construct a chunk without one, and
+    never accepted from a caller: ``dataclasses.replace`` with a new body would
+    otherwise keep the old body's digest."""
 
     def __post_init__(self) -> None:
         if not self.path:
@@ -48,12 +50,11 @@ class Chunk:
             raise CoreError(f"symbol chunk at {self.path}:{self.span} has no identity")
         if self.kind == "lines" and self.identity:
             raise CoreError(f"lines chunk at {self.path}:{self.span} carries an identity")
-        if not self.digest:
-            object.__setattr__(
-                self,
-                "digest",
-                content_hash(self.path, self.span.start, self.span.end, self.identity, self.body),
-            )
+        object.__setattr__(
+            self,
+            "digest",
+            content_hash(self.path, self.span.start, self.span.end, self.identity, self.body),
+        )
 
     @property
     def location(self) -> str:

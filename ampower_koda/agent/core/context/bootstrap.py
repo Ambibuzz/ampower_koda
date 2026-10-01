@@ -2,49 +2,35 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
-from ..budget.allocator import ContextBudget, allocate
-from ..config.merge import merge_config, parse_toml
+from ..config.load import CONFIG_PATH, resolve_config  # noqa: F401 - CONFIG_PATH re-exported
 from ..config.schema import CoreConfig
 from ..contracts.session import CoChangeMemory, RepoMemory, SessionContext
 from ..contracts.source import Overlay
-from ..errors import ConfigError, CoreError
 from ..history.cochange import build_cochange, empty_memory, git_log_arguments, parse_git_log
-from ..indexing.build import BuildStats, build_index
+from ..indexing.build import build_index
 from ..indexing.incremental import apply_overlays
 from ..indexing.parsers.registry import ParserRegistry, default_registry
 from ..memory.repo_memory import read_repo_memory
-from ..repomap.build import MapBuild, build_map
+from ..graph import build_graph, detect_mirrors
 from ..retrieval.engine import Retriever, build_retriever
 from ..workspace.discovery import discover
 from ..workspace.local import SystemClock
 from ..workspace.ports import Clock, Workspace
 
-CONFIG_PATH = ".koda/config.toml"
-
 
 @dataclass(frozen=True, slots=True)
 class Bootstrap:
-    """A built session context, plus what building it cost."""
+    """A built session context and its retriever."""
 
     context: SessionContext
-    stats: BuildStats
-
-    budget: ContextBudget
-    """Every ceiling this session runs under, derived from its window."""
 
     retriever: Retriever
     """The search engine, built once. Not on the context because a
     :class:`~ampower_koda.agent.core.contracts.session.SessionContext` is a
     contract — data with no behaviour — and a retriever holds a scored corpus
-    and knows how to walk a graph."""
-
-    ranking: MapBuild
-    """The map's ranking machinery: the code graph, the unpersonalized file
-    ranks, and the mirror set. Three consumers need these and all three are
-    expensive; computing them once here is the difference between a few
-    milliseconds of cold start and a few milliseconds per query."""
+    and knows how to walk the code graph, which is built once per cold start."""
 
     notes: tuple[str, ...] = ()
     """Non-fatal things a developer would want to know: a config file that
@@ -65,7 +51,7 @@ def build_context(
     clock = clock or SystemClock()
     notes: list[str] = []
 
-    config = _resolve_config(workspace, overrides, notes)
+    config = resolve_config(workspace, overrides, notes)
     if registry.unavailable:
         notes.append(
             "not indexed by symbol: "
@@ -92,55 +78,23 @@ def build_context(
         registry=registry,
     )
 
-    ranking = build_map(context.index, max_tokens=config.context.map_tokens)
-    context = replace(context, repo_map=ranking.map)
-
-    if ranking.map.degraded:
-        notes.append("repo map degraded to a directory tree: no parseable definitions")
-    if ranking.mirrors.roots:
-        notes.append("vendored copies demoted: " + ", ".join(sorted(ranking.mirrors.roots)))
+    graph = build_graph(context.index)
+    mirrors = detect_mirrors(context.index.paths)
+    if mirrors.roots:
+        notes.append("vendored copies demoted: " + ", ".join(sorted(mirrors.roots)))
 
     return Bootstrap(
         context=context,
-        stats=build.stats,
-        budget=allocate(
-            config.context.window_tokens,
-            ledger_override=config.context.ledger_soft_tokens,
-            map_tokens=config.context.map_tokens,
-            memory_tokens=config.context.memory_tokens,
-        ),
         retriever=build_retriever(
             context.index,
-            ranking.graph,
-            ranking.ranks,
-            mirrors=ranking.mirrors,
+            graph,
+            mirrors=mirrors,
             cochange=cochange,
+            config=config.retrieval,
+            rerank_config=config.rerank,
         ),
-        ranking=ranking,
         notes=tuple(notes),
     )
-
-
-def _resolve_config(
-    workspace: Workspace,
-    overrides: dict | None,
-    notes: list[str],
-) -> CoreConfig:
-    """Resolve ``defaults < .koda/config.toml < overrides``."""
-    from_file: dict | None = None
-    if workspace.stat(CONFIG_PATH) is not None:
-        try:
-            from_file = parse_toml(workspace.read_bytes(CONFIG_PATH).decode("utf-8"))
-        except (CoreError, UnicodeDecodeError) as exc:
-            notes.append(f"{CONFIG_PATH} ignored: {exc}")
-
-    try:
-        return merge_config(from_file, overrides)
-    except ConfigError:
-        if from_file is None:
-            raise
-        notes.append(f"{CONFIG_PATH} ignored: contains an invalid value")
-        return merge_config(overrides)
 
 
 def _read_memory(workspace: Workspace, config: CoreConfig, notes: list[str]) -> RepoMemory:

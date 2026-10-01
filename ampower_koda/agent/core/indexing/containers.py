@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 
 from ..contracts.symbols import Definition, DefinitionSite
 
@@ -41,6 +41,3 @@ def _nesting_key(site: DefinitionSite) -> tuple[int, int, str]:
     return (site.extent.start, -site.extent.end, site.name)
 
 
-def qualified_names(definitions: Sequence[Definition]) -> tuple[str, ...]:
-    """Return every definition's qualified name, in order. A convenience for tests."""
-    return tuple(definition.qualified_name for definition in definitions)

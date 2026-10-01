@@ -6,26 +6,24 @@ from .merge import merge_config, parse_toml
 from .schema import (
     ContextConfig,
     CoreConfig,
-    EscalationConfig,
     HistoryConfig,
     IndexingConfig,
     ModelsConfig,
     RetrievalConfig,
+    RerankConfig,
     SecurityConfig,
-    as_mapping,
     config_defaults,
 )
 
 __all__ = [
     "ContextConfig",
     "CoreConfig",
-    "EscalationConfig",
     "HistoryConfig",
     "IndexingConfig",
     "ModelsConfig",
     "RetrievalConfig",
+    "RerankConfig",
     "SecurityConfig",
-    "as_mapping",
     "config_defaults",
     "merge_config",
     "parse_toml",

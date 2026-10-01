@@ -15,15 +15,7 @@ from .agent import (
 )
 from .analysis import FileAnalysis, SkippedFile, SkipReason
 from .chunks import Chunk, ChunkKind, is_indexable_role
-from .escalation import (
-    Escalation,
-    FanoutAngle,
-    Formulation,
-    Formulator,
-    Rewrite,
-    Rung,
-    SideUsage,
-)
+from .escalation import SideUsage
 from .ledger import (
     LEDGER_KINDS,
     BlobRef,
@@ -43,20 +35,16 @@ from .prompt import (
     PromptBudget,
     TranscriptMarker,
 )
-from .repo_map import FileRanks, MirrorSet, RepoMap
+from .mirrors import MirrorSet
 from .repository import (
     RepositoryIndex,
-    chunk_by_digest,
     definitions_by_name,
     files_referencing,
     iter_chunks,
     iter_definitions,
-    iter_indexable_chunks,
     with_file,
-    with_skip,
-    without_file,
 )
-from .retrieval import LEG_TRUST, UNKNOWN_LEG_TRUST, Hit, LegName, LegResult, SearchResult
+from .retrieval import LEG_TRUST, UNKNOWN_LEG_TRUST, Hit, LegResult, SearchResult
 from .session import CoChangeMemory, RepoMemory, SessionContext
 from .source import FileStat, Overlay, SourceFile, Span
 from .symbols import (
@@ -69,7 +57,7 @@ from .symbols import (
     ReferenceKind,
     SymbolRole,
 )
-from .transcript import Block, BlockKind, Transcript, transcript_of
+from .transcript import Block, BlockKind, Transcript
 from .working_set import WorkingSet, WorkingSpan
 
 __all__ = [
@@ -86,13 +74,8 @@ __all__ = [
     "Confidence",
     "Definition",
     "DefinitionSite",
-    "Escalation",
-    "FanoutAngle",
     "FileAnalysis",
-    "FileRanks",
     "FileStat",
-    "Formulation",
-    "Formulator",
     "Hit",
     "LEDGER_KINDS",
     "LEG_TRUST",
@@ -100,7 +83,6 @@ __all__ = [
     "LedgerEntry",
     "LedgerKind",
     "LedgerSource",
-    "LegName",
     "LegResult",
     "Message",
     "MirrorSet",
@@ -114,11 +96,8 @@ __all__ = [
     "REFERENCE_KINDS",
     "Reference",
     "ReferenceKind",
-    "RepoMap",
     "RepoMemory",
     "RepositoryIndex",
-    "Rewrite",
-    "Rung",
     "SYMBOL_ROLES",
     "SearchResult",
     "Session",
@@ -140,15 +119,10 @@ __all__ = [
     "UtilityModel",
     "WorkingSet",
     "WorkingSpan",
-    "chunk_by_digest",
     "definitions_by_name",
     "files_referencing",
     "is_indexable_role",
     "iter_chunks",
     "iter_definitions",
-    "iter_indexable_chunks",
-    "transcript_of",
     "with_file",
-    "with_skip",
-    "without_file",
 ]

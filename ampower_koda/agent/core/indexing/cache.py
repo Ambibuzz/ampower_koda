@@ -154,7 +154,6 @@ def decode_analysis(payload: dict[str, Any], *, stat: FileStat | None) -> FileAn
             identity=item["identity"],
             role=item["role"],
             indexable=item["indexable"],
-            digest=item["digest"],
         )
         for item in payload["chunks"]
     )

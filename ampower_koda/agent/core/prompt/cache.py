@@ -12,14 +12,12 @@ from ..contracts.prompt import (
     PromptBudget,
     TranscriptMarker,
 )
-from ..contracts.repo_map import RepoMap
 from ..contracts.session import RepoMemory
 from ..tokens import estimate_tokens, truncate_to_tokens
 from .models import cache_limits, routing_key
 
 
 def build_prefix(
-    repo_map: RepoMap,
     memory: RepoMemory,
     role_prompt: str,
     *,
@@ -31,22 +29,19 @@ def build_prefix(
     limits = cache_limits(model)
 
     blocks = [
-        PromptBlock(role="map+memory", text=_map_and_memory(repo_map, memory, budget), ttl="5m"),
-        PromptBlock(role="system+tools", text=role_prompt.strip(), ttl="5m"),
+        # Anthropic requires longer TTLs before shorter ones. The rolling
+        # transcript uses 1h, so its preceding system boundaries must too.
+        PromptBlock(role="memory", text=_memory(memory, budget), ttl="1h"),
+        PromptBlock(role="system+tools", text=role_prompt.strip(), ttl="1h"),
     ]
 
     allowed = max(0, MAX_TOTAL_BREAKPOINTS - budget.reserved_breakpoints)
     return tuple(_mark_breakpoints(blocks, min_cacheable=limits.min_cacheable, allowed=allowed))
 
 
-def _map_and_memory(repo_map: RepoMap, memory: RepoMemory, budget: PromptBudget) -> str:
-    """The first cached block: what the repository is, then what it asks of you."""
-    sections: list[str] = []
-    if not repo_map.is_empty:
-        sections.append(truncate_to_tokens(repo_map.text, budget.map_tokens))
-    if not memory.is_empty:
-        sections.append(truncate_to_tokens(memory.text, budget.memory_tokens))
-    return "\n\n".join(sections)
+def _memory(memory: RepoMemory, budget: PromptBudget) -> str:
+    """The first cached block: what the repository asks of you."""
+    return "" if memory.is_empty else truncate_to_tokens(memory.text, budget.memory_tokens)
 
 
 def _mark_breakpoints(
@@ -84,7 +79,7 @@ def place_marker(
     last_plain: int | None = None
     for index, message in enumerate(transcript):
         width += message.tokens
-        if message.plain and width >= limits.min_cacheable:
+        if message.plain and message.text and width >= limits.min_cacheable:
             last_plain = index
 
     return TranscriptMarker(index=last_plain) if last_plain is not None else None
@@ -94,7 +89,6 @@ def assemble(
     *,
     blocks: Sequence[PromptBlock],
     transcript: Sequence[Message],
-    tail: str,
     model: str,
     session_id: str = "",
     previous_marker: TranscriptMarker | None = None,
@@ -107,7 +101,6 @@ def assemble(
         blocks=tuple(blocks),
         marker=marker,
         previous_marker=_keep_alive(previous_marker, marker, transcript),
-        tail=tail,
         session_id=routing_key(session_id),
     )
 
@@ -125,20 +118,3 @@ def _keep_alive(
     if previous.index >= len(transcript) or not transcript[previous.index].plain:
         return None
     return previous
-
-
-def system_plan_mismatch(system_prompt: str, plan: CachePlan) -> str | None:
-    """Detect a driver about to send two role prompts, or the wrong one."""
-    wanted = system_prompt.strip()
-    if not wanted:
-        return None
-
-    carried = plan.system_text
-    if not carried:
-        return "cache plan carries no system text while a system prompt was supplied"
-    if wanted in carried:
-        return None
-    return (
-        "system prompt is not the one in the cache plan — "
-        "sending both would run the wrong role"
-    )
