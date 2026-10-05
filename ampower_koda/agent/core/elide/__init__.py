@@ -1,35 +1,19 @@
-"""§12 — two mechanisms at two timescales, easy to conflate."""
+"""Bounding history: stub old tool results, then summarize under input pressure."""
 
 from __future__ import annotations
 
-from .collapse import ELIDED, READ_TOOLS, ROADMAP_TOOLS, collapse, roadmap, stub
-from .compact import (
-    CLIFF_PROMPT,
-    PRESSURE_OPTIONS,
-    PRESSURE_QUESTION,
-    SUMMARY_HEADER,
-    Compaction,
-    ThrashGuard,
-    compact,
-    trim_folded,
-)
+from .collapse import ELIDED, READ_TOOLS, collapse, stub
+from .compact import SUMMARY_HEADER, Compaction, compact_for_request
 from .hotcold import Elision, hot_cold
 
 __all__ = [
-    "CLIFF_PROMPT",
     "ELIDED",
-    "PRESSURE_OPTIONS",
-    "PRESSURE_QUESTION",
     "READ_TOOLS",
-    "ROADMAP_TOOLS",
     "SUMMARY_HEADER",
     "Compaction",
     "Elision",
-    "ThrashGuard",
     "collapse",
-    "compact",
+    "compact_for_request",
     "hot_cold",
-    "roadmap",
     "stub",
-    "trim_folded",
 ]

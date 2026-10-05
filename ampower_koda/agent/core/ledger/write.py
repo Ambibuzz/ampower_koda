@@ -89,50 +89,9 @@ def record_read(
     return record(ledger, "span", ref.location, refs=(ref,), source=source)
 
 
-def supersede(
-    ledger: Ledger,
-    entry_id: str,
-    text: str,
-    *,
-    source: LedgerSource = "human",
-) -> tuple[Ledger, str]:
-    """Append a correction and point the old entry at it."""
-    original = ledger.get(entry_id)
-    if original is None or not original.is_live:
-        return ledger, ""
-
-    correction = _entry(
-        ledger,
-        original.kind,
-        text,
-        original.refs,
-        source,
-        original.confidence,
-        original.pinned,
-    )
-    ledger = ledger.appending(correction, counted=False)
-    superseded = ledger.get(entry_id)
-    if superseded is None:  # pragma: no cover
-        return ledger, correction.id
-    return ledger.replacing(replace(superseded, superseded_by=correction.id)), correction.id
-
-
-def pin(ledger: Ledger, entry_id: str, *, pinned: bool = True) -> Ledger:
-    """Set an entry's pin. Core-owned, so it is a flag rather than a new line."""
-    entry = ledger.get(entry_id)
-    if entry is None or entry.pinned == pinned:
-        return ledger
-    return ledger.replacing(replace(entry, pinned=pinned))
-
-
 def mark_stale(ledger: Ledger, entry_id: str) -> Ledger:
     """Latch an entry stale. Never unlatches."""
     entry = ledger.get(entry_id)
     if entry is None or entry.stale:
         return ledger
     return ledger.replacing(replace(entry, stale=True))
-
-
-def note(ledger: Ledger, text: str, *, pinned: bool = True) -> tuple[Ledger, str]:
-    """A human's instruction, pinned by default."""
-    return record(ledger, "human_note", text, source="human", confidence="read", pinned=pinned)

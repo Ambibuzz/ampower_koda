@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Container, Sequence
 from dataclasses import dataclass, replace
 
 from ..constants import MAX_TURN_TOKENS_MARGINAL, MAX_TURN_TOKENS_OBSERVED
@@ -37,10 +36,6 @@ class TurnMeters:
 
     dry_streak: int = 0
     continuations: int = 0
-    coverage_fired: bool = False
-    """Latched, so the coverage gate can fire at most once per turn. Latched
-    *before* the check runs upstream — a gate that latches after an await can
-    fire twice on a fast second round."""
 
     @property
     def rounds_left(self) -> int:
@@ -70,10 +65,6 @@ class Decision:
     nudge: nudges.Nudge | None = None
     reason: str = ""
 
-    @property
-    def carry_on(self) -> bool:
-        return not self.stop and not self.force_terminal
-
 
 def check(meters: TurnMeters) -> Decision:
     """The gates, in the order they are allowed to fire."""
@@ -102,28 +93,6 @@ def after_max_tokens(meters: TurnMeters) -> Decision:
         return Decision(nudge=nudges.continuation(), reason="output limit")
     return Decision(stop=True, reason=nudges.CUT_OFF)
 
-
-COVERAGE_MIN_CALLS = 3
-
-COVERAGE_MAX_UNOPENED = 3
-
-
-def coverage_gate(
-    meters: TurnMeters,
-    *,
-    central: Sequence[str],
-    opened: Container[str],
-    discovery_calls: int,
-) -> Decision:
-    """Before the first answer of a turn: did it look at the obvious files?"""
-    if meters.coverage_fired or discovery_calls < COVERAGE_MIN_CALLS:
-        return Decision()
-
-    missed = tuple(path for path in central if path not in opened)
-    if not missed or len(missed) > COVERAGE_MAX_UNOPENED:
-        return Decision()
-
-    return Decision(nudge=nudges.coverage(missed), reason="coverage")
 
 
 def late_tool_call() -> Decision:

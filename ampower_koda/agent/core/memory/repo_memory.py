@@ -8,6 +8,10 @@ from ..errors import WorkspaceError
 from ..tokens import estimate_tokens, truncate_to_tokens
 from ..workspace.ports import Workspace
 
+MIN_TRUNCATED_TOKENS = 32
+"""A cut memory file shorter than this is dropped rather than kept as a stub.
+A file that fits whole is kept at any length."""
+
 
 def read_repo_memory(
     workspace: Workspace,
@@ -15,7 +19,14 @@ def read_repo_memory(
     max_tokens: int,
     filenames: tuple[str, ...] = MEMORY_FILENAMES,
 ) -> RepoMemory:
-    """Read the repository's memory files into one budgeted block."""
+    """Read the repository's memory files into one budgeted block.
+
+    ``max_tokens`` 0 switches memory off: nothing is read and nothing reported
+    as truncated, so "off" and "too small to fit" stay distinguishable.
+    """
+    if max_tokens <= 0:
+        return RepoMemory()
+
     sections: list[str] = []
     sources: list[str] = []
     truncated = False
@@ -37,7 +48,14 @@ def read_repo_memory(
             remaining = 0
             continue
 
-        truncated = truncated or len(body) < len(text.strip())
+        cut = len(body) < len(text.strip())
+        if cut and estimate_tokens(body) < MIN_TRUNCATED_TOKENS:
+            # The leftover of an earlier file's budget: a header and a word or
+            # two instruct nothing, so the file is dropped, not stubbed.
+            truncated = True
+            continue
+
+        truncated = truncated or cut
         section = f"{header}\n\n{body}"
         sections.append(section)
         sources.append(filename)

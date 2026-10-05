@@ -2,35 +2,24 @@
 
 from __future__ import annotations
 
-from .dedupe import (
-    NOT_REPLAYABLE,
-    PREFETCH_CONCURRENCY,
-    REPLAYABLE,
-    Memo,
-    Suppressed,
-    canonical,
-    leading_replayable,
-)
+from .dedupe import REPLAYABLE, Memo, Suppressed, canonical
 from .gates import (
     DRY_ROUNDS_LIMIT,
     Decision,
     TurnMeters,
     after_max_tokens,
     check,
-    coverage_gate,
     evidence_yield,
     is_dry,
     late_tool_call,
 )
 from .leaks import CORRECTION, LEAK_MARKER, Leak, detect, recover
-from .nudges import Nudge, coverage
+from .nudges import Nudge
 
 __all__ = [
     "CORRECTION",
     "DRY_ROUNDS_LIMIT",
     "LEAK_MARKER",
-    "NOT_REPLAYABLE",
-    "PREFETCH_CONCURRENCY",
     "REPLAYABLE",
     "Decision",
     "Leak",
@@ -41,12 +30,9 @@ __all__ = [
     "after_max_tokens",
     "canonical",
     "check",
-    "coverage",
-    "coverage_gate",
     "detect",
     "evidence_yield",
     "is_dry",
     "late_tool_call",
-    "leading_replayable",
     "recover",
 ]

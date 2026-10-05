@@ -6,8 +6,8 @@ import contextlib
 import os
 import subprocess
 import time
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..constants import CACHE_DIRECTORY, EXCLUDED_DIRECTORIES
@@ -17,6 +17,13 @@ from ..errors import WorkspaceError
 _ALLOWED_GIT_SUBCOMMANDS = frozenset({"log"})
 
 _GIT_TIMEOUT_SECONDS = 20
+
+#: ``.koda/.gitignore``: Koda's generated state only (index cache, render
+#: output, archived tests, bytecode) and the marker itself. Regression tests,
+#: config.toml and verification.json stay visible to git so they can be committed.
+_GENERATED_MARKER = ".gitignore\ncache/\nrender/\narchive/\n__pycache__/\n"
+#: The earlier marker, which ignored everything, tests included; it is replaced.
+_LEGACY_MARKER = "*\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +75,10 @@ class LocalWorkspace:
             directory.mkdir(parents=True, exist_ok=True)
             # The cache lives inside the app checkout. Without this marker it
             # is untracked there, and the patch/push path sweeps it into the PR.
+            # Only generated state is ignored: tests/ and config.toml ship.
             marker = self.root_path / Path(self.cache_directory).parts[0] / ".gitignore"
-            if not marker.exists():
-                marker.write_text("*\n", encoding="utf-8")
+            if not marker.exists() or marker.read_text(encoding="utf-8") == _LEGACY_MARKER:
+                marker.write_text(_GENERATED_MARKER, encoding="utf-8")
             temporary.write_bytes(payload)
             os.replace(temporary, target)
         except OSError:
@@ -103,68 +111,8 @@ class LocalWorkspace:
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryWorkspace:
-    """An in-memory workspace: a path → bytes mapping and nothing else."""
-
-    files: Mapping[str, bytes]
-    root_label: str = "/memory"
-    git_output: Mapping[str, str] = field(default_factory=dict)
-    """Maps a joined git argument list to canned stdout, so co-change parsing
-    can be exercised without a repository."""
-
-    cache: dict[str, bytes] = field(default_factory=dict)
-    now_ns: int = 0
-
-    @property
-    def root(self) -> str:
-        return self.root_label
-
-    def list_files(self) -> Iterable[str]:
-        return sorted(self.files)
-
-    def read_bytes(self, path: str) -> bytes:
-        try:
-            return self.files[path]
-        except KeyError as exc:
-            raise WorkspaceError(path, "not found") from exc
-
-    def stat(self, path: str) -> FileStat | None:
-        content = self.files.get(path)
-        if content is None:
-            return None
-        return FileStat(size=len(content), mtime_ns=self.now_ns)
-
-    def read_cache(self, key: str) -> bytes | None:
-        return self.cache.get(key)
-
-    def write_cache(self, key: str, payload: bytes) -> None:
-        self.cache[key] = payload
-
-    def run_git(self, args: Sequence[str]) -> str | None:
-        return self.git_output.get(" ".join(args))
-
-
-@dataclass(frozen=True, slots=True)
 class SystemClock:
     """The real clock. Injected, never reached for directly."""
 
     def now(self) -> float:
         return time.time()
-
-
-@dataclass(frozen=True, slots=True)
-class FixedClock:
-    """A clock that does not move, so decay curves are testable."""
-
-    timestamp: float
-
-    def now(self) -> float:
-        return self.timestamp
-
-
-def text_workspace(files: Mapping[str, str], **kwargs: object) -> MemoryWorkspace:
-    """Build a :class:`MemoryWorkspace` from text, so fixtures read as source."""
-    return MemoryWorkspace(
-        files={path: text.encode("utf-8") for path, text in files.items()},
-        **kwargs,  # type: ignore[arg-type]
-    )

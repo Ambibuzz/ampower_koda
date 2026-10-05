@@ -11,6 +11,13 @@ from .schema import CoreConfig, config_defaults
 
 T = TypeVar("T")
 
+RETIRED_GROUPS = frozenset({"escalation"})
+"""Top-level tables that no longer configure anything. An old config file that
+still carries one is accepted and the table ignored, not rejected."""
+
+RETIRED_KEYS = frozenset({"context.map_tokens"})
+"""Single keys that no longer configure anything (the repo map was removed)."""
+
 
 def merge_config(
     *overrides: Mapping[str, Any] | None,
@@ -18,12 +25,9 @@ def merge_config(
 ) -> CoreConfig:
     """Apply sparse ``overrides`` over ``base``, lowest precedence first.
 
-    Returns what ``_apply`` built rather than re-listing the groups. The old
-    rebuild named six of the seven and dropped ``escalation`` on the last line,
-    so a site could set ``escalation.max_rewrites``, have it accepted, validated
-    against its bounds — and then silently receive the default. A hand-written
-    field list here is a second copy of :class:`CoreConfig` that nothing checks,
-    and the next group added would have been dropped the same way.
+    Returns what ``_apply`` built rather than re-listing the groups: a
+    hand-written field list here would be a second copy of :class:`CoreConfig`
+    that nothing checks, and once silently dropped a whole group.
 
     ``_apply`` returns ``replace(node, **updates)``, which is a complete config
     and re-runs ``__post_init__``, so every group is still validated.
@@ -33,6 +37,40 @@ def merge_config(
         if override:
             config = _apply(config, override, prefix="")
     return config
+
+
+def merge_config_by_key(
+    override: Mapping[str, Any] | None,
+    *,
+    base: CoreConfig | None = None,
+) -> tuple[CoreConfig, tuple[ConfigError, ...]]:
+    """Apply ``override`` one key at a time, skipping the keys that are invalid.
+
+    For a file a person edits by hand: one typo must cost that key, not revert
+    every other key to its default. Each skipped key's error is returned so the
+    caller can say which key and why. Validation is per field, so applying keys
+    one by one accepts exactly what applying them together would.
+    """
+    config = base if base is not None else config_defaults()
+    errors: list[ConfigError] = []
+    for leaf in _leaves(override or {}):
+        try:
+            config = merge_config(leaf, base=config)
+        except ConfigError as exc:
+            if all(str(exc) != str(seen) for seen in errors):
+                errors.append(exc)
+    return config, tuple(errors)
+
+
+def _leaves(override: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Split a nested override into single-key overrides, one per leaf value."""
+    leaves: list[dict[str, Any]] = []
+    for key, value in override.items():
+        if isinstance(value, Mapping) and value:
+            leaves.extend({key: leaf} for leaf in _leaves(value))
+        else:
+            leaves.append({key: value})
+    return leaves
 
 
 def _apply(node: T, override: Mapping[str, Any], *, prefix: str) -> T:
@@ -46,6 +84,8 @@ def _apply(node: T, override: Mapping[str, Any], *, prefix: str) -> T:
     for key, value in override.items():
         path = f"{prefix}{key}"
         spec = known.get(key)
+        if spec is None and (not prefix and key in RETIRED_GROUPS or path in RETIRED_KEYS):
+            continue
         if spec is None:
             raise ConfigError(path, f"unknown key; expected one of {sorted(known)}")
 
@@ -65,7 +105,11 @@ def _coerce(path: str, current: Any, value: Any) -> Any:
     if isinstance(current, tuple):
         if isinstance(value, str) or not isinstance(value, (list, tuple)):
             raise ConfigError(path, "expected a list")
-        return tuple(str(item) for item in value)
+        # Every list key holds patterns or names: ``7`` is a typo, not the string "7".
+        for item in value:
+            if not isinstance(item, str):
+                raise ConfigError(path, f"expected a list of strings, got {type(item).__name__} {item!r}")
+        return tuple(value)
 
     if isinstance(current, bool):
         if not isinstance(value, bool):

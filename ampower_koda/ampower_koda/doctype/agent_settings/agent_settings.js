@@ -56,7 +56,32 @@ frappe.ui.form.on('Agent Settings', {
 
 function set_model_options_for_provider(frm, reset) {
     var provider = frm.doc.default_ai_provider || 'OpenAI';
-    var entries = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
+    with_provider_models(provider, function(entries) {
+        // The provider may have changed while the list was loading.
+        if ((frm.doc.default_ai_provider || 'OpenAI') === provider) apply_model_options(frm, provider, entries, reset);
+    });
+}
+
+// OpenAI's models are listed live (newest first, cached server-side), so a new
+// model is offered without a code change; the built-in list is the fallback.
+function with_provider_models(provider, done) {
+    var fallback = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
+    if (provider !== 'OpenAI') return done(fallback);
+    if (window.koda_live_models) return done(window.koda_live_models);
+    frappe.call({
+        method: 'ampower_koda.agent.api.get_provider_models',
+        args: { provider: provider },
+        callback: function(r) {
+            var ids = (r.message || {}).models || [];
+            if (!ids.length) return done(fallback);
+            window.koda_live_models = ids.map(function(id) { return { value: id, label: id }; });
+            done(window.koda_live_models);
+        },
+        error: function() { done(fallback); }
+    });
+}
+
+function apply_model_options(frm, provider, entries, reset) {
     var model_ids = entries.map(function(m) { return m.value; });
     var current = frm.doc.default_ai_model || '';
 

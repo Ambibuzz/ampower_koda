@@ -6,14 +6,8 @@ from .analysis import PLAIN_TEXT, analyze
 from .build import BuildResult, BuildStats, build_index
 from .cache import schema_fingerprint
 from .chunking import build_chunks
-from .containers import qualified_names, resolve_definitions
-from .incremental import (
-    Revisions,
-    apply_overlays,
-    commit_if_current,
-    forget,
-    reanalyse,
-)
+from .containers import resolve_definitions
+from .incremental import apply_overlays
 from .parsers import (
     LANGUAGES,
     FrappeJsonParser,
@@ -38,19 +32,14 @@ __all__ = [
     "LanguageSpec",
     "ParserRegistry",
     "TreeSitterParser",
-    "Revisions",
     "analyze",
     "apply_overlays",
     "build_chunks",
     "build_index",
     "build_default_registry",
     "build_registry",
-    "commit_if_current",
     "default_registry",
     "load_grammars",
-    "forget",
-    "qualified_names",
-    "reanalyse",
     "registry_identity",
     "resolve_definitions",
     "schema_fingerprint",

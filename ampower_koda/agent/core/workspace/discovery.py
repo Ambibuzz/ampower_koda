@@ -12,7 +12,7 @@ from ..contracts.source import SourceFile
 from ..errors import WorkspaceError
 from ..identity import source_hash
 from .ports import Workspace
-from .redaction import compile_redaction
+from .redaction import compile_redaction, redaction_globs
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +50,7 @@ def decode_source(content: bytes) -> str | None:
 def discover(workspace: Workspace, config: CoreConfig) -> Discovery:
     """Enumerate the workspace and split it into candidates and skips."""
     excluded = excluded_directories(config)
-    is_redacted = compile_redaction(config.security.redact_globs)
+    is_redacted = compile_redaction(redaction_globs(config))
     max_bytes = config.indexing.max_file_bytes
 
     candidates: list[SourceFile] = []

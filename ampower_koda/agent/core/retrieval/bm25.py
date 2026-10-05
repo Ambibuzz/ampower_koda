@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from math import log
 from types import MappingProxyType
@@ -67,10 +67,6 @@ class LexicalIndex:
         frequency = self.document_frequency.get(term, 0)
         total = max(self.counted, 1)
         return log(1.0 + (total - frequency + 0.5) / (frequency + 0.5))
-
-    def rarity(self, term: str) -> float:
-        """``1 / (1 + ln(1 + sites))`` — the reranker's rarity feature."""
-        return 1.0 / (1.0 + log(1.0 + self.document_frequency.get(term, 0)))
 
 
 def build_lexical_index(index: RepositoryIndex) -> LexicalIndex:
@@ -139,10 +135,6 @@ def is_prose(chunk: Chunk) -> bool:
 class ScoredDocument:
     position: int
     score: float
-    matched: tuple[str, ...]
-    """Which query terms this document carried. Feeds the reranker's term
-    coverage feature and the confidence calculation, both of which need to know
-    *which* terms matched rather than only how well."""
 
 
 def score(
@@ -160,7 +152,6 @@ def score(
     weights = weights or {}
     normalised = query.strip().lower()
     accumulated: dict[int, float] = {}
-    matched: dict[int, set[str]] = {}
 
     for term, query_frequency in terms.items():
         positions = index.postings.get(term)
@@ -178,7 +169,6 @@ def score(
             accumulated[position] = accumulated.get(position, 0.0) + weight * idf * _tf(
                 frequency, document.length, index.average_length
             )
-            matched.setdefault(position, set()).add(term)
 
     for position in list(accumulated):
         accumulated[position] += _exact_bonus(index.documents[position].chunk, normalised)
@@ -188,14 +178,7 @@ def score(
         key=lambda item: (-item[1], item[0]),
     )[:limit]
 
-    return tuple(
-        ScoredDocument(
-            position=position,
-            score=value,
-            matched=tuple(sorted(matched.get(position, ()))),
-        )
-        for position, value in ranked
-    )
+    return tuple(ScoredDocument(position=position, score=value) for position, value in ranked)
 
 
 def _tf(frequency: int, length: int, average_length: float) -> float:
@@ -219,12 +202,3 @@ def _exact_bonus(chunk: Chunk, query: str) -> float:
     if query in chunk.body.lower():
         bonus += BM25_TEXT_BONUS
     return bonus
-
-
-def symbols(index: LexicalIndex) -> Sequence[str]:
-    """Every distinct symbol name in the corpus, in first-seen order."""
-    seen: dict[str, None] = {}
-    for document in index.documents:
-        if document.chunk.identity:
-            seen.setdefault(document.chunk.identity, None)
-    return tuple(seen)
