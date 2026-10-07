@@ -855,6 +855,113 @@ def _needs_migrate(path: str) -> bool:
     return parts[-1].endswith(".json") and any(folder in parts[:-1] for folder in MIGRATED_METADATA_FOLDERS)
 
 
+def _worktree_signature(repo_root: str) -> str:
+    """Hash the full working-tree content vs HEAD to detect net file changes.
+
+    Uses content diffs (not just file names) so a follow-up that patches a file
+    already in the changed set is still detected. Includes untracked file
+    contents so newly created files count too.
+    """
+    parts = []
+    # Full content diff of tracked files (staged + unstaged) against HEAD.
+    ok, out = run_git(["diff", "HEAD"], cwd=repo_root)
+    if ok and out:
+        parts.append(out)
+
+    # Untracked files: include their contents, not just their names.
+    ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
+    if ok and untracked:
+        for rel in sorted(untracked.splitlines()):
+            rel = rel.strip()
+            if not rel:
+                continue
+            parts.append(f"\n### UNTRACKED {rel}\n")
+            try:
+                with open(os.path.join(repo_root, rel), "r", encoding="utf-8", errors="replace") as fh:
+                    parts.append(fh.read())
+            except OSError:
+                parts.append(f"(unreadable: {rel})")
+
+    payload = "\n".join(parts)
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _prior_changed_paths(doc) -> list:
+    """Canonical paths from the previous run's files_changed list."""
+    paths = []
+    for row in as_json_list(doc.files_changed):
+        if isinstance(row, dict):
+            p = (row.get("path") or "").strip()
+            if p and p not in paths:
+                paths.append(p)
+    return paths
+
+
+def _merge_file_edits(prior: list, new: list) -> list:
+    """Merge prior and new edit records, updating summaries for same paths."""
+    merged = [dict(e) for e in prior if isinstance(e, dict)]
+    index = {e.get("path"): i for i, e in enumerate(merged) if e.get("path")}
+    for entry in new:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if path and path in index:
+            merged[index[path]]["summary"] = entry.get("summary", merged[index[path]].get("summary"))
+        elif path:
+            merged.append(dict(entry))
+            index[path] = len(merged) - 1
+        else:
+            merged.append(dict(entry))
+    return merged
+
+
+# Names/patterns that indicate throwaway "scratch" files the model sometimes
+# creates (progress notes, status markers, metadata dumps). These are never part
+# of a real code change and must not land in the PR.
+_SCRATCH_NAME_KEYWORDS = (
+    "note", "notes", "metadata", "summary", "readme", "changelog",
+    "finalize", "implementation_done", "done", "todo", "scratch",
+)
+
+
+def _is_scratch_file(rel_path: str) -> bool:
+    """True for agent-created doc/marker files that don't belong in the change set."""
+    name = os.path.basename(rel_path).lower()
+    _, ext = os.path.splitext(name)
+    # Loose .txt files are never a legitimate Frappe code artifact.
+    if ext == ".txt":
+        return True
+    # Markdown only when it looks like an agent note/marker (keep real code .md rare).
+    if ext == ".md" and any(k in name for k in _SCRATCH_NAME_KEYWORDS):
+        return True
+    if re.match(r"(?i)(implementation_done|finalize_|ai_feature|ai_progress)", name):
+        return True
+    return False
+
+
+def _strip_agent_scratch_files(repo_root: str) -> list[str]:
+    """Delete newly-created scratch/marker files from the working tree.
+
+    Returns the list of removed repo-relative paths. Only untracked files are
+    considered, so tracked source code is never touched.
+    """
+    ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
+    if not ok or not (untracked or "").strip():
+        return []
+    removed = []
+    for rel in untracked.splitlines():
+        rel = rel.strip()
+        if not rel or not _is_scratch_file(rel):
+            continue
+        try:
+            os.remove(os.path.join(repo_root, rel))
+            removed.append(rel)
+        except OSError:
+            log_agent_error("Agent Execution: strip scratch file",
+                f"could not remove {rel}\n{frappe.get_traceback()}")
+    return removed
+
+
 def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
     """Determine which bench commands are needed based on which file types were edited.
     Always includes clear-cache and supervisorctl restart."""
@@ -1407,6 +1514,19 @@ def _stale_pull_request(doc, config: dict, branch_name: str) -> str:
     else:
         return ""
     return f"The recorded PR ({doc.pr_url}) is {reason}; it will not be reused for '{branch_name}'."
+
+
+def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: str) -> bool:
+    """True if `branch_name` has commits that `base_branch` does not (local only)."""
+    if not (app_name and base_branch and branch_name):
+        return False
+    try:
+        repo_root = get_repo_root(app_name)
+        ok, out = run_git(["rev-list", "--count", f"{base_branch}..{branch_name}"], cwd=repo_root)
+        return ok and out.strip().isdigit() and int(out.strip()) > 0
+    except Exception:
+        log_agent_error("Agent Deploy: rev-list vs base", frappe.get_traceback())
+        return False
 
 
 def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: str) -> bool:
