@@ -35,6 +35,9 @@
   "change_summary",
   "plan_section",
   "agent_plan",
+  "plan_json",
+  "approved_plan_json",
+  "execution_results",
   "diff_section",
   "patch_diff",
   "logs_section",
@@ -43,6 +46,9 @@
   "error_log",
   "debug_section",
   "pending_bench_commands",
+  "rq_job_id",
+  "agent_run_id",
+  "execution_checkpoint",
   "conversation_log",
   "understanding_snapshot",
   "implementation_snapshot",
@@ -50,6 +56,9 @@
   "follow_up_count",
   "files_changed",
   "tokens_used",
+  "cache_input_tokens",
+  "cache_read_tokens",
+  "cache_write_tokens",
   "cost_estimate",
   "prompts_tab",
   "use_default_prompts",
@@ -120,7 +129,7 @@
    "fieldname": "ai_provider",
    "fieldtype": "Select",
    "label": "Provider",
-   "options": "OpenAI\nGemini\nClaude",
+   "options": "OpenAI\nGemini\nClaude\nOpenRouter",
    "reqd": 1
   },
   {
@@ -130,9 +139,9 @@
   {
    "default": "gpt-4o-mini",
    "fieldname": "ai_model",
-   "fieldtype": "Select",
+   "fieldtype": "Autocomplete",
    "label": "Model",
-   "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022",
+   "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022\ndeepseek/deepseek-v4-flash-0731\ndeepseek/deepseek-chat\nanthropic/claude-sonnet-4\nopenai/gpt-4o-mini\nqwen/qwen-2.5-coder-32b-instruct",
    "reqd": 1
   },
   {
@@ -238,9 +247,11 @@
    "label": "Agent Plan"
   },
   {
+   "description": "Display of the structured plan. Edit Structured Plan JSON to adjust tasks.",
    "fieldname": "agent_plan",
    "fieldtype": "Markdown Editor",
-   "label": "Agent Plan"
+   "label": "Agent Plan",
+   "read_only": 1
   },
   {
    "collapsible": 1,
@@ -298,6 +309,27 @@
    "read_only": 1
   },
   {
+   "fieldname": "rq_job_id",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "RQ Job ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "agent_run_id",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Agent Run ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "execution_checkpoint",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Execution Checkpoint",
+   "read_only": 1
+  },
+  {
    "fieldname": "conversation_log",
    "fieldtype": "Long Text",
    "label": "Conversation Log",
@@ -312,7 +344,7 @@
    "read_only": 1
   },
   {
-   "description": "What the last implementation run built — used as memory for follow-up patches.",
+   "description": "What the last implementation run built - used as memory for follow-up patches.",
    "fieldname": "implementation_snapshot",
    "fieldtype": "Long Text",
    "hidden": 1,
@@ -346,9 +378,28 @@
    "read_only": 1
   },
   {
+   "fieldname": "cache_input_tokens",
+   "fieldtype": "Int",
+   "label": "Cache Input Tokens",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cache_read_tokens",
+   "fieldtype": "Int",
+   "label": "Cache Read Tokens",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cache_write_tokens",
+   "fieldtype": "Int",
+   "label": "Cache Write Tokens",
+   "read_only": 1
+  },
+  {
    "fieldname": "cost_estimate",
    "fieldtype": "Currency",
    "label": "Cost Estimate",
+   "precision": "6",
    "read_only": 1
   },
   {
@@ -376,14 +427,35 @@
    "fieldtype": "Table",
    "label": "Prompts",
    "options": "Agent Prompt Configuration"
+  },
+  {
+   "description": "Canonical task contract. Changes are validated before approval.",
+   "fieldname": "plan_json",
+   "fieldtype": "Code",
+   "label": "Structured Plan JSON",
+   "options": "JSON"
+  },
+  {
+   "fieldname": "approved_plan_json",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Approved Plan JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "execution_results",
+   "fieldtype": "Code",
+   "label": "Task Execution Results",
+   "options": "JSON",
+   "read_only": 1
   }
  ],
  "links": [],
- "modified": "2026-07-04 12:24:28.352151",
+ "modified": "2026-09-24 11:00:00.000000",
  "modified_by": "Administrator",
  "module": "Ampower Koda",
  "name": "Agent Request",
- "naming_rule": "Expression",
+ "naming_rule": "Expression (old style)",
  "owner": "Administrator",
  "permissions": [
   {
@@ -398,6 +470,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "modified",
  "sort_order": "DESC",
  "states": [],

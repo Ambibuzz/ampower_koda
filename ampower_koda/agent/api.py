@@ -3,24 +3,43 @@
 
 import json
 import os
-import subprocess
+import re
 from functools import wraps
+from pathlib import Path
 
 import frappe
 from frappe import _
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.executor import _generate_patch_diff
+from ampower_koda.agent.execution_contract import load_plan
+from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdown
+from ampower_koda.agent.executor import (
+    _generate_patch_diff,
+    _is_request_branch,
+    _uncommitted_paths,
+    _update_status,
+    bench_branch_refusal,
+    normalize_bench_selection,
+    restore_execution_state,
+    validate_target_app,
+)
+from ampower_koda.ampower_koda.doctype.agent_settings.agent_settings import (
+    PROVIDER_KEY_FIELDS,
+)
 from ampower_koda.agent.git_ops import (
     branch_exists,
     checkout_base,
     diff_file,
+    diff_worktree_file,
     get_current_branch,
     get_repo_root,
     list_changed_files,
+    list_worktree_changes,
     run_git,
 )
-from ampower_koda.agent.graph import _get_bench_env
+from ampower_koda.agent.graph import _app_file_exists
+from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent.run_control import enqueue_job, stop_job
 
 DOCTYPE_NAME = "Agent Request"
 
@@ -30,11 +49,60 @@ RESTARTABLE_STATUSES = (
     "Awaiting Approval", "Awaiting Push Approval",
 )
 
+# Statuses from which the saved structured plan may be edited or (re)executed.
+PLAN_EXECUTABLE_STATUSES = (
+    "Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval",
+)
+
 # Statuses where the agent is actively working, so manual actions must wait.
 BUSY_STATUSES = (
     "Understanding", "Planning", "Implementing",
     "Reviewing", "Building", "Pushing",
 )
+
+# Cap on the request's bench log. Matches the field's own 50k truncation, named
+# here because two endpoints now append to the same field and a cap that only
+# one of them applied would let the other grow past it.
+BENCH_LOG_MAX_CHARS = 50000
+
+
+def _reconcile_if_dead(doc) -> bool:
+    """Flip a busy request to Failed when its RQ job is no longer running.
+
+    A Queued request with a job counts too: a job lost before it started would
+    otherwise leave the form polling a request that never starts.
+    """
+    if doc.status not in BUSY_STATUSES and doc.status != "Queued":
+        return False
+    if not (doc.rq_job_id or "").strip():
+        return False
+
+    try:
+        from rq.job import Job
+        from rq.exceptions import NoSuchJobError
+        from frappe.utils.background_jobs import get_redis_conn
+
+        job = Job.fetch(doc.rq_job_id, connection=get_redis_conn())
+        job_status = job.get_status(refresh=True)
+        if job_status in ("queued", "started", "scheduled", "deferred"):
+            return False
+    except NoSuchJobError:
+        pass
+    except Exception:
+        log_agent_error("Agent Reconcile: could not inspect RQ job", frappe.get_traceback())
+        return False
+
+    _update_status(
+        doc.name, doc.owner or frappe.session.user, "Failed",
+        "Background job was terminated unexpectedly (worker likely killed by "
+        "an OOM condition or a bench/service restart). Please retry.",
+        error_log=(
+            f"Reconciled stale status. Last known status: {doc.status}. "
+            f"RQ job id: {doc.rq_job_id} was not found running."
+        ),
+    )
+    doc.reload()
+    return True
 
 
 def _whitelist_logged(fn):
@@ -56,15 +124,20 @@ def _validate_provider_key(doc):
     settings = frappe.get_single("Agent Settings")
     if not settings.enable_ai_agent:
         frappe.throw(_("AI Coding Agent is disabled in Agent Settings."))
+
     provider = (doc.ai_provider or settings.default_ai_provider or "OpenAI").strip()
-    key_checks = {
-        "OpenAI": ("openai_api_key", "OpenAI API key"),
-        "Gemini": ("google_api_key", "Google API key"),
-        "Claude": ("anthropic_api_key", "Anthropic API key"),
-    }
-    field, label = key_checks.get(provider, key_checks["OpenAI"])
+    if provider not in PROVIDER_KEY_FIELDS:
+        frappe.throw(
+            _("Unknown AI provider {0}. Known providers: {1}.").format(
+                provider, ", ".join(PROVIDER_KEY_FIELDS)
+            )
+        )
+
+    field, label = PROVIDER_KEY_FIELDS[provider]
     if not getattr(settings, field, None):
         frappe.throw(_("{0} is not set in Agent Settings.").format(label))
+
+    validate_target_app(doc.target_app_name)
 
 
 @frappe.whitelist()
@@ -75,8 +148,11 @@ def start_agent(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status not in RESTARTABLE_STATUSES:
-        frappe.throw(_("Agent is already busy (status: {0}).").format(doc.status))
+        _reconcile_if_dead(doc)
+        if doc.status not in RESTARTABLE_STATUSES:
+            frappe.throw(_("Agent is already busy (status: {0}).").format(doc.status))
 
     _validate_provider_key(doc)
 
@@ -85,6 +161,10 @@ def start_agent(request_name: str):
         "error_log": "",
         "stage_log": "",
         "agent_plan": "",
+        "plan_json": "",
+        "approved_plan_json": "",
+        "execution_results": "",
+        "execution_checkpoint": "",
         "bench_log": "",
         "patch_diff": "",
         "conversation_log": "",
@@ -93,13 +173,23 @@ def start_agent(request_name: str):
         "follow_up_message": "",
         "follow_up_count": 0,
         "implementation_snapshot": "",
+        "tokens_used": 0,
+        "cache_input_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_estimate": 0,
+        # A fresh run works on a new branch, so the old branch's PR is not its PR.
+        # Follow-ups (submit_follow_up) keep all three.
+        "branch_name": "",
+        "pr_url": "",
+        "pr_number": 0,
         # files_changed is a JSON column with a json_valid() CHECK constraint —
         # "" is not valid JSON, so clear it with NULL (allowed) instead.
         "files_changed": None,
     })
     frappe.db.commit()
 
-    frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_planning_phase",
         queue="default",
         timeout=1800,
@@ -121,11 +211,20 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         frappe.throw(_("Follow-up message is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    if doc.status not in RESTARTABLE_STATUSES:
-        frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
+    doc.check_permission("write")
+    # Delivered work waiting on its bench commands (or back from a failed build) can be refined too.
+    allowed = (*RESTARTABLE_STATUSES, "Awaiting Bench Approval")
+    if doc.status not in allowed:
+        _reconcile_if_dead(doc)
+        if doc.status not in allowed:
+            frappe.throw(_("Follow-up is allowed only when the agent is idle (status: {0}).").format(doc.status))
     if not (doc.branch_name or "").strip():
         frappe.throw(_("Follow-up fix needs an existing branch on this request."))
 
+    try:
+        load_plan(doc.get("approved_plan_json"))
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
     _validate_provider_key(doc)
 
     follow_up = (follow_up_message or "").strip()
@@ -137,13 +236,14 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         "status": "Implementing",
         "follow_up_message": follow_up[:50000],
         "follow_up_count": follow_up_count,
+        "execution_checkpoint": "",
         "error_log": "",
         "bench_log": "",
         "patch_diff": "",
     })
     frappe.db.commit()
 
-    frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
@@ -152,6 +252,22 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         is_follow_up=1,
     )
     return {"status": "ok", "message": _("Follow-up patch started on existing branch (plan preserved).")}
+
+
+def _approve_structured_plan(doc, value=None):
+    """Persist a canonical approval snapshot; Markdown can never override it."""
+    doc.check_permission("write")
+    try:
+        plan = load_plan(doc.get("plan_json") if value is None else value)
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+    frappe.db.set_value(DOCTYPE_NAME, doc.name, {
+        "plan_json": json.dumps(plan, ensure_ascii=True),
+        "approved_plan_json": json.dumps(plan, ensure_ascii=True),
+        "agent_plan": plan_to_markdown(plan),
+        "execution_results": "",
+        "execution_checkpoint": "",
+    })
 
 
 @frappe.whitelist()
@@ -165,15 +281,14 @@ def execute_existing_plan(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    if not (doc.agent_plan or "").strip():
-        frappe.throw(_("No plan found for this request."))
+    doc.check_permission("write")
 
     # Implementation can only start if we are at the approval stage or have finished a previous run.
-    allowed = ("Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval")
-    if doc.status not in allowed:
+    if doc.status not in PLAN_EXECUTABLE_STATUSES:
         frappe.throw(_("Cannot execute plan. Agent status is {0}.").format(doc.status))
 
     _validate_provider_key(doc)
+    _approve_structured_plan(doc)
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, {
         "status": "Implementing",
@@ -183,7 +298,7 @@ def execute_existing_plan(request_name: str):
     })
     frappe.db.commit()
 
-    frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
@@ -194,32 +309,31 @@ def execute_existing_plan(request_name: str):
 
 @frappe.whitelist()
 @_whitelist_logged
-def approve_plan(request_name: str, edited_plan: str = None):
+def approve_plan(request_name: str, plan_json: str = None):
     """
     Confirms the plan and begins the implementation phase.
-    You can optionally provide an edited version of the plan if you made manual adjustments.
+    You can optionally provide edited structured JSON before approval.
     """
     if not request_name:
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status != "Awaiting Approval":
         frappe.throw(_("Cannot approve plan. Agent status is {0}.").format(doc.status))
 
-    plan_to_run = (edited_plan or doc.agent_plan or "").strip()
-    if not plan_to_run:
-        frappe.throw(_("No plan found for this request."))
-
-    if edited_plan is not None and edited_plan.strip():
-        frappe.db.set_value(DOCTYPE_NAME, request_name, "agent_plan", edited_plan.strip()[:50000])
+    _validate_provider_key(doc)
+    _approve_structured_plan(doc, plan_json)
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, {
         "status": "Implementing",
+        # A failed plan revision leaves its error while the plan awaits approval.
+        "error_log": "",
         "patch_diff": "",
     })
     frappe.db.commit()
 
-    frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_execution_phase",
         queue="default",
         timeout=1800,
@@ -230,12 +344,51 @@ def approve_plan(request_name: str, edited_plan: str = None):
 
 @frappe.whitelist()
 @_whitelist_logged
+def revise_plan(request_name: str, feedback: str, plan_json: str = None):
+    """Answer the proposed plan in words; the agent revises it in the same investigation.
+
+    ``plan_json`` keeps edits the user made to the plan before asking.
+    """
+    if not request_name:
+        frappe.throw(_("Request name is required."))
+    feedback = (feedback or "").strip()
+    if not feedback:
+        frappe.throw(_("Say what the plan should change."))
+
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    if doc.status != "Awaiting Approval":
+        frappe.throw(_("Cannot revise the plan. Agent status is {0}.").format(doc.status))
+    _validate_provider_key(doc)
+    values = {"status": "Queued", "error_log": ""}
+    if plan_json:
+        try:
+            edited = load_plan(plan_json)
+        except PlanValidationError as exc:
+            frappe.throw(str(exc))
+        values.update(plan_json=json.dumps(edited, ensure_ascii=True), agent_plan=plan_to_markdown(edited))
+    frappe.db.set_value(DOCTYPE_NAME, request_name, values)
+    frappe.db.commit()
+
+    enqueue_job(
+        "ampower_koda.agent.executor.run_planning_phase",
+        queue="default",
+        timeout=1800,
+        request_name=request_name,
+        plan_feedback=feedback[:20000],
+    )
+    return {"status": "ok", "message": _("Revising the plan from your feedback.")}
+
+
+@frappe.whitelist()
+@_whitelist_logged
 def reject_plan(request_name: str):
     """Reject the plan and set status to Cancelled."""
     if not request_name:
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status != "Awaiting Approval":
         frappe.throw(_("Cannot reject. Agent status is {0}.").format(doc.status))
 
@@ -253,35 +406,204 @@ def reject_plan(request_name: str):
 
 @frappe.whitelist()
 @_whitelist_logged
+def suggest_task_context(request_name: str, query: str):
+    """Rank code spans for a task the user is drafting, with the retriever the
+    planner used, including its configured dedicated reranker.
+
+    Indexing a large app takes tens of seconds, so the work runs as a job and the
+    result arrives on the ``agent_task_suggestions`` realtime event carrying the
+    returned token, which the form matches to its open dialog.
+    """
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    if not (query or "").strip():
+        frappe.throw(_("Describe the task first."))
+    token = frappe.generate_hash(length=12)
+    # Same queue as planning: the worker that just indexed the app for the plan
+    # still holds that session, and a search on it is milliseconds, not a rebuild.
+    frappe.enqueue(
+        "ampower_koda.agent.executor.run_context_suggestion",
+        queue="default",
+        timeout=600,
+        request_name=request_name,
+        query=query.strip()[:2000],
+        token=token,
+        user=frappe.session.user,
+    )
+    return {"status": "ok", "token": token}
+
+
+def _peer_file(app_name: str, new_path: str) -> str:
+    """Nearest existing file with the same extension: same folder, then upward.
+
+    A new file's pattern is its closest sibling — the same rule the plan prompt
+    gives the model — so a task written by someone who cannot name one still
+    hands the implementer something to copy.
+    """
+    root = Path(agent_tools._app_root(app_name))
+    new_file = Path(new_path)
+    directory = root / new_file.parent
+    while True:
+        if directory.is_dir():
+            peers = sorted(
+                p for p in directory.rglob(f"*{new_file.suffix}")
+                if p.is_file() and p.name != "__init__.py" and p != root / new_file
+            )
+            if peers:
+                return peers[0].relative_to(root).as_posix()
+        if directory == root or root not in directory.parents:
+            return ""
+        directory = directory.parent
+
+
+def _default_context_refs(app_name: str, files: list[str]) -> list[dict]:
+    """Whole-file refs: the file itself when it exists, else a peer to copy from."""
+    refs: dict[str, str] = {}
+    for path in files:
+        if _app_file_exists(app_name, path):
+            refs.setdefault(path, "Task target file")
+        elif peer := _peer_file(app_name, path):
+            refs.setdefault(peer, f"Existing peer file supplying the pattern for {path}")
+    return [{"path": p, "start": 0, "end": 0, "symbol": "", "why": why} for p, why in refs.items()]
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def save_plan_task(request_name: str, task: str):
+    """Add or replace one task in the structured plan.
+
+    The whole plan is re-validated, including dependency order and that MODIFY
+    paths exist, so a hand-written task can never reach approval in a shape the
+    executor would reject.
+    """
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    if doc.status not in PLAN_EXECUTABLE_STATUSES:
+        frappe.throw(_("Tasks cannot be edited while the agent is busy (status: {0}).").format(doc.status))
+
+    try:
+        plan = load_plan(doc.get("plan_json"))
+        incoming = task if isinstance(task, dict) else json.loads(task or "")
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+    except (TypeError, ValueError):
+        frappe.throw(_("Task must be a JSON object."))
+    if not isinstance(incoming, dict):
+        frappe.throw(_("Task must be a JSON object."))
+
+    tasks = list(plan["tasks"])
+    task_id = (incoming.get("id") or "").strip()
+    if not task_id:
+        task_id = f"TODO {1 + max((int(t['id'].split()[1]) for t in tasks), default=0)}"
+    incoming = {**incoming, "id": task_id}
+    if not incoming.get("context_refs"):
+        incoming["context_refs"] = _default_context_refs(doc.target_app_name, incoming.get("files") or [])
+    position = next((i for i, t in enumerate(tasks) if t["id"] == task_id), None)
+    if position is None:
+        tasks.append(incoming)
+    else:
+        tasks[position] = incoming
+
+    try:
+        plan = load_plan({**plan, "tasks": tasks})
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        "plan_json": json.dumps(plan, ensure_ascii=True),
+        "agent_plan": plan_to_markdown(plan),
+    })
+    return {"status": "ok", "task_id": task_id, "plan": plan}
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def remove_plan_task(request_name: str, task_id: str):
+    """Remove one task from the structured plan.
+
+    Task ids must stay the contiguous sequence TODO 1..N, so every later task is
+    renumbered and every ``depends_on`` reference is rewritten to match. Tasks
+    that depended on the removed one simply lose that dependency; the whole plan
+    is then re-validated, so a shared-file ordering the removed task provided is
+    reported to the user rather than silently lost.
+    """
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    if doc.status not in PLAN_EXECUTABLE_STATUSES:
+        frappe.throw(_("Tasks cannot be edited while the agent is busy (status: {0}).").format(doc.status))
+
+    try:
+        plan = load_plan(doc.get("plan_json"))
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+
+    tasks = list(plan["tasks"])
+    wanted = (task_id or "").strip().casefold()
+    position = next((i for i, t in enumerate(tasks) if t["id"].casefold() == wanted), None)
+    if position is None:
+        frappe.throw(_("Task {0} is not in the plan.").format(task_id))
+    if len(tasks) == 1:
+        frappe.throw(_("A plan needs at least one task. Edit this task or reject the plan instead."))
+
+    removed = tasks.pop(position)
+    renamed = {t["id"].casefold(): f"TODO {index + 1}" for index, t in enumerate(tasks)}
+    dependents = []
+    for task in tasks:
+        kept = [d for d in task["depends_on"] if d.casefold() != wanted]
+        if len(kept) != len(task["depends_on"]):
+            dependents.append(task["id"])
+        task["depends_on"] = [renamed.get(d.casefold(), d) for d in kept]
+        task["id"] = renamed[task["id"].casefold()]
+
+    try:
+        plan = load_plan({**plan, "tasks": tasks})
+    except PlanValidationError as exc:
+        frappe.throw(str(exc))
+
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {
+        "plan_json": json.dumps(plan, ensure_ascii=True),
+        "agent_plan": plan_to_markdown(plan),
+    })
+    return {
+        "status": "ok", "removed": removed["id"],
+        "dependents_updated": [renamed[d.casefold()] for d in dependents],
+        "plan": plan,
+    }
+
+
+@frappe.whitelist()
+@_whitelist_logged
 def approve_bench(request_name: str, commands: str = None):
     """Approves and runs the pending bench commands (migrate, build, clear-cache, etc.).
-    Optionally pass an edited list of commands as a JSON array to override the defaults."""
+    Optionally pass an edited list of commands as a JSON array to override the defaults.
+    Omitting it keeps the pending list; an empty array skips every bench command."""
     if not request_name:
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status != "Awaiting Bench Approval":
         frappe.throw(_("Cannot approve bench. Agent status is {0}.").format(doc.status))
 
-    if commands:
-        try:
-            cmd_list = json.loads(commands)
-        except (ValueError, TypeError):
-            frappe.throw(_("Invalid commands format."))
-        if isinstance(cmd_list, list) and cmd_list:
-            frappe.db.set_value(
-                DOCTYPE_NAME, request_name,
-                "pending_bench_commands", json.dumps(cmd_list),
-            )
+    try:
+        cmd_list = normalize_bench_selection(commands)
+    except ValueError as exc:
+        frappe.throw(str(exc))
+    if cmd_list is not None:
+        frappe.db.set_value(
+            DOCTYPE_NAME, request_name,
+            "pending_bench_commands", json.dumps(cmd_list),
+        )
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Building")
     frappe.db.commit()
 
-    frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_bench_and_commit",
         queue="default",
         timeout=1800,
         request_name=request_name,
+        clear_checkpoint=True,
     )
 
     cmds = []
@@ -294,7 +616,8 @@ def approve_bench(request_name: str, commands: str = None):
 
     return {
         "status": "ok",
-        "message": _("Running {0} bench commands...").format(len(cmds)),
+        "message": _("Running {0} bench commands...").format(len(cmds)) if cmds
+        else _("No bench commands selected: skipping the bench step."),
     }
 
 
@@ -307,6 +630,7 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status != "Awaiting Push Approval":
         frappe.throw(_("Cannot push. Agent status is {0}.").format(doc.status))
 
@@ -318,11 +642,12 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
     frappe.db.commit()
 
-    frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_deploy_phase",
         queue="default",
         timeout=600,
         request_name=request_name,
+        clear_checkpoint=True,
         do_push=bool(push_branch),
         do_pr=bool(create_pr),
     )
@@ -344,15 +669,42 @@ def checkout_base_branch(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     app_name = (doc.target_app_name or "").strip()
     base_branch = (doc.base_branch or "main").strip()
 
     if not app_name:
         frappe.throw(_("Target App Name is not set."))
 
+    # checkout_base resets and cleans whatever is checked out. Uncommitted work
+    # is discarded only on this request's own branch: anywhere else it is another
+    # request's pending implementation or the user's own work.
+    current = get_current_branch(app_name)
+    own = current != base_branch and _is_request_branch(
+        current, request_name, (doc.branch_prefix or "ai-agent/").strip(), (doc.branch_name or "").strip())
+    if not own:
+        dirty = _uncommitted_paths(get_repo_root(app_name))
+        if dirty:
+            shown = ", ".join(dirty[:10]) + (f" (and {len(dirty) - 10} more)" if len(dirty) > 10 else "")
+            frappe.throw(_(
+                "Branch '{0}' has uncommitted changes that do not belong to this request: {1}. "
+                "Open the request that owns that branch and check out the base branch there, or commit "
+                "or stash the changes. Nothing was discarded."
+            ).format(current or "(unknown)", shown))
+
     ok, msg = checkout_base(app_name, base_branch)
     if not ok:
+        # Recorded too: a failure can come after the reset already discarded work,
+        # and the form must not go on to bench commands on unsynchronized source.
+        _append_bench_log(request_name, f"$ git checkout {base_branch}\nFAILED\n{(msg or '').strip()}\n")
         frappe.throw(_("Failed to checkout base branch: {0}").format(msg))
+
+    # Persisted, not just broadcast. This discards uncommitted work in the target
+    # app, and a realtime alert is gone on the next reload — which left the one
+    # destructive step in the bench flow as the only one with no record that it
+    # ran. Appended rather than assigned so it survives the bench commands the
+    # form runs straight afterwards, which write the same field.
+    _append_bench_log(request_name, f"$ git checkout {base_branch}\nOK\n{(msg or '').strip()}\n")
 
     frappe.publish_realtime("agent_progress", {
         "request_name": request_name,
@@ -361,6 +713,20 @@ def checkout_base_branch(request_name: str):
     }, user=doc.owner)
 
     return {"status": "ok", "message": msg}
+
+
+def _append_bench_log(request_name: str, block: str) -> str:
+    """Append a block to the request's bench log and commit it.
+
+    Keeps the tail when the cap is reached: the newest output is the one someone
+    is looking at, and truncating the front loses a run nobody is reading yet.
+    """
+    existing = (frappe.db.get_value(DOCTYPE_NAME, request_name, "bench_log") or "").rstrip()
+    combined = f"{existing}\n\n{block}".strip() if existing else block.strip()
+    combined = combined[-BENCH_LOG_MAX_CHARS:]
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "bench_log", combined)
+    frappe.db.commit()
+    return combined
 
 
 @frappe.whitelist()
@@ -372,6 +738,7 @@ def get_default_bench_commands(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     app_name = (doc.target_app_name or "").strip()
     site_name = frappe.local.site
 
@@ -389,62 +756,118 @@ def get_default_bench_commands(request_name: str):
 @frappe.whitelist()
 @_whitelist_logged
 def run_selected_bench_commands(request_name: str, commands: str = None):
-    """Run user-selected bench commands. commands is a JSON array of command strings."""
+    """Queue user-selected bench commands. commands is a JSON array of command strings.
+
+    Returns as soon as the job is queued: a migrate or build can outlast a web
+    request, and a service restart would stop the process serving it. Each
+    command's receipt is appended to the bench log by the job, and progress
+    arrives through the usual status updates. An empty array runs nothing.
+    """
     if not request_name:
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status in BUSY_STATUSES:
         frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
+    if doc.status == "Queued" and (doc.rq_job_id or "").strip():
+        # A queued agent job owns the request; queuing this one would supersede it.
+        frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
+    _require_bench_branch(doc)
 
-    cmds = []
-    if commands:
-        try:
-            cmds = json.loads(commands)
-        except (ValueError, TypeError):
-            frappe.throw(_("Invalid commands format."))
-
-    if not cmds or not isinstance(cmds, list):
+    try:
+        cmds = normalize_bench_selection(commands)
+    except ValueError as exc:
+        frappe.throw(str(exc))
+    if cmds is None:
         frappe.throw(_("No commands provided."))
+    if not cmds:
+        _append_bench_log(request_name, "No bench commands selected: nothing was run.")
+        return {"status": "skipped", "message": _("No bench commands selected: nothing was run.")}
 
-    bench_root = os.path.join(frappe.get_app_path("frappe"), "..", "..", "..")
-    bench_root = os.path.normpath(bench_root)
-    bench_env = _get_bench_env()
-
-    output_parts = []
-    for cmd in cmds:
-        if not isinstance(cmd, str) or not cmd.strip():
-            continue
-        try:
-            result = subprocess.run(
-                cmd.strip().split(),
-                cwd=bench_root,
-                capture_output=True,
-                text=True,
-                timeout=900,
-                env=bench_env,
-            )
-            out = (result.stdout or "") + (result.stderr or "")
-            status_str = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
-            output_parts.append(f"$ {cmd}\n{status_str}\n{out.strip()}\n")
-        except subprocess.TimeoutExpired:
-            output_parts.append(f"$ {cmd}\nTIMEOUT after 900s\n")
-            log_agent_error(
-                "Agent API: run_selected_bench_commands timeout",
-                f"request={request_name}\ncmd={cmd}",
-            )
-        except Exception as e:
-            output_parts.append(f"$ {cmd}\nERROR: {e}\n")
-            log_agent_error(
-                "Agent API: run_selected_bench_commands",
-                f"request={request_name}\ncmd={cmd}\n{e}\n{frappe.get_traceback()}",
-            )
-
-    bench_log = "\n".join(output_parts)
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "bench_log", bench_log[:50000])
+    previous_status = doc.status
+    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Building")
     frappe.db.commit()
+    job = enqueue_job(
+        "ampower_koda.agent.executor.run_selected_bench_commands",
+        queue="default",
+        # Room for every command's own 900 s limit, so a long list is not cut off midway.
+        timeout=max(1800, 960 * len(cmds)),
+        request_name=request_name,
+        commands=cmds,
+        previous_status=previous_status,
+    )
 
-    return {"status": "ok", "log": bench_log}
+    return {
+        "status": "queued",
+        "job_id": getattr(job, "id", None),
+        "commands": cmds,
+        "message": _("Queued {0} bench command(s); results are added to the bench log.").format(len(cmds)),
+    }
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def get_model_defaults():
+    """Provider and model configured in Agent Settings, for the request form.
+
+    The form's suggestion list is a static catalogue; without this a model saved
+    in Settings is never offered on a request, and a request's own default comes
+    from that catalogue instead of from Settings. No secrets are returned.
+    """
+    settings = frappe.get_single("Agent Settings")
+    return {
+        "provider": (settings.default_ai_provider or "OpenAI").strip(),
+        "model": (settings.default_ai_model or "").strip(),
+    }
+
+
+# Tool-calling text families on /v1/models; everything else there (embeddings, audio, images,
+# moderation, legacy completions, chatgpt-* without tool calls) cannot drive Koda.
+_OPENAI_CHAT_MODEL = re.compile(r"^(gpt-(?!3)|o\d|codex)")
+_OPENAI_NOT_CHAT = re.compile(r"audio|realtime|transcribe|tts|image|search|embedding|moderation|instruct")
+_OPENAI_SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")  # dated pins of an alias that is listed anyway
+OPENAI_MODELS_CACHE_SECONDS = 6 * 3600
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def get_provider_models(provider: str = "OpenAI", refresh: int = 0):
+    """The provider's current models, newest first, for the model pickers.
+
+    Only OpenAI is listed live (GET /v1/models with the key in Agent Settings),
+    so a new model is offered the day it ships instead of after a code change.
+    Any other provider, or a failed fetch, returns no models and the form keeps
+    its built-in list. Model ids only; no secrets are returned.
+    """
+    if not (frappe.has_permission(DOCTYPE_NAME, "read") or frappe.has_permission("Agent Settings", "read")):
+        frappe.throw(_("Not permitted to list models."), frappe.PermissionError)
+    if (provider or "").strip() != "OpenAI":
+        return {"models": []}
+    cache_key = "koda:openai_models"
+    if not int(refresh or 0):
+        cached = frappe.cache().get_value(cache_key)
+        if cached:
+            return {"models": cached}
+    settings = frappe.get_single("Agent Settings")
+    api_key = settings.get_password("openai_api_key", raise_exception=False) or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {"models": [], "error": "No OpenAI API key in Agent Settings."}
+    base_url = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    try:
+        import requests
+
+        response = requests.get(f"{base_url}/models", headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+        response.raise_for_status()
+        rows = response.json().get("data") or []
+    except Exception as exc:  # noqa: BLE001 -- the form falls back to its built-in list
+        return {"models": [], "error": f"Could not list OpenAI models: {type(exc).__name__}"}
+    models = [row["id"] for row in sorted(rows, key=lambda row: int(row.get("created") or 0), reverse=True)
+              if isinstance(row.get("id"), str) and _OPENAI_CHAT_MODEL.match(row["id"])
+              and not _OPENAI_NOT_CHAT.search(row["id"]) and not _OPENAI_SNAPSHOT.search(row["id"])]
+    if models:
+        frappe.cache().set_value(cache_key, models, expires_in_sec=OPENAI_MODELS_CACHE_SECONDS)
+    return {"models": models}
 
 
 @frappe.whitelist()
@@ -454,6 +877,8 @@ def get_agent_status(request_name: str):
     if not request_name:
         frappe.throw(_("Request name is required."))
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
+    _reconcile_if_dead(doc)
     return {
         "name": doc.name,
         "status": doc.status,
@@ -470,82 +895,187 @@ def get_agent_status(request_name: str):
 
 _SKIP_TREE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "dist", "build", ".mypy_cache"}
 _SKIP_TREE_SUFFIXES = (".pyc", ".pyo")
+# Lines git writes between "diff --git" and "---" (see git-diff "extended header lines").
+_PATCH_EXTENDED_HEADERS = (
+    "index ", "old mode ", "new mode ", "deleted file mode ", "new file mode ",
+    "similarity index ", "dissimilarity index ", "rename from ", "rename to ",
+    "copy from ", "copy to ",
+)
+
+
+def _patch_header_path(raw: str, prefix: str) -> str | None:
+    """Path from a ---/+++ header value; None for /dev/null."""
+    # Git appends a tab after a path that contains spaces.
+    raw = raw.rstrip("\r").rstrip("\t")
+    if raw == "/dev/null":
+        return None
+    return raw[len(prefix):] if raw.startswith(prefix) else raw
+
+
+def _diff_git_paths(header: str) -> tuple[str | None, str | None]:
+    """Old/new paths from a 'diff --git a/X b/Y' line (exact when X == Y)."""
+    rest = header[len("diff --git "):].rstrip("\r")
+    if not rest.startswith("a/"):
+        return None, None
+    half = (len(rest) - 3) // 2  # "a/X b/X" is two equal halves around " "
+    if rest[:half] == "a/" + rest[half + 3:] and rest[half:half + 3] == " b/":
+        return rest[2:half], rest[half + 3:]
+    at = rest.rfind(" b/")
+    return (rest[2:at], rest[at + 3:]) if at > 0 else (None, None)
+
+
+def _split_patch_blocks(patch_diff: str) -> list[dict]:
+    """Split a stored diff into per-file blocks: [{"old", "new", "text"}].
+
+    A block starts at 'diff --git' or, for the header-less untracked-file
+    blocks _generate_patch_diff writes, at a '---' line after a finished
+    header. Hunk bodies are skipped by their @@ line counts, so a removed
+    line that reads '-- x' ('--- x' in the diff) never starts a block.
+    old/new are None for /dev/null (an added or a deleted file).
+    """
+    blocks: list[dict] = []
+    current = None
+    old_left = new_left = 0
+
+    def start(old=None, new=None):
+        # "open" while only header lines have been read, so a ---/+++ belongs to it.
+        block = {"old": old, "new": new, "lines": [], "minus": False, "open": True}
+        blocks.append(block)
+        return block
+
+    for line in (patch_diff or "").split("\n"):
+        if current is not None and (old_left > 0 or new_left > 0):
+            marker = line[:1]
+            if marker in (" ", ""):
+                old_left, new_left = old_left - 1, new_left - 1
+            elif marker == "-":
+                old_left -= 1
+            elif marker == "+":
+                new_left -= 1
+            if marker in (" ", "", "-", "+", "\\"):
+                current["lines"].append(line)
+                continue
+            old_left = new_left = 0  # truncated hunk: read this line as a header
+
+        in_header = current is not None and current["open"]
+        if line.startswith("diff --git "):
+            current = start(*_diff_git_paths(line))
+        elif line.startswith("--- ") and not (in_header and not current["minus"]):
+            current = start()
+            current["minus"] = True
+            current["old"] = _patch_header_path(line[4:], "a/")
+        elif line.startswith("--- "):
+            current["minus"] = True
+            current["old"] = _patch_header_path(line[4:], "a/")
+        elif line.startswith("+++ ") and in_header and current["minus"]:
+            current["new"] = _patch_header_path(line[4:], "b/")
+            current["open"] = False
+        elif line.startswith("@@") and current is not None:
+            current["open"] = False
+            counts = line.split("@@")[1].split() if line.count("@@") >= 2 else []
+            old_left = new_left = 0
+            for count in counts:
+                span = count[1:].split(",")
+                size = int(span[1]) if len(span) > 1 and span[1].isdigit() else 1
+                if count.startswith("-"):
+                    old_left = size
+                elif count.startswith("+"):
+                    new_left = size
+        elif in_header and line.startswith("deleted file mode"):
+            current["new"] = None
+        elif in_header and line.startswith("new file mode"):
+            current["old"] = None
+        elif in_header and line.startswith("rename from "):
+            current["old"] = line[len("rename from "):]
+        elif in_header and line.startswith("rename to "):
+            current["new"] = line[len("rename to "):]
+        elif in_header and not line.startswith(_PATCH_EXTENDED_HEADERS):
+            current["open"] = False  # e.g. "Binary files ... differ" or the blank separator
+        if current is not None:
+            current["lines"].append(line)
+
+    return [
+        {"old": b["old"], "new": b["new"], "text": "\n".join(b["lines"]).strip("\n")}
+        for b in blocks
+    ]
 
 
 def _parse_patch_diff_index(patch_diff: str) -> dict[str, str]:
     """Build {relative_path: status} from a stored unified diff."""
     changed: dict[str, str] = {}
-    if not patch_diff:
-        return changed
-
-    lines = patch_diff.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.startswith("--- "):
-            i += 1
-            continue
-
-        old_raw = line[4:].strip()
-        new_raw = ""
-        if i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
-            new_raw = lines[i + 1][4:].strip()
-            i += 2
+    for block in _split_patch_blocks(patch_diff):
+        old, new = block["old"], block["new"]
+        if old is None and new:
+            status, path = "A", new
+        elif new is None and old:
+            status, path = "D", old
+        elif new:
+            status, path = "M", new
         else:
-            i += 1
             continue
-
-        if old_raw == "/dev/null" and new_raw.startswith("b/"):
-            changed[new_raw[2:]] = "A"
-        elif new_raw == "/dev/null" and old_raw.startswith("a/"):
-            changed[old_raw[2:]] = "D"
-        elif old_raw.startswith("a/") and new_raw.startswith("b/"):
-            changed[new_raw[2:]] = "M"
-        elif new_raw.startswith("b/"):
-            changed[new_raw[2:]] = "M"
-
+        # Staged changes precede unstaged ones: keep the first (HEAD-relative) status.
+        changed.setdefault(path, status)
     return changed
 
 
 def _extract_file_diff_from_patch(patch_diff: str, file_path: str) -> str:
-    """Extract one file's diff block from combined patch_diff text."""
+    """Extract one file's diff blocks from combined patch_diff text."""
     if not patch_diff or not file_path:
         return ""
+    return "\n".join(
+        block["text"] for block in _split_patch_blocks(patch_diff)
+        if file_path in (block["old"], block["new"])
+    )
 
-    blocks = patch_diff.split("\n\n")
-    needle_a = f"--- a/{file_path}"
-    needle_null_old = "--- /dev/null"
-    needle_b = f"+++ b/{file_path}"
 
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        if needle_b in block and (needle_a in block or needle_null_old in block):
-            return block
-    return ""
+def _is_git_metadata(relative: str) -> bool:
+    return any(part.lower() == ".git" for part in relative.replace("\\", "/").split("/"))
 
 
 def _safe_repo_path(repo_root: str, file_path: str) -> str:
-    """Resolve file_path inside repo_root or throw on traversal."""
-    if not file_path or file_path.startswith("/") or ".." in file_path.split("/"):
-        frappe.throw(_("Invalid file path."))
+    """Resolve file_path inside repo_root or throw on traversal.
 
-    full = os.path.normpath(os.path.join(repo_root, file_path))
-    root_norm = os.path.normpath(repo_root)
-    if not full.startswith(root_norm + os.sep) and full != root_norm:
+    Symlinks and junctions are resolved first, so a link cannot lead outside
+    the repository or into Git metadata.
+    """
+    if (not file_path or os.path.isabs(file_path) or os.path.splitdrive(file_path)[0]
+            or ".." in file_path.replace("\\", "/").split("/")):
+        frappe.throw(_("Invalid file path."))
+    if _is_git_metadata(file_path):
+        frappe.throw(_("Git metadata cannot be opened in the IDE."))
+
+    root = os.path.realpath(repo_root)
+    full = os.path.realpath(os.path.join(root, file_path))
+    try:
+        inside = os.path.commonpath([root, full]) == root
+    except ValueError:  # different drives on Windows
+        inside = False
+    if not inside or full == root:
         frappe.throw(_("File path is outside the repository."))
+    if _is_git_metadata(os.path.relpath(full, root)):
+        frappe.throw(_("Git metadata cannot be opened in the IDE."))
     return full
 
 
-def _write_repo_file(repo_root: str, file_path: str, content: str) -> str:
-    """Write content to a repo-relative path; return absolute path written."""
+def _sha256(data: bytes | None) -> str | None:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
+def _write_repo_file(repo_root: str, file_path: str, content: str, expected: bytes | None = None,
+                     check_expected: bool = False) -> str:
+    """Atomically write content to a repo-relative path; return absolute path written.
+
+    With check_expected, the write is refused (ValueError) unless the file still
+    holds `expected` (None: absent) when it is replaced.
+    """
+    from ampower_koda.agent.atomic import atomic_write, read_bytes
+
     full = _safe_repo_path(repo_root, file_path)
-    parent = os.path.dirname(full)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(full, "w", encoding="utf-8") as f:
-        f.write(content)
+    if not check_expected:
+        expected = read_bytes(full)
+    atomic_write(full, content.encode("utf-8"), expected=expected)
     return full
 
 
@@ -555,8 +1085,13 @@ def _should_skip_tree_entry(name: str) -> bool:
     return any(name.endswith(suffix) for suffix in _SKIP_TREE_SUFFIXES)
 
 
-def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]:
-    """Walk repo_root and return nested tree nodes with change metadata."""
+def _build_directory_tree(repo_root: str, changed: dict[str, str], is_redacted=None) -> list[dict]:
+    """Walk repo_root and return nested tree nodes with change metadata.
+
+    Directory links (symlinks, junctions) are left out, never followed: they
+    can lead outside the repository or loop. is_redacted(rel, full) marks files
+    the IDE may not open.
+    """
 
     def walk(dir_path: str, rel_prefix: str) -> list[dict]:
         nodes: list[dict] = []
@@ -566,13 +1101,16 @@ def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]
             return nodes
 
         for name in entries:
-            if _should_skip_tree_entry(name):
+            if _should_skip_tree_entry(name) or name.lower() == ".git":
                 continue
 
             full = os.path.join(dir_path, name)
             rel = f"{rel_prefix}/{name}" if rel_prefix else name
 
             if os.path.isdir(full):
+                # dir_path is already resolved, so any difference means full is a link.
+                if os.path.normcase(os.path.realpath(full)) != os.path.normcase(full):
+                    continue
                 children = walk(full, rel)
                 changed_count = sum(
                     1 for c in changed if c == rel or c.startswith(rel + "/")
@@ -593,6 +1131,7 @@ def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]
                     "path": rel,
                     "status": status,
                     "has_changes": bool(status),
+                    "redacted": bool(is_redacted and is_redacted(rel, full)),
                 })
 
         folders = [n for n in nodes if n["type"] == "folder"]
@@ -601,15 +1140,23 @@ def _build_directory_tree(repo_root: str, changed: dict[str, str]) -> list[dict]
         files.sort(key=lambda n: n["name"].lower())
         return folders + files
 
-    return walk(repo_root, "")
+    return walk(os.path.realpath(repo_root), "")
 
 
 def _get_changed_files_for_request(doc) -> tuple[dict[str, str], str]:
-    """Return changed file map and data source ('git' or 'patch_diff')."""
+    """Return changed file map and data source ('working_tree', 'git' or 'patch_diff')."""
     app_name = (doc.target_app_name or "").strip()
     base_branch = (doc.base_branch or "main").strip()
     branch_name = (doc.branch_name or "").strip()
 
+    # With the request branch checked out, the disk is the truth: base vs working
+    # tree covers commits, uncommitted edits and new untracked files alike.
+    if app_name and branch_name and get_current_branch(app_name) == branch_name:
+        ok, files = list_worktree_changes(app_name, base_branch)
+        if ok:
+            return {f["path"]: f["status"] for f in files}, "working_tree"
+
+    # Another branch is checked out: show the request branch's committed changes.
     if app_name and branch_name and branch_exists(app_name, branch_name):
         ok, files = list_changed_files(app_name, base_branch, branch_name)
         if ok and files:
@@ -635,13 +1182,19 @@ def get_change_tree(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     app_name = (doc.target_app_name or "").strip()
     if not app_name:
         frappe.throw(_("Target app is not set on this request."))
 
     repo_root = get_repo_root(app_name)
     changed, source = _get_changed_files_for_request(doc)
-    tree = _build_directory_tree(repo_root, changed)
+    # Names only; the flag lets the IDE skip opening what get_file_content refuses.
+    matcher = agent_tools._redaction_matcher(app_name)
+    tree = _build_directory_tree(
+        repo_root, changed,
+        lambda rel, full: bool(agent_tools.redaction_pattern(app_name, rel, full, matcher)),
+    )
 
     branch_state = _get_branch_state(doc)
 
@@ -684,26 +1237,43 @@ def get_file_diff(request_name: str, file_path: str):
         frappe.throw(_("File path is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     app_name = (doc.target_app_name or "").strip()
     if not app_name:
         frappe.throw(_("Target app is not set on this request."))
 
     repo_root = get_repo_root(app_name)
-    _safe_repo_path(repo_root, file_path)
+    full = _safe_repo_path(repo_root, file_path)
 
     base_branch = (doc.base_branch or "main").strip()
     branch_name = (doc.branch_name or "").strip()
     changed, source = _get_changed_files_for_request(doc)
     status = changed.get(file_path, "")
 
+    # A diff shows the file's lines, so it obeys the same redaction as get_file_content.
+    pattern = agent_tools.redaction_pattern(app_name, file_path, full)
+    if pattern:
+        return {
+            "path": file_path,
+            "status": status,
+            "source": "none",
+            "diff": "",
+            "redacted": _("{0} matches the redaction pattern {1}; its diff is hidden.").format(file_path, pattern),
+        }
+
     diff_text = ""
-    if branch_name and branch_exists(app_name, branch_name):
-        ok, diff_text = diff_file(app_name, base_branch, branch_name, file_path)
+    if source == "working_tree":
+        ok, diff_text = diff_worktree_file(app_name, base_branch, file_path)
         if not ok:
             diff_text = ""
+    else:
+        if branch_name and branch_exists(app_name, branch_name):
+            ok, diff_text = diff_file(app_name, base_branch, branch_name, file_path)
+            if not ok:
+                diff_text = ""
 
-    if not diff_text.strip():
-        diff_text = _extract_file_diff_from_patch(doc.patch_diff or "", file_path)
+        if not diff_text.strip():
+            diff_text = _extract_file_diff_from_patch(doc.patch_diff or "", file_path)
 
     return {
         "path": file_path,
@@ -761,6 +1331,23 @@ def _require_request_branch(doc) -> str:
     return branch_name
 
 
+def _require_bench_branch(doc) -> str:
+    """Throw unless the checkout is the request's branch or its base branch (no checkout).
+
+    Manual bench commands build and migrate whatever is checked out. The IDE
+    runs them for the request's branch, and the form after "Checkout Base
+    Branch"; any other branch is another request's or the user's work.
+    """
+    app_name = (doc.target_app_name or "").strip()
+    if not app_name:
+        frappe.throw(_("Target app is not set on this request."))
+    base_branch = (doc.base_branch or "main").strip()
+    refused = bench_branch_refusal(app_name, doc.branch_name, allowed=(base_branch,))
+    if refused:
+        frappe.throw(refused)
+    return get_current_branch(app_name)
+
+
 def _has_pushable_changes(doc) -> bool:
     """True if the repo has uncommitted work or committed changes vs the base branch.
 
@@ -789,6 +1376,7 @@ def get_file_content(request_name: str, file_path: str):
         frappe.throw(_("File path is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     _require_request_branch(doc)
     app_name = (doc.target_app_name or "").strip()
     if not app_name:
@@ -798,22 +1386,35 @@ def get_file_content(request_name: str, file_path: str):
     full = _safe_repo_path(repo_root, file_path)
     if not os.path.isfile(full):
         frappe.throw(_("File not found: {0}").format(file_path))
+    # The same redaction the agent's reads obey: the editor is not a way around it.
+    pattern = agent_tools.redaction_pattern(app_name, file_path, full)
+    if pattern:
+        frappe.throw(_("{0} matches the redaction pattern {1} and cannot be opened.").format(file_path, pattern))
 
-    with open(full, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
+    with open(full, "rb") as f:
+        raw = f.read()
+    # Decoded as text mode did (universal newlines); the digest is of the bytes on disk.
+    content = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
 
     return {
         "path": file_path,
         "full_path": full,
         "content": content,
         "language": _detect_editor_language(file_path),
+        "sha256": _sha256(raw),
     }
 
 
 @frappe.whitelist()
 @_whitelist_logged
-def save_file_content(request_name: str, file_path: str, content: str):
-    """Save edited file content from the IDE to the agent branch working tree."""
+def save_file_content(request_name: str, file_path: str, content: str, expected_sha256: str = None):
+    """Save edited file content from the IDE to the agent branch working tree.
+
+    expected_sha256 is the digest get_file_content returned. When given, the
+    save is refused with status "conflict" if the file changed on disk since
+    (another tab, an external editor, the agent); the response carries the
+    current digest so the IDE can offer to overwrite deliberately.
+    """
     if not request_name:
         frappe.throw(_("Request name is required."))
     if not file_path:
@@ -822,14 +1423,31 @@ def save_file_content(request_name: str, file_path: str, content: str):
         frappe.throw(_("File content is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status in BUSY_STATUSES:
         frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
     _require_request_branch(doc)
     app_name = (doc.target_app_name or "").strip()
 
+    from ampower_koda.agent.atomic import read_bytes
+
     repo_root = get_repo_root(app_name)
-    full_path = _write_repo_file(repo_root, file_path, content)
+    full = _safe_repo_path(repo_root, file_path)
+    current = read_bytes(full)
+    conflict = {
+        "status": "conflict",
+        "message": _("{0} changed on disk after it was opened; not saved.").format(file_path),
+        "path": file_path,
+        "full_path": full,
+    }
+    if expected_sha256 and _sha256(current) != expected_sha256:
+        return {**conflict, "sha256": _sha256(current)}
+    try:
+        # Compare-and-swap: atomic_write re-checks the bytes just before replacing.
+        full_path = _write_repo_file(repo_root, file_path, content, expected=current, check_expected=True)
+    except ValueError:
+        return {**conflict, "sha256": _sha256(read_bytes(full))}
 
     patch_diff = _generate_patch_diff(app_name)
     frappe.db.set_value(DOCTYPE_NAME, request_name, "patch_diff", patch_diff[:100000])
@@ -840,6 +1458,7 @@ def save_file_content(request_name: str, file_path: str, content: str):
         "message": _("Saved {0} bytes to disk.").format(len(content)),
         "path": file_path,
         "full_path": full_path,
+        "sha256": _sha256(content.encode("utf-8")),
     }
 
 
@@ -851,11 +1470,14 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if not (doc.branch_name or "").strip():
         frappe.throw(_("No branch on this request."))
 
     if doc.status in BUSY_STATUSES:
-        frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
+        _reconcile_if_dead(doc)
+        if doc.status in BUSY_STATUSES:
+            frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
 
     _require_request_branch(doc)
 
@@ -870,11 +1492,12 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
     frappe.db.commit()
 
-    frappe.enqueue(
+    enqueue_job(
         "ampower_koda.agent.executor.run_deploy_phase",
         queue="default",
         timeout=600,
         request_name=request_name,
+        clear_checkpoint=True,
         do_push=bool(push_branch),
         do_pr=bool(create_pr),
     )
@@ -896,9 +1519,35 @@ def cancel_agent_request(request_name: str):
         frappe.throw(_("Request name is required."))
 
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
     if doc.status in ("Completed", "Failed", "Cancelled"):
         return {"status": "noop", "message": _("Request already finished.")}
 
     frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Cancelled")
     frappe.db.commit()
+    stop_job(doc.get("rq_job_id") or "")
     return {"status": "ok", "message": _("Request cancelled.")}
+
+
+@frappe.whitelist()
+@_whitelist_logged
+def resume_execution(request_name: str):
+    """Continue saved execution without resetting the branch or completed tasks."""
+    doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("write")
+    _reconcile_if_dead(doc)
+    if doc.status not in ("Failed", "Cancelled") or not doc.get("execution_checkpoint"):
+        frappe.throw(_("Resume requires a stopped execution with a saved checkpoint."))
+    _validate_provider_key(doc)
+    # Run the worker's own admission checks here, so a refused resume is a
+    # message on the button rather than a Failed request a second later.
+    try:
+        plan = load_plan(doc.get("approved_plan_json"))
+        restore_execution_state(doc, plan, validate_target_app(doc.target_app_name))
+    except (ValueError, KeyError, TypeError) as exc:
+        frappe.throw(_("Cannot resume: {0}").format(exc))
+    stop_job(doc.get("rq_job_id") or "")
+    frappe.db.set_value(DOCTYPE_NAME, request_name, {"status": "Implementing", "error_log": ""})
+    frappe.db.commit()
+    enqueue_job("ampower_koda.agent.executor.run_execution_phase", request_name=request_name, resume=1)
+    return {"status": "ok", "message": _("Resuming saved execution on the existing branch.")}

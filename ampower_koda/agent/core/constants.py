@@ -1,0 +1,265 @@
+"""Every tunable number the cold-start stages depend on."""
+
+from __future__ import annotations
+
+from typing import Final
+
+
+CHARS_PER_TOKEN: Final[float] = 3.6
+
+MEMORY_MAX_TOKENS: Final[int] = 800
+
+
+CHUNK_LINES: Final[int] = 80
+
+CHUNK_CHARS: Final[int] = 6_000
+
+CHUNK_LONG_LINE_STRIDE: Final[int] = 5_600
+
+CHUNK_OVERLAP_LINES: Final[int] = 8
+
+COMMENT_MAX_LINES: Final[int] = 24
+
+CHUNKLESS_ROLES: Final[tuple[str, ...]] = ("constant", "type", "enum")
+
+NON_INDEXABLE_ROLES: Final[tuple[str, ...]] = ("field",)
+
+
+ANCHOR_DIGEST: Final[int] = 8
+
+
+MAX_INDEX_FILE_BYTES: Final[int] = 1_500_000
+
+EXCLUDED_DIRECTORIES: Final[frozenset[str]] = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".koda",
+        ".venv",
+        "venv",
+        "env",
+        ".tox",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        "__pycache__",
+        "node_modules",
+        "bower_components",
+        ".pnpm-store",
+        ".yarn",
+        ".next",
+        ".turbo",
+        "dist",
+        "build",
+        "coverage",
+        "_to_delete",
+    }
+)
+
+DEFAULT_REDACT_GLOBS: Final[tuple[str, ...]] = (".env*", "**/secrets*")
+
+MEMORY_FILENAMES: Final[tuple[str, ...]] = ("KODA.md", "CLAUDE.md", "AGENTS.md")
+
+
+CACHE_ENTRY_VERSION: Final[int] = 5
+
+CACHE_DIRECTORY: Final[str] = ".koda/cache/tags"
+
+
+COCHANGE_MAX_COMMITS: Final[int] = 1_000
+
+COCHANGE_HALF_LIFE_DAYS: Final[float] = 180.0
+
+COCHANGE_MAX_FILES_PER_COMMIT: Final[int] = 25
+
+COCHANGE_MAX_NEIGHBOURS: Final[int] = 12
+
+
+EDGE_WEIGHTS: Final[dict[str, float]] = {
+    "calls": 1.0,
+    "instantiates": 0.6,
+    "contains": 0.5,
+    "references": 0.35,
+}
+
+MIRROR_MIN_SHARED_FILES: Final[int] = 5
+MIRROR_MIN_SHARED_FRACTION: Final[float] = 0.6
+
+VENDOR_DIRECTORIES: Final[frozenset[str]] = frozenset(
+    {
+        "reference",
+        "vendor",
+        "vendored",
+        "third_party",
+        "thirdparty",
+        "external",
+        "node_modules",
+        "site-packages",
+        "bundled",
+        "apps",
+        "copy",
+        "copies",
+    }
+)
+
+BUDGET_SHARES: Final[dict[str, float]] = {
+    "ledger": 0.03,
+    # About two whole functions plus a names-only outline; the most that fits
+    # a 32k input unsqueezed.
+    "working_set": 0.12,
+    "fold": 0.015,
+}
+
+BUDGET_FLOORS: Final[dict[str, int]] = {"ledger": 4_000}
+
+BUDGET_FLOOR_CEILING: Final[float] = 0.25
+
+BUDGET_TOTAL_CEILING: Final[float] = 0.35
+
+BUDGET_CEILED_REGIONS: Final[tuple[str, ...]] = (
+    "ledger",
+    "working_set",
+    "fold",
+    "memory",
+)
+
+MAX_TURN_TOKENS_MARGINAL: Final[int] = 80_000
+MAX_TURN_TOKENS_OBSERVED: Final[int] = 160_000
+OBSERVED_WINDOW_MULTIPLE: Final[float] = 1.25
+
+MAX_ROUNDS: Final[int] = 60
+MAX_OUTPUT_TOKENS: Final[int] = 8_000
+
+CALIBRATOR_CLAMP: Final[tuple[float, float]] = (0.4, 3.0)
+CALIBRATOR_ALPHA: Final[float] = 0.3
+
+
+MAX_TOTAL_BREAKPOINTS: Final[int] = 4
+
+MIN_CACHEABLE_BY_FAMILY: Final[dict[str, int]] = {
+    "opus-5": 512,
+    "fable-5": 512,
+    "sonnet": 1_024,
+    "opus": 4_096,
+    "haiku": 4_096,
+}
+MIN_CACHEABLE_DEFAULT: Final[int] = 1_024
+
+SESSION_ID_MAX_CHARS: Final[int] = 256
+
+
+BM25_K1: Final[float] = 1.2
+BM25_B: Final[float] = 0.75
+
+BM25_PATH_REPEAT: Final[int] = 2
+BM25_SYMBOL_REPEAT: Final[int] = 3
+
+BM25_TEXT_BONUS: Final[float] = 2.5
+BM25_PATH_BONUS: Final[float] = 1.5
+BM25_SYMBOL_BONUS: Final[float] = 4.0
+
+SAME_FILE_DECAY: Final[float] = 0.85
+MAX_HITS_PER_FILE: Final[int] = 2
+
+PROSE_COMMENT_SHARE: Final[float] = 0.85
+PROSE_RESULT_PENALTY: Final[float] = 0.55
+
+BRIDGE_SCORE_PER_TERM: Final[float] = 2.5
+BRIDGE_MAX_SYMBOLS: Final[int] = 8
+SYMBOL_EXPANSION_MAX: Final[int] = 12
+SYMBOL_EXPANSION_WEIGHT: Final[float] = 0.3
+SYMBOL_EXPANSION_DEFINITION_BONUS: Final[float] = 3.5
+BRIDGE_DEFINITION_BONUS: Final[float] = 4.0
+BRIDGE_TERM_WEIGHT: Final[float] = 0.35
+
+ISSUE_QUERY_MIN_CHARS: Final[int] = 320
+VIEW_RANK_DECAY: Final[float] = 0.35
+VIEW_WEIGHTS: Final[dict[str, float]] = {
+    "original": 1.0,
+    "title": 1.2,
+    "identifiers": 1.3,
+    "anchor": 1.55,
+    "path": 1.8,
+}
+IDENTIFIER_MAX_SITES: Final[int] = 100
+
+STRUCTURAL_MAX_SEEDS: Final[int] = 8
+STRUCTURAL_PER_SYMBOL_CAP: Final[int] = 4
+STRUCTURAL_LIMIT: Final[int] = 12
+STRUCTURAL_DEFINITION_WEIGHT: Final[float] = 1.0
+STRUCTURAL_REFERENCE_WEIGHT: Final[float] = 0.4
+
+GRAPH_DEPTH: Final[int] = 2
+GRAPH_EXPAND_LIMIT: Final[int] = 24
+GRAPH_KEEP: Final[int] = 12
+GRAPH_HOP_DECAY: Final[float] = 0.45
+
+HISTORY_NEIGHBOURS: Final[int] = 6
+
+FUSION_RANK_DECAY: Final[float] = 0.35
+SEED_LIMIT: Final[int] = 8
+SOURCE_LIMIT: Final[int] = 40
+UNION_LIMIT: Final[int] = 60
+DEFAULT_SEARCH_LIMIT: Final[int] = 20
+MAX_SEARCH_LIMIT: Final[int] = 50
+
+
+DISTILL_SCAN_LINES: Final[int] = 60
+
+DISTILL_MAX_ANCHORS: Final[int] = 4
+
+LEDGER_MERGE_MAX_CHARS: Final[int] = 160
+LEDGER_MERGE_MAX_PART_CHARS: Final[int] = 72
+LEDGER_MERGE_MAX_REFS: Final[int] = 4
+
+LEDGER_RECENT_WINDOW: Final[int] = 12
+
+
+WORKING_SET_SEARCH_LIMIT: Final[int] = 8
+
+WORKING_SET_MAX_SPANS: Final[int] = 12
+
+WORKING_SET_MAX_EDITED: Final[int] = 8
+
+WORKING_SET_EXCERPT_CHARS: Final[int] = 600
+
+WORKING_SET_WEAK_COVERAGE: Final[float] = 0.75
+
+WORKING_SET_RELATIVE_FLOOR: Final[float] = 0.5
+"""Hits below this share of the top score are dropped."""
+
+WORKING_SET_FULL_SPANS: Final[int] = 3
+"""The best hits are rendered whole, with line numbers, so they can be cited
+and edited without a re-read."""
+
+WORKING_SET_FULL_SPAN_CHARS: Final[int] = 6_000
+
+WORKING_SET_OUTLINE_FILES: Final[int] = 2
+
+WORKING_SET_OUTLINE_CHARS: Final[int] = 2_400
+"""A names-only outline, ``symbol@line``, of the top files."""
+
+WORKING_SET_CALLERS: Final[int] = 2
+
+TYPO_MIN_LENGTH: Final[int] = 6
+"""Only longer prose words are corrected; short words are too often real."""
+
+TYPO_MAX_DISTANCE: Final[int] = 2
+
+
+ROADMAP_MAX_COORDINATES: Final[int] = 24
+
+KEEP_RAW_TURNS: Final[int] = 3
+
+COMPACTION_MAX_OUTPUT_TOKENS: Final[int] = 700
+
+FOLD_MAX_OUTPUT_TOKENS: Final[int] = 900
+
+FOLD_ARGS_CLIP_CHARS: Final[int] = 200
+FOLD_RESULT_CLIP_CHARS: Final[int] = 400
+
+
+DEFAULT_WINDOW_TOKENS: Final[int] = 180_000
+
+DEFAULT_ARCHITECT_MODEL: Final[str] = "anthropic/claude-sonnet-5"

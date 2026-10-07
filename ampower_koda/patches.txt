@@ -1,4 +1,7 @@
 [pre_model_sync]
+# Before sync, so the legacy DocTypes are renamed ahead of their replacements.
+# The dated suffix re-runs it on sites where the post-sync version skipped them.
+ampower_koda.patches.rename_agent_doctypes #2026-09-28
 
 [post_model_sync]
 ampower_koda.patches.rename_agent_doctypes
