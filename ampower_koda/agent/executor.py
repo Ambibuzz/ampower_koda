@@ -11,20 +11,14 @@ import sys
 import uuid
 
 import frappe
-from ampower_koda.agent import koda_core
-from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.execution_contract import load_plan, read_snapshot
-from ampower_koda.agent import session as koda_session
-from ampower_koda.agent import tools as agent_tools
-from ampower_koda.agent import render_check, verification
-from ampower_koda.agent.checkpoint import ExecutionJournal, restore_checkpoint, cleanup_temporaries
-from ampower_koda.agent.run_control import (
-    managed_job, current_run, check_active, set_request_value, run_context, RunStopped,
+import subprocess
+from ampower_koda.agent.graph import _get_bench_env
+from ampower_koda.agent.graph import (
+    build_planning_graph,
+    build_execution_graph,
 )
 from ampower_koda.agent.graph import _get_bench_env, _message_content_to_str
 from ampower_koda.agent.git_ops import (
-    KODA_CLEAN_EXCLUDES,
-    branch_exists,
     generate_branch_name,
     get_pull_request,
     get_repo_root,
@@ -39,7 +33,7 @@ from ampower_koda.agent.git_ops import (
     worktree_signature,
 )
 
-DOCTYPE_NAME = "Agent Request"
+DOCTYPE_NAME = "AI Agent Request"
 
 
 #: Files under .koda/ that are the team's configuration, not Koda's generated state.
@@ -471,37 +465,11 @@ def run_planning_phase(request_name: str, plan_feedback: str = "") -> None:
 
 # Phase 2: Execution (Implement + Review)
 
-
-def restore_execution_state(doc, plan_object: dict, app_name: str) -> dict:
-    """Validate and restore one request checkpoint without mutating the checkout."""
-    branch_name = (doc.branch_name or "").strip()
-    if not branch_name or get_current_branch(app_name) != branch_name:
-        raise ValueError("Resume requires the request's existing branch to be checked out. No checkout or cleanup was performed.")
-    ok, head = run_git(["rev-parse", "HEAD"], cwd=get_repo_root(app_name))
-    if not ok:
-        raise ValueError("Could not verify HEAD for resume: " + head)
-    restored = restore_checkpoint(
-        doc.get("execution_checkpoint"),
-        plan=plan_object,
-        branch=branch_name,
-        head=head.strip(),
-        read_current=lambda path: read_snapshot(agent_tools._resolve_path(app_name, path)),
-    )
-    if restored.get("target_app_name") != app_name or restored.get("user_message", "") != (doc.user_message or ""):
-        raise ValueError("Request configuration changed since the checkpoint; start a newly approved run.")
-    if restored.get("is_follow_up") and restored.get("follow_up_message", "") != (doc.follow_up_message or "").strip():
-        raise ValueError("Follow-up instructions changed since the checkpoint; submit a new follow-up.")
-    return restored
-
-
-@managed_job
-def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_up: int = 0,
-                        resume: int = 0) -> None:
-    """Create/reuse the working branch, run implement + review, then await bench approval.
-
-    When preserve_branch is set, reuse the request's existing branch for a follow-up
-    patch instead of creating a fresh one. is_follow_up enables patch-only mode
-    without replacing the approved plan.
+def run_execution_phase(request_name: str) -> None:
+    """
+    Carries out the implementation of the approved plan.
+    This phase creates a working branch, applies code changes, and performs
+    an automated review to ensure quality and correctness.
     """
     frappe.set_user("Administrator")
     try:
@@ -514,72 +482,25 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
 
     try:
+        revert_msg = _revert_previous_changes(
+            config["target_app_name"], config["base_branch"],
+            request_name=request_name, user=user,
+            branch_prefix=config["branch_prefix"],
+        )
+        if revert_msg:
+            _update_status(request_name, user, "Implementing", f"Cleaned up: {revert_msg}")
+
         app_name = config["target_app_name"]
-        keep_same_branch = bool(int(preserve_branch or 0))
-        is_follow_up_mode = bool(int(is_follow_up or 0)) or keep_same_branch
-        resume_mode = bool(int(resume or 0))
-        restored = None
-
-        # Validate the persisted approval before any checkout/reset or file mutation.
-        approved = doc.get("approved_plan_json")
-        plan_object = load_plan(approved)
-
-        if resume_mode:
-            branch_name = (doc.branch_name or "").strip()
-            restored = restore_execution_state(doc, plan_object, app_name)
-            check_active(reserve=5)
-            cleanup_temporaries(restored.pop("_checkpoint_temporaries", []), lambda p: agent_tools._resolve_path(app_name, p))
-            is_follow_up_mode = bool(restored.get("is_follow_up"))
-            _update_status(request_name, user, "Implementing", "Resuming saved execution on the existing branch.")
-        elif keep_same_branch:
-            branch_name = (doc.branch_name or "").strip()
-            if not branch_name:
-                _update_status(request_name, user, "Failed",
-                    "Follow-up mode requires an existing branch on this request.",
-                    error_log="Missing branch_name for follow-up execution.")
-                return
-            if not branch_exists(app_name, branch_name):
-                _update_status(request_name, user, "Failed",
-                    f"Follow-up branch '{branch_name}' was not found in local repo.",
-                    error_log=f"Branch not found: {branch_name}")
-                return
-
-            repo_root = get_repo_root(app_name)
-            current = get_current_branch(app_name)
-            if current != branch_name:
-                ok, msg = run_git(["checkout", branch_name], cwd=repo_root)
-                if not ok:
-                    _update_status(request_name, user, "Failed",
-                        f"Could not checkout follow-up branch '{branch_name}': {msg}",
-                        error_log=f"checkout failed: {msg}")
-                    return
-            # Preserve existing branch state — do NOT reset/clean or we wipe the
-            # implementation the user is asking us to patch.
-            _update_status(request_name, user, "Implementing",
-                f"Follow-up patch on branch '{branch_name}' (plan preserved).",
-                branch_name=branch_name)
-        else:
-            revert_msg = _revert_previous_changes(
-                config["target_app_name"], config["base_branch"],
-                request_name=request_name, user=user,
-                branch_prefix=config["branch_prefix"], archive_tests=False,
-                own_branch=(doc.branch_name or "").strip(),
-            )
-            if revert_msg:
-                _update_status(request_name, user, "Implementing", f"Cleaned up: {revert_msg}")
-
-            branch_name = generate_branch_name(request_name, config["branch_prefix"], app_name)
-            ok, msg = create_branch(app_name, branch_name, config["base_branch"])
-            if not ok:
-                _update_status(request_name, user, "Failed",
-                    f"Failed to create working branch: {msg}",
-                    error_log=f"create_branch failed: {msg}")
-                return
-            # A new branch has no pull request yet: an earlier run's PR belongs
-            # to its own branch and must not be reported as updated by this one.
-            _update_status(request_name, user, "Implementing",
-                f"Created branch '{branch_name}'. Starting implementation...",
-                branch_name=branch_name, pr_url="", pr_number=0)
+        branch_name = generate_branch_name(request_name, config["branch_prefix"], app_name)
+        ok, msg = create_branch(app_name, branch_name, config["base_branch"])
+        if not ok:
+            _update_status(request_name, user, "Failed",
+                f"Failed to create working branch: {msg}",
+                error_log=f"create_branch failed: {msg}")
+            return
+        _update_status(request_name, user, "Implementing",
+            f"Created branch '{branch_name}'. Starting implementation...",
+            branch_name=branch_name)
 
         prior_changed_paths = _prior_changed_paths(doc) if is_follow_up_mode else []
         implementation_memory = (
@@ -588,7 +509,8 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
         )
         follow_up_message = (doc.follow_up_message or "").strip() if is_follow_up_mode else ""
 
-        # Carry the planning-phase stage log into execution for continuity.
+        # We parse the existing log to ensure the execution graph has full context
+        # of what was discovered during the planning phase.
         prev_stage_log = _parse_stage_log(doc.stage_log or "")
 
         repo_root = get_repo_root(app_name)
@@ -960,6 +882,129 @@ def _strip_agent_scratch_files(repo_root: str) -> list[str]:
             log_agent_error("Agent Execution: strip scratch file",
                 f"could not remove {rel}\n{frappe.get_traceback()}")
     return removed
+
+
+def _prior_changed_paths(doc) -> list:
+    """Canonical paths from the previous run's files_changed list."""
+    paths = []
+    for row in as_json_list(doc.files_changed):
+        if isinstance(row, dict):
+            p = (row.get("path") or "").strip()
+            if p and p not in paths:
+                paths.append(p)
+    return paths
+
+
+def _merge_file_edits(prior: list, new: list) -> list:
+    """Merge prior and new edit records, updating summaries for same paths."""
+    merged = [dict(e) for e in prior if isinstance(e, dict)]
+    index = {e.get("path"): i for i, e in enumerate(merged) if e.get("path")}
+    for entry in new:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if path and path in index:
+            merged[index[path]]["summary"] = entry.get("summary", merged[index[path]].get("summary"))
+        elif path:
+            merged.append(dict(entry))
+            index[path] = len(merged) - 1
+        else:
+            merged.append(dict(entry))
+    return merged
+
+
+def _save_implementation_snapshot(request_name: str, doc, final_state: dict, is_follow_up: bool):
+    """Remember what this run built so follow-ups can patch instead of re-implement."""
+    summary = (final_state.get("change_summary") or "").strip()
+    edits = final_state.get("edits_made") or []
+    paths = [e.get("path") for e in edits if isinstance(e, dict) and e.get("path")]
+    lines = []
+    if summary:
+        lines.append(summary)
+    if paths:
+        lines.append("\nFiles touched this run:")
+        lines.extend(f"- {p}" for p in paths[:30])
+    snapshot = "\n".join(lines).strip()
+    if not snapshot:
+        return
+    prior = (doc.implementation_snapshot or "").strip()
+    if is_follow_up and prior:
+        snapshot = f"{prior}\n\n--- Follow-up run ---\n{snapshot}"
+    set_request_value(request_name, {
+        "implementation_snapshot": snapshot[:50000],
+    })
+
+
+def run_context_suggestion(request_name: str, query: str, token: str, user: str) -> None:
+    """Rank code spans for a task with the shared retrieval/reranking pipeline.
+
+    Runs as a job because indexing a large app takes longer than a web request
+    should; the form matches the reply to its dialog by ``token``.
+    """
+    frappe.set_user("Administrator")
+    payload = {"request_name": request_name, "token": token}
+    try:
+        doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+        payload["suggestions"] = koda_core.suggest_context(doc.target_app_name, query)
+    except Exception as e:
+        log_agent_error("Agent Task Suggestion Error", frappe.get_traceback())
+        payload["error"] = str(e)
+    frappe.publish_realtime("agent_task_suggestions", payload, user=user)
+
+
+_NOTE_EXTENSIONS = (".md", ".txt")
+
+
+def _strip_stray_notes(repo_root: str, keep: set[str]) -> list[str]:
+    """Delete untracked .md/.txt files the run left behind, except planned ones.
+
+    Returns the repo-relative paths removed. Only untracked files are listed,
+    so tracked source and docs are never touched.
+    """
+    ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
+    if not ok:
+        return []
+    removed = []
+    for rel in (untracked or "").splitlines():
+        rel = rel.strip()
+        if (not rel.lower().endswith(_NOTE_EXTENSIONS) or _same_file(rel, keep)
+                or '.koda' in rel.replace('\\', '/').split('/')):
+            continue
+        try:
+            os.remove(os.path.join(repo_root, rel))
+            removed.append(rel)
+        except OSError:
+            log_agent_error("Agent Execution: strip stray note",
+                f"could not remove {rel}\n{frappe.get_traceback()}")
+    return removed
+
+
+def _same_file(path: str, others) -> bool:
+    """Plan and edit paths are app-relative, git paths are repo-relative; match by suffix."""
+    return any(path == other or path.endswith("/" + other) or other.endswith("/" + path) for other in others)
+
+
+#: Module folders whose ``<folder>/<name>/<name>.json`` records `bench migrate`
+#: syncs into the database, plus the app-level fixtures and customisations.
+MIGRATED_METADATA_FOLDERS = (
+    "doctype", "report", "page", "workspace", "workspace_sidebar", "dashboard",
+    "dashboard_chart", "dashboard_chart_source", "number_card", "print_format",
+    "web_form", "notification", "module_onboarding", "onboarding_step",
+    "form_tour", "custom", "fixtures",
+)
+
+#: Front-end sources that `bench build` bundles: plain assets, templates and the
+#: Vue/TypeScript/preprocessed-style sources of the esbuild bundles.
+BUILT_ASSET_SUFFIXES = (
+    ".js", ".jsx", ".ts", ".tsx", ".vue", ".css", ".scss", ".sass", ".less", ".html",
+)
+
+
+def _needs_migrate(path: str) -> bool:
+    parts = path.replace("\\", "/").lower().split("/")
+    if parts[-1] == "patches.txt":
+        return True
+    return parts[-1].endswith(".json") and any(folder in parts[:-1] for folder in MIGRATED_METADATA_FOLDERS)
 
 
 def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
@@ -1542,6 +1587,19 @@ def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: st
         return False
 
 
+def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: str) -> bool:
+    """True if `branch_name` has commits that `base_branch` does not (local only)."""
+    if not (app_name and base_branch and branch_name):
+        return False
+    try:
+        repo_root = get_repo_root(app_name)
+        ok, out = run_git(["rev-list", "--count", f"{base_branch}..{branch_name}"], cwd=repo_root)
+        return ok and out.strip().isdigit() and int(out.strip()) > 0
+    except Exception:
+        log_agent_error("Agent Deploy: rev-list vs base", frappe.get_traceback())
+        return False
+
+
 def _generate_patch_diff(app_name: str) -> str:
     """Generate a unified diff of all uncommitted changes in the target app repo."""
     try:
@@ -1749,5 +1807,22 @@ def _append_conversation_log(request_name: str, new_block: str) -> str:
 
 
 def _extract_understanding(doc) -> str:
-    """The investigation's findings, saved with the plan when planning finished."""
-    return (getattr(doc, "understanding_snapshot", "") or "").strip()
+    """Extract the Understanding section from the conversation log.
+
+    Prefers the dedicated understanding_snapshot field (stable across runs and log
+    trimming). Falls back to parsing the clean sectioned-text conversation log, then
+    to the legacy JSON format for requests logged before the format change.
+    """
+    snapshot = (getattr(doc, "understanding_snapshot", "") or "").strip()
+    if snapshot:
+        return snapshot
+
+    text = doc.conversation_log or ""
+    try:
+        steps = json.loads(doc.conversation_log or "[]")
+        for step in steps:
+            if step.get("phase") == "Understanding":
+                return step.get("output", "")
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return ""

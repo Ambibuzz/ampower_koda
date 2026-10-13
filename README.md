@@ -63,15 +63,32 @@ Set `KODA_PLAYWRIGHT_PYTHONPATH` (its site-packages) and `PLAYWRIGHT_BROWSERS_PA
 
 ## Setup
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
 1. Open **Agent Settings** from the search bar.
 2. Check **Enable AI Agent**.
 3. Enter the API key for your provider.
 4. Optionally set a default provider and model. With OpenAI, the model list is loaded live from your account, newest first.
+<<<<<<< HEAD
+=======
+1. Open Agent Settings from the search bar.
+2. Check Enable AI Agent.
+3. Enter your API key for the provider you want to use (OpenAI, Gemini, or Claude).
+4. Optionally set a default provider and model.
+>>>>>>> 2acb550 (feat(koda_v2): add Agent IDE, rename agent DocTypes, and improve agent execution flow)
+=======
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
 5. Save.
 
 
 ## Creating a Request
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
 1. Open the **Agent Request** list and click **New**.
 2. Fill in:
    - **Title**: a short summary.
@@ -81,8 +98,31 @@ Set `KODA_PLAYWRIGHT_PYTHONPATH` (its site-packages) and `PLAYWRIGHT_BROWSERS_PA
    - **Target App Name**: the app's directory name (e.g. `ampower_task_manager`).
    - **GitHub Repo URL**, **GitHub Token** and **Base Branch**.
 3. Save, then click **Start Agent**.
+<<<<<<< HEAD
 
 Your target app, repository, provider, model, base branch, branch prefix and Git identity are remembered and pre-filled on your next request. The GitHub token is not; enter it on each request or store it in Agent Settings as the encrypted default.
+=======
+1. Go to Agent Request list (search for it or find it under the AI Agents module).
+2. Click New.
+3. Fill in:
+   - Title -- short summary of what you need.
+   - Type -- Bug Fix, Feature Request, or Improvement.
+   - Description -- detailed explanation of the change.
+   - Provider and Model -- pick your AI provider and model.
+   - Target App Name -- the Frappe app directory name (e.g. ampower_task_manager).
+   - GitHub Repo URL -- full URL of the repository.
+   - GitHub Token -- personal access token.
+   - Base Branch -- the branch to base changes on (e.g. develop or main).
+4. Save the document.
+5. Click Start Agent.
+
+### Persistence
+The app remembers your most-used configuration (Target App Name, GitHub Repo URL, AI Provider, Model, Base Branch, Branch Prefix, Git identity) and pre-fills it on every new request. The GitHub token is never persisted across requests for security reasons you must enter it on each new request (or store it in Agent Settings as the encrypted default).
+>>>>>>> 2acb550 (feat(koda_v2): add Agent IDE, rename agent DocTypes, and improve agent execution flow)
+=======
+
+Your target app, repository, provider, model, base branch, branch prefix and Git identity are remembered and pre-filled on your next request. The GitHub token is not; enter it on each request or store it in Agent Settings as the encrypted default.
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
 
 
 ## How It Works
@@ -174,6 +214,68 @@ Tokens are stored encrypted, secret files are never shown to the model, and ever
 <img width="854" height="480" alt="1775651869174" src="https://github.com/user-attachments/assets/f39d1226-ab20-49f8-8d2c-d279f463faf2" />
 
 
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+## Buttons Available at All Times
+
+These buttons appear in the Actions dropdown whenever the agent is not actively running:
+
+- Checkout Base Branch -- switch back to the base branch and discard uncommitted changes.
+- Run Bench Commands -- manually run migrate, build, clear-cache, and restart.
+- Re-run Agent -- start over from scratch (explore, plan, implement).
+- Execute Existing Plan -- skip exploration and use the existing plan.
+
+
+## Configuration Fields
+
+Each request carries its own configuration:
+
+- Target App Name -- directory name of the Frappe app to modify.
+- GitHub Repo URL -- https://github.com/org/repo format.
+- GitHub Token -- personal access token (stored encrypted).
+- Base Branch -- branch to base changes on.
+- Branch Prefix -- prefix for agent-created branches (default: ai-agent/).
+- Git User Name / Email -- identity for commits.
+
+These fields (except the GitHub Token) are remembered across requests using user settings.
+
+
+## Custom Prompt Configuration
+
+For advanced use cases, you can override the agent's default logic on a per-request basis:
+
+1. Open an **Agent Request**.
+2. Go to the **Prompts** tab.
+3. Uncheck **Use Default Prompts**.
+4. In the **Custom Prompts** table, add one or more overrides:
+   - **System Prompt**: Global identity and constraints.
+   - **Understand Prompt**: How the agent explores the codebase.
+   - **Plan Prompt**: How the agent synthesizes findings into a task list.
+   - **Implement Prompt**: Instructions for the file-editing phase.
+   - **Review Prompt**: Criteria for self-review and verification.
+
+If a prompt type is not explicitly added to the table, the agent will fall back to its internal system default for that phase.
+
+<<<<<<< HEAD
+>>>>>>> 2acb550 (feat(koda_v2): add Agent IDE, rename agent DocTypes, and improve agent execution flow)
+=======
+## Koda IDE
+
+Once a request has an agent branch or a generated diff, open the **Koda IDE** from the Actions dropdown on the Agent Request (**Open Koda IDE**). The IDE lets you:
+
+- Browse the changed files in a file explorer, with change badges (added / modified / deleted).
+- Edit any file in a full code editor with syntax highlighting and a light/dark theme toggle.
+- Switch between **Code** and **Diff** views to inspect exactly what changed.
+- **Save** edits directly to the agent branch on disk.
+- **Deploy** the selected bench commands (migrate, build, clear-cache, restart).
+- **Push** the branch and create a pull request on GitHub.
+
+Open tabs can be closed via the close (×) control that appears on hover.
+
+>>>>>>> 58b4a32 (refactor(koda_v2): standardize APIs, add error logging, and clean up codebase)
+=======
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
 ## Data Security
 
 Koda sends the code it reads to the AI provider you choose; an agent cannot work on code it cannot read. Apply your usual controls for sensitive repositories.
@@ -181,8 +283,17 @@ Koda sends the code it reads to the AI provider you choose; an agent cannot work
 
 ## In-App Help
 
+<<<<<<< HEAD
+<<<<<<< HEAD
 Search for **Koda Docs** in the Frappe search bar.
 
+=======
+For more detailed guidance and tips, search for **Koda Docs** in your Frappe search bar.
+>>>>>>> 58b4a32 (refactor(koda_v2): standardize APIs, add error logging, and clean up codebase)
+=======
+Search for **Koda Docs** in the Frappe search bar.
+
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
 
 ## License
 

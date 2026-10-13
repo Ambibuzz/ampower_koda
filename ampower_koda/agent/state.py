@@ -85,6 +85,35 @@ class AgentState(TypedDict, total=False):
     plan_last_blocker: str  # the blocker the last amendment answered; the same one again is not progress
     plan_scope_repairs: list[str]  # file inventory completed from explicit, already-approved renames
 
+    # Follow-up patch mode
+    is_follow_up: bool
+    follow_up_message: str
+    prior_changed_paths: list
+    implementation_memory: str
+
+    # Review/Test phase
+    review_passed: bool
+    review_notes: str
+    # Why repair stopped short of a passing review: the work is delivered with this and the last
+    # findings as warnings, never failed. Only a crash or an unloadable plan ends a run in "error".
+    review_stopped: str
+    tests_unresolved: str  # tests still failing after the repair cap: delivered as a warning
+    review_attempts: int
+    review_fingerprint: str  # changed-file state at the last failed review; unchanged = no progress
+    review_fingerprints_seen: list[str]  # detects A→B→A repair oscillation before the hard valve
+    review_failure_fingerprints_seen: list[str]  # repeated deterministic check failure despite unrelated edits
+    review_repairable: bool  # failed review is owned by implementation; resume there instead of re-reviewing
+    review_retry_requested: bool  # review snapshot/provider state changed; retry review rather than edit source
+    review_rechecks: int  # bounded review-only retries that do not consume implementation repair attempts
+    review_history: dict  # active reviewer rounds/source snapshot retained across repair rechecks
+    review_format_retries: int  # fresh read-only attempts after retained verdict repair fails
+    repair_strategy_level: int  # bounded fresh diagnoses after ineffective code repairs
+    verification_contract: dict  # commands and pre-existing test hashes frozen before edits
+    verification_receipts: list[dict]  # actual exit codes/output from the latest review gate
+    plan_amendments: int  # plan patch rounds spent on implementation blockers this run
+    plan_last_blocker: str  # the blocker the last amendment answered; the same one again is not progress
+    plan_scope_repairs: list[str]  # file inventory completed from explicit, already-approved renames
+
     # Pending approvals
     pending_bench_commands: str # JSON-encoded list[str] — always parse with json.loads before use
 

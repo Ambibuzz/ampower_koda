@@ -224,6 +224,116 @@ OPENROUTER_REASONING_ALLOWANCE_TOKENS = 16000
 # Provider-native prompt caching for the stable system prefix (safe no-op when unsupported).
 ENABLE_PROMPT_CACHE = True
 
+# Per-phase output stored in conversation_log. High so full phase text is retained
+# (phase outputs are LLM summaries and are naturally well under this in practice).
+MAX_PHASE_OUTPUT_CHARS = 60000
+
+# Full-input pressure is the only trigger for rewriting retained tool history.
+# A "round" is one assistant tool-call message plus all of its tool results.
+MIN_KEEP_ROUNDS = 1           # latest call/result pair must survive into the next request
+COMPACT_RESULT_PREVIEW = 140  # chars of each tool result kept in the compact summary
+MAX_COMPACTED_HISTORY_CHARS = 12000
+MAX_TOOL_RESULT_CHARS = 8000
+# A whole source file is read once (about 25k tokens at most) rather than in slices.
+MAX_READ_RESULT_CHARS = 80000
+# Searches and outlines bound themselves and say what they left out; the generic
+# cap would cut them without saying so.
+SELF_BOUNDED_TOOLS = {"read_file", "search_code", "get_file_outline", "check_page"}
+FIND_CODE_HITS = 8
+FIND_CODE_EXCERPT_CHARS = 160
+# A result fetched with a purpose is read by a bare model call and the conversation
+# gets only its answer, so the full result is not re-sent with every later request.
+READER_TOOLS = frozenset({"read_file", "search_code", "get_file_outline", "call_method"})
+# Shorter results cost less than the call that would read them: at 1.5-2.5k chars its answer was
+# 40-60% of the input, plus the call's own reasoning and latency.
+READER_MIN_CHARS = 4000
+READER_INPUT_CHARS = MAX_READ_RESULT_CHARS  # what the helper reads of one result, a whole read at most
+# A purpose read of a whole file longer than this returns its outline instead of a helper reading it all.
+PURPOSE_OUTLINE_LINES = 800
+# The same in characters, for dense files: AGENT-0036's generated script was 126 lines but 26k characters.
+PURPOSE_OUTLINE_CHARS = 40000
+# The exact text of a file this request changes reaches the model as it is, never a summary of it.
+READER_BYPASS = "[exact text: "
+READER_OUTPUT_TOKENS = 4000  # the answer plus low-effort reasoning
+READER_SYSTEM = (
+    "You read one tool result for a coding agent that will not see it, and give it what it needs. "
+    "Answer the agent's purpose from this text alone. Cite each finding as path:line or path:start-end, "
+    "and copy identifiers exactly: function and method names, parameters, response keys, field names, "
+    "CSS classes, routes and messages. Quote code only where a line or two is itself the answer. Say what "
+    "the text covers of the purpose and what it does not. If nothing in it bears on the purpose, reply in "
+    "one line: \"UNRELATED: <what this text is>\". Never guess beyond the text. At most 25 lines.")
+# Mid-turn, a stale message is retired only where the rewrite is cheap: the
+# rewrite uncaches everything after it, so only messages with at most ~8k
+# tokens after them qualify, once ~1k tokens are free; further back, only a ~20k bulk saving.
+PRUNE_TAIL_CHARS = 8000 * 3.3
+PRUNE_TAIL_MIN_CHARS = 1000 * 3.3
+PRUNE_BULK_CHARS = 20000 * 3.3
+# Prompt-cache prices as multiples of uncached input. A rewrite re-caches what
+# follows it at the write price, so below context pressure a prune rarely pays.
+CACHE_READ_PRICE = {"openai/": 0.1, "anthropic/": 0.1, "deepseek/": 0.1, "google/": 0.25}
+DEFAULT_CACHE_READ_PRICE = 0.3
+CACHE_WRITE_PRICE = 1.25
+# Room for an adaptation's KEEP/CHANGE reference contract ahead of the change
+# surface; the findings sit in the cached shared context, sent once per pass.
+MAX_UNDERSTANDING_CONTEXT_CHARS = 12000
+# A copy at least this long changes by edits: rewriting it whole drops what the reference does.
+COPY_REWRITE_MIN_LINES = 150
+CLIENT_SOURCE_SUFFIXES = (".js", ".css", ".html", ".vue")
+
+
+def _server_calls(app_name: str, source: str) -> list[str]:
+    """Dotted whitelisted-method paths of this app that a client source calls."""
+    return _re.findall(rf"\b{_re.escape(app_name)}(?:\.[A-Za-z_][A-Za-z0-9_]*)+", source or "")
+
+
+def _whitelisted_functions(source: str | None) -> dict[str, str]:
+    """Module-level @frappe.whitelist functions of a Python source: name -> source text."""
+    if not source:
+        return {}
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    return {node.name: ast.get_source_segment(source, node) or ""
+            for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any("whitelist" in ast.unparse(decorator) for decorator in node.decorator_list)}
+
+
+def _uncalled_whitelisted(app_name: str, baseline: dict, changed_paths: list[str], read_current,
+                          called: list[str]) -> list[str]:
+    """Dotted paths of whitelisted methods this execution added or changed that call_method never ran."""
+    missing = []
+    for path in changed_paths:
+        if not path.endswith(".py") or "/.koda/" in f"/{path}" or path.rsplit("/", 1)[-1].startswith("test"):
+            continue
+        before = _whitelisted_functions(baseline.get(path))
+        module = path[:-3].replace("/", ".")
+        for name, text in _whitelisted_functions(read_current(path)).items():
+            if before.get(name) == text:
+                continue
+            dotted, tail = f"{app_name}.{module}", f"{module.rsplit('.', 1)[-1]}.{name}"
+            if not any(m == f"{dotted}.{name}" or m.endswith("." + tail) for m in called):
+                missing.append(f"{dotted}.{name}")
+    return missing
+# Room to write a whole file in one call, with the reasoning that precedes it.
+# Output is billed as generated, so a high ceiling costs nothing unused.
+MODEL_ROUND_OUTPUT_TOKENS = 32000
+MODEL_FINAL_OUTPUT_TOKENS = 8192
+# Reasoning budget for ALWAYS_REASONING models: half the smallest per-call cap, so every call keeps room.
+MODEL_REASONING_BUDGET_TOKENS = MODEL_FINAL_OUTPUT_TOKENS // 2
+# OpenRouter families that reason on every call (GLM 4.5+, DeepSeek R1, QwQ, "thinking" variants).
+ALWAYS_REASONING = _re.compile(r"glm-(?:4\.[5-9]|[5-9])|deepseek-r1|qwq|thinking|reasoner", _re.I)
+# Sized for the largest valid plan plus its overview and scope.
+PLAN_OUTPUT_TOKENS_PER_TASK = 450
+MODEL_PLAN_OUTPUT_TOKENS = 1000 + MAX_PLAN_TASKS * PLAN_OUTPUT_TOKENS_PER_TASK
+# OpenRouter counts hidden reasoning inside ``max_tokens``; reserve room for it
+# on top of the visible plan so the answer still fits.
+OPENROUTER_REASONING_ALLOWANCE_TOKENS = 16000
+
+
+# Provider-native prompt caching for the stable system prefix (safe no-op when unsupported).
+ENABLE_PROMPT_CACHE = True
+
 DOCTYPE_NAME = "Agent Request"
 
 # Appended to the explore helper's question. A customized "Understand Prompt" may
@@ -297,6 +407,55 @@ def _review_recovery_reason(decision: str, notes: str, payload, criteria: list[s
         f" Expected exactly {len(criteria)} evidence entries, criteria numbered 1..{len(criteria)}."
     )
 
+    Preferred format: {"review_passed": true/false, "issues": ["...", ...]}
+
+    If the model didn't produce valid JSON, this is treated as a formatting
+    slip, not a real failure — by the time review_node calls this, the
+    mechanical health checks have already passed, so an unparseable verdict
+    is far more likely to be "forgot the format" than "found a real problem".
+    A genuine failure must be an *explicit* review_passed: false.
+    """
+    notes = (text or "").strip()
+    payload = _extract_review_json(notes)
+
+    if payload is not None and isinstance(payload.get("review_passed"), bool):
+        passed = payload["review_passed"]
+        issues = payload.get("issues") or []
+        if passed:
+            return True, notes
+        if isinstance(issues, list) and issues:
+            formatted = "\n".join(f"- {issue}" for issue in issues if str(issue).strip())
+            return False, formatted or notes
+        return False, notes or "Review reported issues without details."
+
+    # No parseable, well-formed verdict. Mechanical checks already passed
+    # before this was ever called — don't fail a real run over a formatting
+    # slip. Soft pass, but say plainly that the verdict was unparseable so
+    # it's visible in review_notes rather than silently swallowed.
+    return True, (
+        "Verdict could not be parsed as structured JSON; treated as a soft "
+        f"pass since mechanical checks already passed. Raw response: {notes[:300]}"
+    )
+
+
+def _extract_review_json(text: str) -> dict | None:
+    """Pull a {"review_passed": ...} object out of the model's response.
+
+    Tries, in order: the whole response as JSON, a ```json fenced block,
+    then the last such object embedded in prose (nested objects included).
+    """
+    candidates = [text.strip()]
+    fence_match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+    if fence_match:
+        candidates.append(fence_match.group(1))
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, dict) and "review_passed" in parsed:
+            return parsed
 
 def _extract_review_json(text: str) -> dict | None:
     """Pull a {"review_passed": ...} object out of the model's response.
@@ -964,6 +1123,38 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
             active_journal.update(execution_baseline=baseline)
         return full, canonical, current
 
+    observed = {}
+    copied = copied_files if copied_files is not None else {}  # destination -> reference, across passes
+
+    def capture_write(path, *, fresh_read=False):
+        check_active(reserve=5)
+        full = agent_tools._resolve_path(app_name, path)
+        # _resolve_path resolves symlinks; measure against the resolved root too,
+        # or a junctioned app root turns every written path into "../../...".
+        canonical = os.path.relpath(full, os.path.realpath(agent_tools._app_root(app_name))).replace("\\", "/")
+        # Refused before the snapshot: the before-content goes into the baseline the reviewer diffs.
+        pattern = agent_tools.redaction_pattern(app_name, path, full)
+        if pattern:
+            raise ValueError(f"{path} matches the redaction pattern {pattern}; secrets are never read or written.")
+        if verification_contract is not None and (
+            canonical == verification.CONFIG_PATH or canonical in verification_contract.get("existing_tests", {})
+            or canonical in (verification_contract.get("frozen_tests") or {})
+        ):
+            raise ValueError(f"{canonical} belongs to the frozen verification contract. "
+                             "Repair the implementation or add a new regression test instead of weakening this check.")
+        current = read_snapshot(full)
+        if fresh_read and current is not None and (full not in observed or observed[full] != current):
+            raise ValueError(f"Read {path} again before editing: line anchors or file content may be stale.")
+        if before is not None and canonical not in before:
+            before[canonical] = current
+        active_journal = checkpoint.journal()
+        if active_journal:
+            baseline = dict(active_journal.state.get("execution_baseline") or {})
+            for key, content in (before or {}).items():
+                baseline.setdefault(key, content)
+            active_journal.update(execution_baseline=baseline)
+        return full, canonical, current
+
     @tool
     def find_files(pattern: str = "", max_depth: int = 6) -> str:
         """List the app's files. Without a pattern: an indented tree (max_depth defaults to 6).
@@ -1448,6 +1639,31 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     total_tokens = (state or {}).get("tokens_used", 0)  # carry forward from prior phases
     usage_missing_logged = False  # warn once per loop, not once per round
 
+    read_only_streak = 0
+    write_nudges = 0
+    READ_STREAK_LIMIT = 5
+    # One edit per response re-sends the whole conversation per edit. Twice per turn at most.
+    single_edit_streak = 0
+    batch_nudges = 0
+    NUDGE_TEXT = (
+        "Work toward the plan's acceptance criteria. Read any missing context "
+        "needed for a correct edit, then apply and validate a focused change. "
+        "If the task is blocked or already satisfied, explain the evidence instead "
+        "of making an unnecessary edit. Do not guess anchors or field names."
+    )
+    overthought = 0
+    OVERTHINK_NUDGES = 2
+    OVERTHINK_TEXT = (
+        "Your last reply spent its whole output budget on reasoning and produced no tool call. "
+        "Stop deliberating. Make the next concrete tool call now: "
+        + ("write or edit the first file the task needs, in pieces if it is large. Settle an open design "
+           "question with the most reasonable choice and record it in your final report's unverified list "
+           "instead of resolving it in thought." if require_writes else
+           "read or run the one thing your next conclusion needs, or give your answer with what you "
+           "already know.")
+    )
+
+    wrote_anything = False
     read_only_streak = 0
     write_nudges = 0
     READ_STREAK_LIMIT = 5
@@ -2221,13 +2437,10 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             "_write_baseline": before,
             "_file_moves": file_moves,
             "copied_files": copied_files,
-            "called_methods": called_methods,
             "verification_contract": verification_contract,
             'verification_progress': verified['value'],
             'verification_receipts': verified['receipts'],
         }
-        if tool_edited_paths:
-            result["_tool_edited_paths"] = tool_edited_paths
         return result
     except Exception as e:
         log_agent_error(
@@ -2256,6 +2469,118 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
 PLAN_PATCH_ROUNDS = 2
 """Repair rounds that ask for edits to a rejected plan amendment. Each costs a
 cached-prefix read plus a few hundred new tokens."""
+
+    Once a call had to grow the cap, later repair and patch calls start from
+    the grown value instead of rediscovering the same truncation. ``window``
+    is the model's context window, from which each call derives the real
+    room it has; ``ceiling`` records a smaller limit the provider rejected
+    above, once known.
+    """
+    state = state or {}
+    try:
+        window, _ = koda_core.request_limits(state.get("target_app_name", ""), state.get("ai_model", "gpt-4o-mini"))
+    except Exception:  # noqa: BLE001 - an unknown window only limits growth, never the call
+        window = 0
+    return {"max_tokens": _plan_output_tokens(provider), "window": int(window or 0), "ceiling": 0}
+
+
+def _invoke_structured(llm, provider: str, schema: dict, messages: list, config: dict, *,
+                       budget: dict, request_name: str, total_tokens: int, round_label: int) -> tuple[dict, int]:
+    """One planner call that grows its output cap when the reply is truncated.
+
+    Every attempt is charged. Truncation at the context window's ceiling raises
+    ``PlanValidationError``. Returns the structured response and the token total.
+    """
+    estimate = estimate_messages(messages) + serialized_tokens(schema)
+    window = int(budget.get("window") or 0) or DEFAULT_WINDOW_TOKENS
+    ceiling = max(int(budget["max_tokens"]), recovery.output_ceiling(window, estimate))
+    if budget.get("ceiling"):
+        ceiling = min(ceiling, int(budget["ceiling"]))
+    cap = recovery.OutputCap(budget["max_tokens"], ceiling)
+
+    def call(max_tokens: int):
+        check_active(reserve=MODEL_TIME_RESERVE)
+        return _structured_model(llm, provider, schema, max_tokens=max_tokens).invoke(messages, config=config)
+
+    def note(previous: int, grown: int, reasoning: int) -> None:
+        _publish_agent_log(request_name, "llm_response", round=round_label,
+            preview=(f"Planner ran out of output room at {previous:,} tokens"
+                     + (f" ({reasoning:,} spent reasoning)" if reasoning else "")
+                     + f"; retrying with a {grown:,}-token cap"))
+
+    outcome = recovery.invoke_growing(
+        call, cap,
+        raw_of=lambda reply: reply.get("raw") if isinstance(reply, dict) else None,
+        on_retry=note,
+    )
+    # Wasted attempts are still billed; keep the running total where the
+    # caller can read it back when this ends in PlanValidationError.
+    for chargeable in outcome.wasted:
+        total_tokens = _charge_plan_call(chargeable, request_name, total_tokens, round_label=round_label)
+    raw = outcome.reply.get("raw") if isinstance(outcome.reply, dict) else None
+    total_tokens = _charge_plan_call(raw, request_name, total_tokens, round_label=round_label)
+    budget["max_tokens"] = cap.value
+    if cap.ceiling < ceiling:
+        budget["ceiling"] = cap.ceiling
+    budget["total_tokens"] = total_tokens
+    if outcome.truncated:
+        raise PlanValidationError([
+            f"Planner output reached the model output limit ({cap.value:,} tokens is all this model has left"
+            + (f"; {outcome.reasoning_tokens:,} spent reasoning" if outcome.reasoning_tokens else "") + ")"])
+    return outcome.reply, total_tokens
+
+
+def _structured_model(llm, provider: str, schema: dict, *, max_tokens: int | None = None):
+    """Bind ``schema`` using the provider's structured-output API.
+
+    The output cap and extra_body go on a copy of the model before wrapping:
+    kwargs passed to the wrapped sequence never reach the request.
+    """
+    update: dict = {}
+    if max_tokens:
+        fields = getattr(type(llm), "model_fields", {})
+        for name in ("max_tokens", "max_output_tokens"):
+            if name in fields:
+                update[name] = int(max_tokens)
+                break
+    if provider == "OpenRouter":
+        # Keep the usage flag and sticky-routing session_id already in extra_body.
+        body = dict(getattr(llm, "extra_body", None) or {})
+        body["provider"] = {**dict(body.get("provider") or {}), "require_parameters": True}
+        update["extra_body"] = body
+    if update:
+        llm = llm.model_copy(update=update)
+    # Native structured-output path per wrapper: OpenAI/OpenRouter enforce json_schema (strict),
+    # Claude only has json_schema on newer models so use tool input, Gemini rejects json_schema.
+    method = {
+        "Claude": "function_calling",
+        "Gemini": "json_mode",
+    }.get(provider, "json_schema")
+    options = {"method": method, "include_raw": True}
+    if provider in ("OpenAI", "OpenRouter"):
+        options["strict"] = True
+    return llm.with_structured_output(schema, **options)
+
+
+def _unpack_structured_plan(result) -> tuple[object, dict]:
+    if not isinstance(result, dict) or "parsed" not in result:
+        raise PlanValidationError(["Provider returned no structured plan result"])
+
+    raw = result.get("raw")
+    metadata = getattr(raw, "response_metadata", None) or {}
+    reason = str(metadata.get("finish_reason") or metadata.get("stop_reason") or "").lower()
+    status = str(metadata.get("status") or "").lower()
+    if reason in {"length", "max_tokens", "max_output_tokens"} or status == "incomplete":
+        raise PlanValidationError(["Planner output reached the model output limit"])
+    if result.get("parsing_error"):
+        raise PlanValidationError([f"Provider rejected the structured plan: {result['parsing_error']}"])
+
+    parsed = result.get("parsed")
+    if hasattr(parsed, "model_dump"):
+        parsed = parsed.model_dump()
+    if not isinstance(parsed, dict):
+        raise PlanValidationError(["Provider returned no structured plan object"])
+    return raw, parsed
 
 
 def _plan_run_config(run_name: str, *, round_number: int, mode: str) -> dict:
@@ -3040,6 +3365,455 @@ def _prepare_verification_contract(state: dict) -> dict:
     return verification.prepare_contract(state["target_app_name"], editable_tests=(
         path for task in state.get("execution_tasks", []) for path in task.get("files", [])
     ))
+
+
+def review_node(state: dict) -> dict:
+    """Check the whole implementation, run its tests, then review it in an independent context."""
+    if state.get("error"):
+        _persist_task_results(state)
+        return {"error": state["error"]}
+    if state.get("review_stopped"):
+        return {}  # repair stopped (its call budget ran out); the last review's findings stand
+    active, criteria, allowed = _execution_context(state)
+    logs = _log_stage(state, "Reviewing", "started", "Reviewing the changes")
+    baseline = _without_redacted(state, state.get("execution_baseline") or {})
+    changes, diff = change_evidence(baseline, lambda p: _read_current(state, p))
+    changed_paths = [e["path"] for e in changes]
+    paths = _integration_neighbor_paths(
+        state, list(dict.fromkeys(_review_paths(state, allowed) + changed_paths)), changed_paths)
+    reviewed_content = {p: _read_current(state, p) for p in paths}
+    moved = renamed_sources(state.get("file_moves") or [], lambda p: _read_current(state, p))
+    deletions = _approved_deletions(state)
+    prior_deleted = set(state.get("prior_deleted_paths") or []) if state.get("is_follow_up") else set()
+    # A task's files are a starting point, so a path the plan named but the work
+    # did not need is not a defect — only a path that was actually written, or
+    # that exists, is checked.
+    check_paths = [p for p in paths if p not in moved and p not in deletions
+                   and reviewed_content.get(p) is not None
+                   and not (p in prior_deleted and reviewed_content.get(p) is None)]
+    health = run_health_checks(state["target_app_name"], [{"path": p} for p in check_paths])
+    health.results.extend(
+        CheckResult(f"exists:{p}", False, "A file this task changed is missing")
+        for p in changed_paths
+        if p not in moved and p not in deletions and p not in prior_deleted
+        and not _app_file_exists(state["target_app_name"], p)
+    )
+    health.results.extend(CheckResult(f"deleted:{p}", reviewed_content.get(p) is None,
+                                      "Approved DELETE path must be absent") for p in deletions)
+    attempt = state.get("review_attempts", 0) + 1
+    updates = {"review_repairable": False, "review_retry_requested": False}
+
+    def halted() -> bool:
+        """Repair stopped: the work goes out with its findings as warnings."""
+        return bool(updates.get("review_stopped"))
+
+    completion = completion_report(json.dumps(state.get("task_completion") or {}))
+    # The implementer's own report, for the reviewer to verify rather than trust.
+    claims = [{"task_id": active["id"], **completion}]
+    if health.passed:
+        contract = state.get("verification_contract")
+        if contract is None:  # no implementation turn prepared one
+            contract = _prepare_verification_contract(state)
+        updates["verification_contract"] = contract
+        required = verification.needs_tests(
+            [*check_paths, *changed_paths, *(state.get("prior_changed_paths") or [])])
+        # The host owns re-testing every coherent repair; a blocked/unfinished
+        # model report must not postpone this until the call budget has run out.
+        test_health, receipts = verification.run_verification(
+            state["target_app_name"], contract, env=_get_bench_env(), required=required,
+        )
+        # The warning reflects these tests only: cleared here, set again below if they still fail
+        # after the repair cap. Earlier failures stay in the receipts of the reviews that saw them.
+        updates["tests_unresolved"] = ""
+        health.results.extend(test_health.results)
+        for receipt in receipts:
+            receipt["source_revisions"] = {p: revision(content) for p, content in reviewed_content.items()}
+        updates["verification_receipts"] = receipts
+        updates['verification_progress'] = repair_budget.observe(state.get('verification_progress'), test_health, receipts)
+    if state.get("turn_exhausted") and completion.get("status") == "complete":
+        # The turn boundary is not a correctness verdict. A complete report
+        # still goes through the mandatory checks and independent final review.
+        updates["turn_exhausted"] = False
+    # Tests still failing after MAX_TEST_REPAIRS rounds are reported, not gated;
+    # suite-integrity checks and environment failures keep gating.
+    test_repairs = int(state.get("test_repair_rounds") or 0)
+    test_warnings, demoted = "", []
+    if test_repairs >= MAX_TEST_REPAIRS:
+        demoted = [r for r in health.failures if r.name.startswith("tests:")
+                   and not r.name.startswith(TEST_INTEGRITY_CHECKS) and getattr(r, "owner", "") != "environment"]
+        if demoted:
+            test_warnings = "\n".join(f"- {r.name}: {str(r.detail)[:400]}" for r in demoted)
+            health.results = [r for r in health.results if r not in demoted]
+            updates["tests_unresolved"] = test_warnings
+            _publish_agent_log(state.get("request_name", ""), "tests_reported_as_warnings",
+                               tests=[r.name for r in demoted], repairs=test_repairs)
+    plan_recovery_attempted = False
+    unfinished_at_cap = False
+    if health.environment_failures:
+        passed, notes = False, (
+            "Review could not access the required source/checker environment; code repair is not the owner: "
+            + health.summary()
+        )
+        updates["review_stopped"] = notes
+    elif state.get("turn_exhausted") and completion.get("status") != "complete":
+        # Unfinished, not failed: the continuation gets what is left and every
+        # check result, and a check it has not reached yet is not a stall.
+        passed, notes = False, f"{CALL_LIMIT_NOTE} without finishing. Inspect current changes and complete the plan."
+        updates["review_repairable"] = True
+        unfinished_at_cap = True
+        # A blocked report from the forced final call says what is left; hand
+        # it to the retry instead of making it rediscover the state.
+        remaining = [completion.get("summary", "")] + list(completion.get("unverified") or [])
+        remaining = [item for item in remaining if isinstance(item, str) and item.strip()]
+        if completion.get("status") == "blocked" and remaining:
+            notes += " Reported remaining work: " + " | ".join(remaining)[:1500]
+        notes += "\nChecks already executed against the current files:\n" + health.summary()
+    elif any(result.name.startswith('tests:') for result in health.failures):
+        # An older completion report may claim testing was blocked. Freshly
+        # executed failing cases are stronger evidence: repair those cases,
+        # rather than sending a now-stale testing blocker back to the planner.
+        passed, notes = False, health.summary()
+        updates["review_repairable"] = True
+        updates["test_repair_rounds"] = test_repairs + 1
+    elif completion.get("status") == "blocked":  # an exhausted turn took the branch above
+        # A scope blocker must reach the planner even when an uncreated destination
+        # also fails the existence check. Repeating the same contract cannot fix it.
+        passed = False
+        plan_recovery_attempted = True
+        amended, note = _amend_plan_for_blocker(state, completion)
+        # Keep the repair outcome before the model's often-long blocker report,
+        # so dashboard previews and bounded errors cannot hide why recovery failed.
+        notes = f"{PLAN_RECOVERY_NOTE} {note}\nImplementation blocked: {completion['summary']}"
+        _publish_agent_log(state.get("request_name", ""), "llm_response", round=0,
+                           preview=f"{active['id']} plan recovery: {note}")
+        if amended:
+            updates.update(amended)
+        if amended and "execution_tasks" in amended:
+            attempt = 0  # A repaired contract gets a fresh, still-bounded review budget.
+            updates["review_fingerprint"] = ""
+            updates["review_fingerprints_seen"] = []
+            updates["review_failure_fingerprints_seen"] = []
+        if not health.passed:
+            notes += " Current checks: " + health.summary()
+    elif not health.passed:
+        passed, notes = False, health.summary()
+        updates["review_repairable"] = True
+    elif (state.get("review_attempts", 0) > 0
+          and not state.get("review_retry_requested")
+          and completion.get("status") != "complete"):
+        passed, notes = False, (f"{INVALID_REPORT_NOTE} complete JSON report. Finish the task and report its "
+                                "behavior and verification.")
+        updates["review_repairable"] = True
+    else:
+        # _run_agent_turn sends the shared request context as its own message.
+        prompt = get_review_prompt([{"path": p} for p in paths], request_name=state.get("request_name"))
+        prompt += "\n\n## REVIEW CONTRACT (authoritative)\n" + json.dumps({
+            "phase": "final review of the whole plan",
+            "criteria": [{"criterion": i, "requirement": c} for i, c in enumerate(criteria, 1)],
+            "implementation_claims": _compact_execution_results(claims),
+        }, ensure_ascii=True)
+        # Changed paths go in only as their diff; hashes bind every reviewed path,
+        # and omitted source stays reachable through the read tools.
+        prompt += "\n\n## CURRENT CHANGE EVIDENCE\n" + diff
+        unchanged_paths = [path for path in paths if path not in set(changed_paths)]
+        if unchanged_paths:
+            # No-op/follow-up review still needs actual source, while changed
+            # paths must not be duplicated beside their diff.
+            prompt += "\n\n## UNCHANGED SOURCE EVIDENCE\n" + source_context(
+                unchanged_paths, reviewed_content.get, baseline, limit=8000
+            )
+        prompt += "\n\n## SOURCE REVISION MANIFEST\n" + json.dumps({
+            path: revision(reviewed_content.get(path)) for path in paths
+        }, ensure_ascii=True)
+        prompt += "\n\n## STATIC CHECKS\n" + health.summary()
+        uncalled = _uncalled_whitelisted(state["target_app_name"], baseline, changed_paths,
+                                         lambda p: reviewed_content.get(p, _read_current(state, p)),
+                                         list(state.get("called_methods") or []))
+        if uncalled:
+            prompt += (
+                "\n\n## CHANGED WHITELISTED METHODS NEVER RUN\n" + "\n".join(f"- {m}" for m in uncalled)
+                + "\nNo call_method in this request ran these. Run each one with call_method before judging a "
+                "criterion that depends on it (what it returns, who may call it, what it refuses); one that posts "
+                "to an external service is the exception. A criterion that depends on a method nobody ran is "
+                "unmet: say it was not run.")
+        prompt += "\n\n## EXECUTED BEHAVIORAL CHECKS\n" + json.dumps(
+            _model_receipts(updates.get("verification_receipts", [])), ensure_ascii=True)
+        prompt += (
+            "\nAssess every criterion against current source. Behavior is proven by running it: use "
+            "call_method to run the changed endpoints and helpers against the live site (database writes are "
+            "rolled back), and read the executed test receipts and their source. Python tests run against the live "
+            "site; a test that mocks the behavior under test proves nothing. Implementation claims are not "
+            "proof. Do not invent requirements outside the approved scope. For a copy or adaptation, the "
+            "reference is part of the specification: before marking a criterion unmet, check what the reference "
+            "does. Behavior the plan does not name as a change or a fix is correct when the change does what the "
+            "reference does, even where a criterion's wording seems stricter; record that conflict as P2, never "
+            "P0/P1. Missing or truncated context is a reason to use your tools, not a defect.\n"
+            "Rank each issue: P0 the request does not work (crash, wrong data, broken page); P1 a criterion "
+            "is not met in real use or a regression; P2 an edge case, missing test for working behavior, "
+            "or a better design; P3 style. Only P0/P1 send the task back; P2/P3 are recorded and pass. "
+            "Client/UI behavior is verified by reading its source and wiring; never require a Node test for "
+            "it. Name a test file in an issue only when that test itself is wrong. "
+            'Return ONLY JSON: {"review_passed":true,"issues":[{"criterion":1,"severity":"P1",'
+            '"issue":"what fails, the concrete input and the observed vs expected result"}],"evidence":'
+            '[{"criterion":1,"status":"satisfied","evidence":"path:symbol and what you ran or read"}]}. '
+            'Include exactly one evidence entry per numbered criterion. "unmet" needs a P0/P1 issue; mark a '
+            'criterion with only P2/P3 issues "satisfied". Use "unverified" only for evidence your tools can '
+            "still fetch; get it first. review_passed is false exactly when a P0/P1 issue or an unverified "
+            "criterion remains."
+        )
+        histories = state.get("review_history") or {}
+        prior_attempts = int(state.get("review_attempts", 0) or 0)
+        reuse_history = bool(prior_attempts and prior_attempts % REVIEW_HISTORY_RECHECKS)
+        history = histories.get(active["id"]) if reuse_history else None
+        history = history if isinstance(history, dict) else {}
+        opening_prompt = history.get("task_prompt")
+        previous_snapshot = history.get("reviewed_content")
+        if isinstance(opening_prompt, str) and isinstance(previous_snapshot, dict):
+            # Continue the same reviewer conversation after implementation has
+            # repaired its finding. The previous source/tool reads remain a
+            # cacheable prefix; only the actual repair delta and current receipts
+            # are appended. Explicit supersession prevents stale source from
+            # being treated as current.
+            delta_baseline = dict(previous_snapshot)
+            for path in paths:
+                delta_baseline.setdefault(path, None)
+            _, repair_diff = change_evidence(
+                delta_baseline, reviewed_content.get, limit=12000
+            )
+            directive = (
+                "## REVIEW RECHECK AFTER IMPLEMENTATION REPAIR\n"
+                "Continue the same complete review. The current repair diff below supersedes any older "
+                "source lines or tool results for those paths. Preserve previously satisfied criteria, "
+                "verify the concrete prior finding is resolved, and inspect the changed regions for regressions. "
+                "Converge: a new finding in code this repair did not change is P2 unless it makes the request "
+                "fail outright (P0); do not deepen a criterion the previous pass accepted, unless running "
+                "it (call_method on real records or check_page) shows its outcome is not delivered. "
+                "Use read-only tools only when this delta is truncated or a connected dependency is missing.\n\n"
+                "### PRIOR FINDING\n" + str(state.get("review_notes") or "")[:4000]
+                + "\n\n### CURRENT REPAIR DIFF\n" + repair_diff
+                + "\n\n### CURRENT SOURCE REVISIONS\n" + json.dumps({
+                    path: revision(reviewed_content.get(path)) for path in paths
+                }, ensure_ascii=True)
+                + "\n\n### CURRENT IMPLEMENTATION CLAIM\n" + json.dumps(
+                    _compact_execution_results(claims), ensure_ascii=True)
+                + "\n\n### CURRENT STATIC CHECKS\n" + health.summary()
+                + "\n\n### CURRENT EXECUTED BEHAVIORAL CHECKS\n" + json.dumps(
+                    _model_receipts(updates.get("verification_receipts", [])), ensure_ascii=True)
+            )
+            # The repair changed the source: earlier reads, and calls that failed
+            # against the old revision, may run again.
+            for key in ("seen_calls", "seen_results", "failed_calls", "failure_causes"):
+                history.setdefault(key, {}).clear()
+            # Each recheck restates the prior finding and the full current delta.
+            drop_followups(history, "review_recheck")
+            _queue_followup(
+                history,
+                str(history.get("last_verdict") or state.get("review_notes") or ""),
+                directive,
+                kind="review_recheck",
+            )
+            prompt = opening_prompt
+        else:
+            history["task_prompt"] = prompt
+        history["reviewed_content"] = dict(reviewed_content)
+        decision, notes = "invalid", ""
+        prior_unmet = set()
+        # The recovery pass continues the first pass's retained tool rounds, so
+        # its smaller round budget is spent on reads that have not happened yet.
+        output = ""
+        for recovery_pass in range(2):
+            turn_updates = _run_agent_turn(
+                {**state, **updates}, "Reviewing", prompt, read_only_tools=True,
+                max_rounds=MAX_TOOL_ROUNDS_REVIEW if recovery_pass == 0 else MAX_TOOL_ROUNDS_REVIEW_RECOVERY,
+                history=history,
+                # The same catalogue as planning and implementation, so the review
+                # reuses the cached tools+system prefix; both session tools refuse here.
+                session={"plan_sink": None, "explorer": None, "shared_context": True},
+            )
+            updates.update(turn_updates)
+            updates.pop("_write_baseline", None)
+            updates.pop("_tool_edited_paths", None)
+            updates.pop("_file_moves", None)
+            if updates.get("review_stopped"):
+                notes = str(state.get("review_notes") or "")  # the last findings go out with the warning
+                break
+            # A reviewer turn that failed (a provider error, a full context) is retried
+            # like missing evidence, and after its bounded retries reported, never fatal.
+            turn_error = updates.pop("error", None)
+            steps = updates.get("intermediate_steps") or []
+            output = steps[-1].get("output", "") if steps else ""
+            payload = _extract_review_json(output)
+            decision, notes = review_decision(payload, criteria)
+            if prior_unmet and decision != "invalid":
+                now_satisfied = {e["criterion"] for e in payload["evidence"] if e["status"] == "satisfied"}
+                resolved = payload.get("resolved_findings", [])
+                valid_resolutions = isinstance(resolved, list) and all(
+                    isinstance(item, dict) and type(item.get("criterion")) is int
+                    and isinstance(item.get("explanation"), str) and item["explanation"].strip()
+                    for item in resolved
+                )
+                resolved_ids = {item["criterion"] for item in resolved} if valid_resolutions else set()
+                if (prior_unmet & now_satisfied) - resolved_ids:
+                    decision, notes = "invalid", "Invalid review result: earlier concrete findings need explicit resolution evidence."
+            if updates.get("turn_exhausted") and not turn_error and decision in {"pass", "repair"}:
+                # The forced no-tools final call still produced a complete,
+                # well-formed verdict. Reaching the round cap is not a reason
+                # to discard it; only an incomplete or invalid verdict is.
+                updates["turn_exhausted"] = False
+                _publish_agent_log(state.get("request_name", ""), "review_verdict_after_cap",
+                                   decision=decision, recovery=recovery_pass)
+            if updates.get("turn_exhausted") and recovery_pass == 0 and not turn_error:
+                # A per-pass cap is why the bounded evidence recovery exists.
+                updates["turn_exhausted"] = False
+            if turn_error or updates.get("turn_exhausted"):
+                notes = turn_error or "Reviewer exhausted its call limit; verification is incomplete."
+                # Exhausting this read-only pass is recoverable if the overall
+                # execution budget still has room for a fresh evidence pass.
+                updates["turn_exhausted"] = False
+                decision = "needs_evidence"
+                break
+            if decision not in {"invalid", "needs_evidence"}:
+                break
+            if recovery_pass == 0:
+                entries = payload.get("evidence", []) if isinstance(payload, dict) else []
+                # A malformed envelope may still contain a valid concrete finding.
+                prior_unmet = {e["criterion"] for e in entries if isinstance(e, dict)
+                    and type(e.get("criterion")) is int and 1 <= e["criterion"] <= len(criteria)
+                    and e.get("status") == "unmet"} if isinstance(entries, list) else set()
+                _queue_followup(history, output, (
+                    "## REVIEWER RECOVERY\n"
+                    + _review_recovery_reason(decision, notes, payload, criteria) + "\n\n"
+                    "The tool results from your first pass are retained above; do not re-read them. "
+                    "Use read-only tools only for current source you have not fetched yet, preserve all "
+                    "concrete findings, then return the complete verdict as JSON only. Read test sources "
+                    "and execution receipts for runtime criteria. If changed server logic has no executed "
+                    "evidence, run it with call_method, or report the scenario implementation must add and "
+                    "run; verify client/UI behavior from source. "
+                    'If any earlier unmet criterion becomes satisfied, include resolved_findings '
+                    '[{"criterion":1,"explanation":"Current source evidence resolving the earlier finding"}]. '
+                    "Every concrete finding must remain or be explicitly resolved."
+                ))
+        history["last_verdict"] = output
+        updates["review_history"] = {active["id"]: history}
+        passed = decision == "pass" and not halted()
+        if decision == "repair" and not halted():
+            updates["review_repairable"] = True
+            # A test the reviewer calls wrong must be correctable; every other
+            # green test stays frozen.
+            contract = dict(updates.get("verification_contract") or state.get("verification_contract") or {})
+            contract["frozen_tests"] = dict(contract.get("frozen_tests") or {})
+            if verification.release_frozen(contract, notes):
+                updates["verification_contract"] = contract
+        if decision in {"invalid", "needs_evidence"} and not halted():
+            retries = int(state.get("review_format_retries", 0) or 0)
+            if retries < MAX_REVIEW_RECHECKS:
+                updates.update(review_retry_requested=True, review_format_retries=retries + 1,
+                               review_history={})
+                attempt = int(state.get("review_attempts", 0) or 0)
+                notes = "Reviewer evidence/format recovery needed: " + notes
+            else:
+                updates["review_stopped"] = "The independent review could not reach a verdict (" + (
+                    "missing evidence" if decision == "needs_evidence" else "invalid verdict format"
+                ) + ") after recovery and two fresh review attempts: " + notes[:1500]
+        elif decision in {"pass", "repair"}:
+            updates["review_format_retries"] = 0
+    if (not halted()
+            and any(_read_current(state, p) != content for p, content in reviewed_content.items())):
+        passed, notes = False, "Files changed during review. Verify current source again before accepting the work."
+        updates["review_repairable"] = False
+        rechecks = int(state.get("review_rechecks", 0) or 0) + 1
+        if rechecks <= MAX_REVIEW_RECHECKS:
+            # This is neither an implementation defect nor a terminal error:
+            # the verdict simply describes an obsolete snapshot.  Re-enter
+            # review with current bytes without spending a repair attempt.
+            updates["review_retry_requested"] = True
+            updates["review_rechecks"] = rechecks
+            attempt = int(state.get("review_attempts", 0) or 0)
+        else:
+            updates["review_stopped"] = (
+                f"Source kept changing during review after {rechecks} snapshots; "
+                "automatic re-review stopped to avoid approving unstable files."
+            )
+    elif passed or updates.get("review_repairable"):
+        updates["review_rechecks"] = 0
+    if test_warnings:
+        notes = f"{notes}\nTests still failing after {test_repairs} repair rounds (reported, not blocking):\n{test_warnings}"
+    updates.update({"review_passed": passed, "review_notes": notes, "review_attempts": attempt})
+    # Repeated evidence stops repair, not an attempt count. An unfinished turn
+    # words its remaining work differently each time, so its progress is the
+    # files and check results moving, not the notes.
+    failure_fingerprint = _health_failure_fingerprint(health)
+    fingerprint = ("unfinished\x00" + _review_fingerprint(changes) + "\x00" + failure_fingerprint
+                   if unfinished_at_cap else _review_outcome_fingerprint(changes, notes))
+    # An amended plan reset the histories above; read them from there.
+    history_source = updates if "review_fingerprints_seen" in updates else state
+    prior_fingerprints = list(history_source.get("review_fingerprints_seen") or [])
+    if not prior_fingerprints and history_source.get("review_fingerprint"):
+        prior_fingerprints.append(history_source["review_fingerprint"])
+    track_failure_progress = not passed and not halted() and not updates.get("review_retry_requested")
+    cycled, seen = (_record_review_fingerprint(fingerprint, prior_fingerprints)
+                     if track_failure_progress else (False, prior_fingerprints))
+    prior_failure_fingerprints = list(history_source.get("review_failure_fingerprints_seen") or [])
+    # An unfinished turn stalls only when its files and checks both stand still (``cycled``).
+    repeated_failure = bool(track_failure_progress and failure_fingerprint and not unfinished_at_cap
+                            and failure_fingerprint in prior_failure_fingerprints)
+    if track_failure_progress and failure_fingerprint and not repeated_failure:
+        prior_failure_fingerprints.append(failure_fingerprint)
+    stalled_plan_recovery = (plan_recovery_attempted
+                             and "execution_tasks" not in updates)
+    updates["review_fingerprint"] = fingerprint
+    updates["review_fingerprints_seen"] = seen
+    updates["review_failure_fingerprints_seen"] = prior_failure_fingerprints
+    if repeated_failure and completion.get("status") == "blocked":
+        # Blocked and the same check failed again: deliver with the failure as a warning.
+        # (An exhausted turn's "blocked" means unfinished; repeated_failure excludes it.)
+        updates["review_stopped"] = ("The work is blocked and the same "
+                                     f"deterministic check failed again: {completion.get('summary', '')[:1000]}\n"
+                                     f"{notes[:2000]}")
+    elif (track_failure_progress and attempt >= MAX_REVIEW_ATTEMPTS
+            and (repeated_failure or cycled or stalled_plan_recovery)):
+        why = ("after the same deterministic check failed again" if repeated_failure else
+               "after plan recovery produced no executable contract change" if stalled_plan_recovery else
+               "after returning to a changed-file state already reviewed")
+        strategy = int(state.get("repair_strategy_level", 0) or 0)
+        if strategy < MAX_REPAIR_STRATEGIES:
+            updates.update(repair_strategy_level=strategy + 1, review_repairable=True,
+                           review_notes=notes + f"\nPrevious repair was ineffective {why}.")
+            _publish_agent_log(state.get("request_name", ""), "repair_strategy_changed",
+                               task_id=active["id"], strategy=strategy + 1, preview=notes[:1000])
+        else:
+            updates["review_stopped"] = (f"The work did not pass review after "
+                                         f"{attempt} attempts and {strategy} changed repair strategies {why}: "
+                                         f"{notes[:2000]}")
+    elif (not passed and not halted()
+          and updates.get("review_repairable")
+          and attempt % REVIEW_COST_PRESSURE_ATTEMPT == 0):
+        # Telemetry only: many serial reviews never stop the run.
+        _publish_agent_log(
+            state.get("request_name", ""),
+            "review_cost_pressure",
+            task_id=active["id"],
+            attempts=attempt,
+            action="continue repair with compact evidence",
+        )
+    results = list(state.get("task_results") or [])
+    result = {
+        "task_id": active["id"], "status": "passed" if passed else "failed",
+        "attempts": attempt, "summary": state.get("task_summary", ""),
+        "behavior": completion.get("behavior", []),
+        "verification": completion.get("verification", []),
+        "unverified": list(completion.get("unverified", []))
+        + [f"Failing test (after {test_repairs} repairs): {r.name}" for r in demoted],
+        "changes": changes, "review": notes,
+        "executed_checks": updates.get("verification_receipts", []),
+    }
+    results = [r for r in results if r["task_id"] != active["id"]] + [result]
+    updates["task_results"] = results
+    updates["change_summary"] = "\n\n".join(r["summary"] for r in results if r.get("summary"))
+    updates["stage_log"] = _log_stage({**state, "stage_log": logs}, "Reviewing", "completed",
+                                       "Review passed" if passed else "Review failed")
+    _persist_task_results({**state, **updates})
+    return updates
 
 
 def review_node(state: dict) -> dict:

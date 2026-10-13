@@ -116,9 +116,19 @@ def _grep_shape(arguments: Mapping[str, object], result: str) -> str:
         return "0 matches"
     if str(arguments.get("mode", "")) == "files":
         return f"{count} file(s)"
+<<<<<<< HEAD
+<<<<<<< HEAD
     stated = _IN_FILES.search(result.split("\n", 1)[0])
     files = int(stated.group(1)) if stated else len(
         {line.split(":", 1)[0] for line in _content_lines(result)[1:] if ":" in line})
+=======
+    files = len({line.split(":", 1)[0] for line in _content_lines(result) if ":" in line})
+>>>>>>> 73dde5e (Ab 01766 (#13))
+=======
+    stated = _IN_FILES.search(result.split("\n", 1)[0])
+    files = int(stated.group(1)) if stated else len(
+        {line.split(":", 1)[0] for line in _content_lines(result)[1:] if ":" in line})
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
     return f"{count} matches in {files or 1} file(s)"
 
 
@@ -159,6 +169,10 @@ def _lines(result: str) -> int:
 
 
 def _count(result: str) -> int:
+<<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
     """How many results this output represents: the count its header states.
 
     search, grep and glob open with ``<tool> "<query>": N hits|matches|file(s)|path(s)``;
@@ -169,3 +183,10 @@ def _count(result: str) -> int:
         return int(stated.group(1))
     return len([line for line in _content_lines(result)
                 if not (line.startswith("[") or line.startswith("… +"))])
+<<<<<<< HEAD
+=======
+    """How many results this output represents."""
+    return _lines(result)
+>>>>>>> 73dde5e (Ab 01766 (#13))
+=======
+>>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
