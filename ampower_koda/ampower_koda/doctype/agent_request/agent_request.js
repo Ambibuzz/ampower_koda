@@ -47,18 +47,6 @@ var REQUEST_TYPE_HELP = {
     'ERPNext-flavored': '<b>Highlights:</b> ERPNext flows (Sales, Stock, Accounts) in your custom app.'
 };
 
-var REQUEST_TYPE_HELP = {
-    'Bug Fix': '<b>Highlights:</b> Fix a specific failure (validation error, broken API, JS error, wrong query).',
-    'Reports & analytics': '<b>Highlights:</b> Create or modify Script Reports, filters, columns, or analytics.',
-    'DocTypes & data model': '<b>Highlights:</b> Create/modify DocTypes, fields, child tables, permissions, naming rules.',
-    'Forms & desk UI': '<b>Highlights:</b> Client scripts, buttons, list view tweaks, field visibility, desk UX changes.',
-    'Server & business logic': '<b>Highlights:</b> Validation logic, controller changes, whitelisted APIs, queries.',
-    'Documents & output': '<b>Highlights:</b> Print Formats, PDF templates, document output formatting.',
-    'Integrations': '<b>Highlights:</b> External APIs, webhooks, sync, connectors, third-party services.',
-    'Platform & maintenance': '<b>Highlights:</b> Patches, hooks, scheduler tasks, performance or cleanup work.',
-    'ERPNext-flavored': '<b>Highlights:</b> ERPNext flows (Sales, Stock, Accounts) in your custom app.'
-};
-
 var STATUS_FLOW = [
     'Queued', 'Understanding', 'Planning', 'Awaiting Approval',
     'Implementing', 'Reviewing', 'Awaiting Bench Approval', 'Building',

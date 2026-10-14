@@ -29,6 +29,7 @@ class AgentSettings(Document):
             frappe.throw(
                 _("{0} is required when {1} is the default provider").format(label, provider)
             )
+
     def _validate_langsmith(self):
         """Tracing on with no key is the failure worth catching here.
 

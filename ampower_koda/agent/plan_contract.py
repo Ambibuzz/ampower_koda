@@ -302,13 +302,6 @@ def validate_plan(raw) -> dict:
         "risks": _string_list(raw.get("risks"), "plan.risks", issues),
         "tasks": tasks,
     }
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-
->>>>>>> 33eb5b0 (Feature/koda plan fix (#15))
-=======
->>>>>>> 38f5e87 (Feature/ safer agent execution with run cancellation/resume, checkpointing, Frappe code validation, contained testing, AI response recovery, prompt caching, automated review/repair, and improved planning (#17))
     id_to_index: dict[str, int] = {}
     for index, task in enumerate(tasks):
         key = task["id"].casefold()

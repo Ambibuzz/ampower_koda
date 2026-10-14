@@ -30,6 +30,10 @@ from .contracts.escalation import SideUsage
 from .contracts.ledger import Ledger
 from .contracts.model import UtilityModel
 from .contracts.prompt import PromptBudget
+from .contracts.transcript import Block, Transcript
+from .elide.collapse import READ_TOOLS
+from .elide.compact import compact_for_request
+from .elide.hotcold import hot_cold
 from .fold.document import SessionState
 from .fold.run import fold_turn
 from .ledger.distill import distil_into
@@ -48,12 +52,22 @@ ROLE_PROMPT = """You are a software engineer working inside one repository.
 
 Answer from what you have actually read. When you have not read something, say
 so rather than inferring it — a confident guess costs more to undo than a short
+answer costs to extend.
 
 Prefer outline over read. Prefer one search over three greps. Cite what you
 found as path:line so it can be checked."""
 
 
 def open_session(
+    workspace: Workspace,
+    *,
+    overrides: dict | None = None,
+    model: str = DEFAULT_ARCHITECT_MODEL,
+) -> Session:
+    """Cold start. Expensive, and it happens exactly once per conversation."""
+    bootstrap = build_context(workspace, overrides=overrides)
+    context = bootstrap.context
+    return Session(
         workspace=workspace,
         model_id=model,
         context=context,

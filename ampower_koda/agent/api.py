@@ -105,46 +105,6 @@ def _reconcile_if_dead(doc) -> bool:
     return True
 
 
-
-def _reconcile_if_dead(doc) -> bool:
-    """Flip a busy request to Failed when its RQ job is no longer running.
-
-    A Queued request with a job counts too: a job lost before it started would
-    otherwise leave the form polling a request that never starts.
-    """
-    if doc.status not in BUSY_STATUSES and doc.status != "Queued":
-        return False
-    if not (doc.rq_job_id or "").strip():
-        return False
-
-    try:
-        from rq.job import Job
-        from rq.exceptions import NoSuchJobError
-        from frappe.utils.background_jobs import get_redis_conn
-
-        job = Job.fetch(doc.rq_job_id, connection=get_redis_conn())
-        job_status = job.get_status(refresh=True)
-        if job_status in ("queued", "started", "scheduled", "deferred"):
-            return False
-    except NoSuchJobError:
-        pass
-    except Exception:
-        log_agent_error("Agent Reconcile: could not inspect RQ job", frappe.get_traceback())
-        return False
-
-    _update_status(
-        doc.name, doc.owner or frappe.session.user, "Failed",
-        "Background job was terminated unexpectedly (worker likely killed by "
-        "an OOM condition or a bench/service restart). Please retry.",
-        error_log=(
-            f"Reconciled stale status. Last known status: {doc.status}. "
-            f"RQ job id: {doc.rq_job_id} was not found running."
-        ),
-    )
-    doc.reload()
-    return True
-
-
 def _whitelist_logged(fn):
     """Log unexpected API failures to Frappe Error Log before re-raising."""
     @wraps(fn)
@@ -1238,8 +1198,6 @@ def get_change_tree(request_name: str):
 
     branch_state = _get_branch_state(doc)
 
-    branch_state = _get_branch_state(doc)
-
     pending_cmds = []
     try:
         pending_cmds = json.loads(doc.pending_bench_commands or "[]")
@@ -1520,8 +1478,6 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
         _reconcile_if_dead(doc)
         if doc.status in BUSY_STATUSES:
             frappe.throw(_("Agent is busy (status: {0}).").format(doc.status))
-
-    _require_request_branch(doc)
 
     _require_request_branch(doc)
 
