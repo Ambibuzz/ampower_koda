@@ -1,6 +1,7 @@
 """The browser side of check_page, run as its own process (the worker never imports Playwright).
 
 argv: route, steps (JSON), screenshot path, Page JSON path ("" for none), session file, report file.
+KODA_RECORD_DIR: where to save a replayable recording of the check.
 Writes the report as JSON to the report file (the caller keeps only a bounded tail of stdout) and prints
 ``KODA_RENDER_REPORT_FILE``; without a report file it prints one ``KODA_RENDER_REPORT {json}`` line. Each step is reported by what it did while the page
 settled, not only by the end state: the server calls it made, what changed on the page and in dialogs,
@@ -17,6 +18,7 @@ import sys
 import time
 import traceback
 import urllib.parse
+from pathlib import Path
 
 MAX_STEPS = 20
 DIFF_LINES = 25
@@ -887,6 +889,20 @@ def first_visible(locator):
     return None
 
 
+def one_line(exc):
+    return " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
+
+
+def write_unrecorded(record_dir, message):
+    """Why the check was not recorded, in the error.txt the worker reads (recording/bundle.py ERROR_FILE).
+
+    Written here rather than through the recording package, so it still works when that package cannot be imported.
+    """
+    folder = Path(record_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "error.txt").write_text(message, encoding="utf-8")
+
+
 def page_width(page):
     return (page.viewport_size or {}).get("width") or 0
 
@@ -895,6 +911,7 @@ def main():
     route, steps, shot, page_json, session_file = (sys.argv[1], json.loads(sys.argv[2]), sys.argv[3], sys.argv[4],
                                                   sys.argv[5])
     report_file = sys.argv[6] if len(sys.argv) > 6 else ""
+    record_dir = os.environ.get("KODA_RECORD_DIR")
     report = {"route": route, "steps": []}
     # Before anything touches the site: a missing runtime must not leave a Page registered.
     try:
@@ -951,6 +968,19 @@ def main():
                 print("KODA_RENDER_UNAVAILABLE the site is not reachable at " + base + " (is the web server "
                       "running?): " + " ".join(str(exc).split())[:200], flush=True)
                 sys.exit(4)
+            # Attached after sign-in, so the sign-in check is not part of the replay. A recorder that cannot
+            # start (rrweb not installed, folder not writable, the recording package missing or broken) leaves
+            # the reason, and the check runs unrecorded. Imported here, not at the top, so a broken recording
+            # package never stops a check that does not record.
+            recording = None
+            if record_dir:
+                try:
+                    from ampower_koda.agent.recording import recorder
+                    recording = recorder.Recorder(record_dir)
+                    recording.attach(context, tab.page)
+                except Exception as exc:
+                    recording = None
+                    write_unrecorded(record_dir, one_line(exc))
             stage = "loading the page"
             try:
                 response = tab.page.goto(base + route, wait_until="load")
@@ -960,9 +990,15 @@ def main():
                 tab.settle(WATCH_LOAD_MS)
                 report["load"] = motion_lines(tab.evaluate("window.__motion ? window.__motion.stop() : null"),
                                               tab.seen_animations, load=True)
+                if recording:
+                    recording.drain()
                 for index, step in enumerate(steps[:int(os.environ.get("KODA_RENDER_MAX_STEPS", MAX_STEPS))], 1):
                     stage = f"step {index}"
+                    if recording:
+                        recording.step_start(index, step)
                     report["steps"].append(tab.step_report(index, step))
+                    if recording:
+                        recording.step_end(report["steps"][-1])
                 stage = "reading the final page"
                 report["url"] = tab.page.url
                 text = tab.page.locator("body").inner_text()
@@ -980,6 +1016,11 @@ def main():
                 # Whatever was seen before the failure still goes back.
                 report["runner_error"] = f"the check stopped while {stage}: " + " ".join(
                     f"{type(exc).__name__}: {exc}".split())[:300]
+            if recording:
+                try:
+                    recording.finish(route)
+                except Exception as exc:
+                    write_unrecorded(record_dir, one_line(exc))
             report["console"] = tab.console
             report["api_failures"] = [f"{c['status']} {c['method']}: {c['body']}" for c in tab.calls
                                       if (c["status"] or 0) >= 400][:15]
