@@ -102,7 +102,7 @@ def missing_tooling() -> list[str]:
     # javascript_check.cjs resolves eslint like node does: node_modules in this folder or a parent.
     here = Path(__file__).resolve().parent
     if not any((folder / "node_modules" / "eslint" / "package.json").is_file() for folder in (here, *here.parents)):
-        gaps.append(f"eslint is missing: run `npm ci` in {here.parents[1]}")
+        gaps.append("eslint is missing: run `bench setup requirements --node`")
     if importlib.util.find_spec("playwright") is None and not _playwright_path():
         gaps.append("Playwright is missing: run `bench setup requirements --python`, then `bench migrate` "
                     "(it downloads Chromium)")
