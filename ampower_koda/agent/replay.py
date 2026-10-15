@@ -5,6 +5,7 @@ Every check_page run during a request is recorded into the target app's .koda/re
 """
 
 import re
+import secrets
 import time
 from pathlib import Path
 
@@ -30,7 +31,9 @@ def new_recording_dir(app_name, request_name, route):
         # A file in use or a permission problem: the next check tries again; this one still records.
         pass
     slug = re.sub(r"[^A-Za-z0-9_-]+", "_", route).strip("_")[:60] or "page"
-    folder = root / request_name / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}"
+    # The time comes first because prune sorts folders by name; the random part keeps two checks of the
+    # same route in the same second apart.
+    folder = root / request_name / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}-{slug}"
     try:
         folder.mkdir(parents=True, exist_ok=True)
     except OSError:
