@@ -15,6 +15,10 @@ RRWEB_MISSING = ("the recorder library @rrweb/record is not installed; run `benc
 
 # Enough of a step's report to say what the step did; the agent got the full report already.
 STEP_LINES_KEPT = 30
+# A page that never stops changing (a clock, a spinner) emits events without end. Past this the recording
+# stops: the start, with the first full snapshot, is kept, and summary.json says it was truncated.
+# capture.js uses the same limit.
+MAX_EVENTS = 20000
 
 
 class RecordingUnavailable(Exception):
@@ -48,6 +52,7 @@ class Recorder:
         self.started = time.time()
         self.page = None
         self.events = []
+        self.truncated = False
         self.steps = []
 
     def attach(self, context, page):
@@ -61,8 +66,13 @@ class Recorder:
             collected = self.page.evaluate("window.__kodaRec ? window.__kodaRec.drain() : null")
         except Exception:
             return
-        if collected:
-            self.events += collected["events"]
+        if not collected or self.truncated:
+            return
+        room = MAX_EVENTS - len(self.events)
+        new_events = collected["events"]
+        self.events += new_events[:room]
+        if collected.get("truncated") or len(new_events) > room:
+            self.truncated = True
 
     def stamp(self, name, payload):
         """Put a named moment into the recording, so the replay timeline can show it."""
@@ -88,7 +98,7 @@ class Recorder:
         self.drain()
         record = {
             "version": 1,
-            "meta": {"route": route, "started": self.started},
+            "meta": {"route": route, "started": self.started, "truncated": self.truncated},
             "events": self.events,
             "steps": self.steps,
         }
@@ -96,5 +106,6 @@ class Recorder:
         bundle.write_summary(self.out_dir, {
             "route": route,
             "started": self.started,
+            "truncated": self.truncated,
             "steps": [{"index": step["index"], "outcome": step.get("outcome")} for step in self.steps],
         })
