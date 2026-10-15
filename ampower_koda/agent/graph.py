@@ -1140,15 +1140,19 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
                 return "RENDER_FAILED: steps must be a JSON list of step objects."
         # Planning and review must not change the live site: no Page JSON import or commit there.
         record_dir = replay.new_recording_dir(app_name, request_name, route)
-        result = render_check.check_page(app_name, route, parsed, env=_get_bench_env(), register=not read_only,
-                                         record_dir=record_dir)
-        if replay.has_recording(record_dir):
-            _publish_agent_log(request_name, "check_recording", recording=record_dir.name, route=route)
-        elif record_dir:
-            not_recorded = replay.recording_error(record_dir)
-            if not_recorded:
-                _publish_agent_log(request_name, "check_recording", route=route, error=not_recorded)
-            shutil.rmtree(record_dir, ignore_errors=True)
+        try:
+            result = render_check.check_page(app_name, route, parsed, env=_get_bench_env(), register=not read_only,
+                                             record_dir=record_dir)
+            if replay.has_recording(record_dir):
+                _publish_agent_log(request_name, "check_recording", recording=record_dir.name, route=route)
+            elif record_dir:
+                not_recorded = replay.recording_error(record_dir)
+                if not_recorded:
+                    _publish_agent_log(request_name, "check_recording", route=route, error=not_recorded)
+        finally:
+            # A cancelled request or a failed log publish must not leave an unrecorded folder behind.
+            if record_dir and not replay.has_recording(record_dir):
+                shutil.rmtree(record_dir, ignore_errors=True)
         return result
 
     # The same schema in every phase; the page's own server calls are what it exercises.
