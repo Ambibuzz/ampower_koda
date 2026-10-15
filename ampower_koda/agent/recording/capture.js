@@ -15,12 +15,25 @@
   // Desk's icon sprite is about 2.5 MB of static SVG on every page; it is left out of the recording.
   const ICON_SPRITE_ID = 'all-symbols';
 
+  // Same limit as recorder.py's MAX_EVENTS. A page that never stops changing stops being recorded here,
+  // so it cannot fill the browser's memory between two drains; the start, with the first snapshot, is kept.
+  const MAX_EVENTS = 20000;
+
   const events = [];
+  let recordedEvents = 0;
+  let truncated = false;
 
   rrwebRecord({
     emit(event) {
+      if (recordedEvents >= MAX_EVENTS) {
+        truncated = true;
+        return;
+      }
+      recordedEvents += 1;
       events.push(event);
     },
+    // Field values can hold customer or employee data; rrweb masks only password fields by default.
+    maskAllInputs: true,
     sampling: {mousemove: false, scroll: 150, media: 800, input: 'last'},
     slimDOMOptions: 'all',
     inlineStylesheet: true,
@@ -39,7 +52,7 @@
     },
 
     drain() {
-      return {events: events.splice(0)};
+      return {events: events.splice(0), truncated};
     },
   };
 })();
