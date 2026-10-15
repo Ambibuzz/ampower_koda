@@ -1,0 +1,12 @@
+{
+  "name": "ampower-koda",
+  "private": true,
+  "description": "JavaScript dependencies for the Frappe coding agent: code validation, and browser-check recording",
+  "engines": { "node": ">=18.18.0" },
+  "dependencies": {
+    "@rrweb/record": "2.1.7",
+    "eslint": "^9.39.0",
+    "globals": "^16.0.0",
+    "jsonc-parser": "^3.3.1"
+  }
+}
