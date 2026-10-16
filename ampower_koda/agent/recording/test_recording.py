@@ -1,6 +1,6 @@
 """Recording check_page runs: the recorder, the files it writes, and pruning old recordings.
 
-Run from the app folder with the bench's Python: ../../env/bin/python -m unittest discover tests
+Run with: bench --site <site> run-tests --module ampower_koda.agent.recording.test_recording
 """
 
 import os
