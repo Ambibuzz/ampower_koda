@@ -19,7 +19,7 @@ Koda builds changes to your Frappe apps from a plain-language request. It invest
 
 - Frappe v15 or v16
 - Python 3.10+
-- Node.js 18.18+ and npm
+- Node.js 18.18+ and yarn (a Frappe bench already has both)
 - An API key for OpenAI, Google AI Studio (Gemini), Anthropic (Claude) or OpenRouter
 - A GitHub personal access token with repo scope
 - On Linux, sudo once, for the browser's system libraries
@@ -29,8 +29,7 @@ Koda builds changes to your Frappe apps from a plain-language request. It invest
 
 ```
 cd frappe-bench
-bench get-app ampower_koda                          # Python packages, Playwright included
-cd apps/ampower_koda && npm ci && cd ../..          # ESLint, for JavaScript checks
+bench get-app ampower_koda                          # Python and JavaScript packages: Playwright, ESLint, rrweb
 bench --site your-site install-app ampower_koda     # also downloads Chromium (about 150 MB)
 bench restart
 ```
@@ -49,9 +48,8 @@ When a request starts, Koda names any check this bench cannot run yet. Those che
 ```
 cd frappe-bench/apps/ampower_koda
 git pull
-npm ci
 cd ../..
-bench setup requirements --python
+bench setup requirements                            # Python and JavaScript packages
 bench migrate                                       # also downloads Chromium if it is missing
 bench restart
 ```

@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re as _re
+import shutil
 from copy import deepcopy
 from datetime import datetime
 
@@ -25,6 +26,7 @@ from ampower_koda.agent import checkpoint
 from ampower_koda.agent import recovery
 from ampower_koda.agent import verification
 from ampower_koda.agent import render_check
+from ampower_koda.agent import replay
 from ampower_koda.agent import python_diagnostics
 from ampower_koda.agent.advisor import Advisor, directive as advisor_directive
 from ampower_koda.agent import repair_budget
@@ -918,7 +920,7 @@ def _request_spend_pressure(state: dict, request_name: str) -> str:
 
 def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_moves=None,
                 delete_paths=(), verification_contract=None, verification_observer=None, copied_files=None,
-                called_methods=None, session=None, reader=None):
+                called_methods=None, session=None, reader=None, request_name=""):
     """Build LangChain tools bound to a specific app_name.
 
     The catalogue is the same in every phase (tools precede messages in cache keys),
@@ -1137,7 +1139,21 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
             if not isinstance(parsed, list) or not all(isinstance(step, dict) for step in parsed):
                 return "RENDER_FAILED: steps must be a JSON list of step objects."
         # Planning and review must not change the live site: no Page JSON import or commit there.
-        return render_check.check_page(app_name, route, parsed, env=_get_bench_env(), register=not read_only)
+        record_dir = replay.new_recording_dir(app_name, request_name, route)
+        try:
+            result = render_check.check_page(app_name, route, parsed, env=_get_bench_env(), register=not read_only,
+                                             record_dir=record_dir)
+            if replay.has_recording(record_dir):
+                _publish_agent_log(request_name, "check_recording", recording=record_dir.name, route=route)
+            elif record_dir:
+                not_recorded = replay.recording_error(record_dir)
+                if not_recorded:
+                    _publish_agent_log(request_name, "check_recording", route=route, error=not_recorded)
+        finally:
+            # A cancelled request or a failed log publish must not leave an unrecorded folder behind.
+            if record_dir and not replay.has_recording(record_dir):
+                shutil.rmtree(record_dir, ignore_errors=True)
+        return result
 
     # The same schema in every phase; the page's own server calls are what it exercises.
     check_page = StructuredTool.from_function(
@@ -2181,6 +2197,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             called_methods=called_methods,
             session=session,
             reader=reader,
+            request_name=request_name,
         )
         llm = _get_llm(provider=provider, model=model, session_id=request_name,
                        reasoning_effort=_phase_reasoning_effort(phase, provider, model))

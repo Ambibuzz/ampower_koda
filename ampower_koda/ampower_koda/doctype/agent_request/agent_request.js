@@ -1554,6 +1554,15 @@ function append_log_entry(frm, data) {
             + ts + (data.success ? '\u2713 OK' : '\u2717 FAILED') + ' '
             + '<span style="color:var(--text-light);">' + frappe.utils.escape_html((data.output_preview || '').substring(0, 180)) + '</span>'
             + '</div>';
+    } else if (data.type === 'check_recording' && data.error) {
+        html = '<div style="color:var(--text-muted);margin-bottom:3px;padding-left:14px;">'
+            + ts + __('Browser check of {0} was not recorded: {1}',
+                [frappe.utils.escape_html(data.route || ''), frappe.utils.escape_html(data.error)])
+            + '</div>';
+    } else if (data.type === 'check_recording') {
+        html = '<div style="color:var(--text-muted);margin-bottom:3px;padding-left:14px;">'
+            + ts + __('Browser check of {0} recorded', [frappe.utils.escape_html(data.route || '')])
+            + '</div>';
     } else {
         html = '<div style="margin-bottom:3px;">'
             + ts + frappe.utils.escape_html(JSON.stringify(data).substring(0, 250))

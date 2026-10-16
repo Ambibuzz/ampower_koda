@@ -102,7 +102,7 @@ def missing_tooling() -> list[str]:
     # javascript_check.cjs resolves eslint like node does: node_modules in this folder or a parent.
     here = Path(__file__).resolve().parent
     if not any((folder / "node_modules" / "eslint" / "package.json").is_file() for folder in (here, *here.parents)):
-        gaps.append(f"eslint is missing: run `npm ci` in {here.parents[1]}")
+        gaps.append("eslint is missing: run `bench setup requirements --node`")
     if importlib.util.find_spec("playwright") is None and not _playwright_path():
         gaps.append("Playwright is missing: run `bench setup requirements --python`, then `bench migrate` "
                     "(it downloads Chromium)")
@@ -208,8 +208,11 @@ def _format(report: dict) -> str:
 
 
 def check_page(app_name: str, route: str, steps: list | None = None, env: dict | None = None, *,
-               register: bool = True) -> str:
-    """``register=False`` (planning, review) never imports Page JSON into the live site or commits."""
+               register: bool = True, record_dir: Path | None = None) -> str:
+    """``register=False`` (planning, review) never imports Page JSON into the live site or commits.
+
+    ``record_dir``: save a replayable recording of the check there.
+    """
     route = "/" + str(route or "").strip().lstrip("/")
     if not re.fullmatch(r"/[A-Za-z0-9_\-./?=&%]*", route) or route.startswith("//"):
         return "RENDER_FAILED: route must be a site path such as /desk/my_page."
@@ -226,6 +229,8 @@ def check_page(app_name: str, route: str, steps: list | None = None, env: dict |
     browsers = _browsers_path()
     if browsers:
         command_env["PLAYWRIGHT_BROWSERS_PATH"] = browsers
+    if record_dir:
+        command_env["KODA_RECORD_DIR"] = str(record_dir)
     shots = root / RENDER_DIRECTORY
     shots.mkdir(parents=True, exist_ok=True)
     shot = shots / f"{re.sub(r'[^A-Za-z0-9_-]+', '_', route).strip('_') or 'page'}-{time.strftime('%H%M%S')}.png"
