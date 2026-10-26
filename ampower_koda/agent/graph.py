@@ -1125,7 +1125,7 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         return verification.call_method(app_name, method, kwargs, env=_get_bench_env(),
                                         limit=READER_INPUT_CHARS if purpose.strip() else verification.MAX_CALL_OUTPUT)
 
-    def check_page_call(route: str, steps: list[dict] | str = "") -> str:
+    def check_page_call(route: str, steps: list[dict] | str = "", page_path: str = "") -> str:
         # An array, not JSON inside a JSON string: two escaped step lists in one trace broke on quoting.
         # A string still parses for callers that send one.
         parsed = steps if isinstance(steps, list) else []
@@ -1142,7 +1142,8 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
         record_dir = replay.new_recording_dir(app_name, request_name, route)
         try:
             result = render_check.check_page(app_name, route, parsed, env=_get_bench_env(), register=not read_only,
-                                             record_dir=record_dir)
+                                             record_dir=record_dir, user=render_check.browser_check_user(request_name),
+                                             page_path=page_path)
             if replay.has_recording(record_dir):
                 _publish_agent_log(request_name, "check_recording", recording=record_dir.name, route=route)
             elif record_dir:
@@ -1158,8 +1159,9 @@ def _make_tools(app_name: str, read_only: bool = False, *, before=None, file_mov
     # The same schema in every phase; the page's own server calls are what it exercises.
     check_page = StructuredTool.from_function(
         func=check_page_call, name="check_page", description=render_check.RENDER_TOOL_DESCRIPTION,
-        handle_validation_error=lambda exc: "RENDER_FAILED: route must be a string and steps a list of step "
-                                            f"objects ({str(exc).splitlines()[0]}).")
+        handle_validation_error=lambda exc: "RENDER_FAILED: route must be a string, steps a list of step "
+                                            "objects and page_path a string "
+                                            f"({str(exc).splitlines()[0]}).")
 
     def read_only_failure(prefix: str) -> str:
         if session is not None and session.get("plan_sink") is not None:

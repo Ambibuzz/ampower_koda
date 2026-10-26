@@ -2,12 +2,14 @@
 
 The model cannot otherwise see the pages it builds: a client script that never loads, a route that
 is not found, a control whose handler throws, or a whitelisted method that fails only when the page
-calls it. Each check runs in its own process (the worker never imports Playwright), signs in as
-Administrator with a one-time login key, and can drive the page with a short list of steps.
+calls it. Each check runs in its own process (the worker never imports Playwright), signs in (as
+Administrator, or the request's owner) with a session the runner makes on the site, and can drive the page
+with a short list of steps.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -18,11 +20,15 @@ import tempfile
 import time
 from pathlib import Path
 
+import frappe
+
 from ampower_koda.agent import verification
 from ampower_koda.agent.tools import _app_root, command_environment
 
 RENDER_TIMEOUT = 180  # each step waits for its calls and animations to settle
 MAX_STEPS = 20
+# Each check saves a screenshot; older ones are deleted so .koda/render does not grow without end.
+SCREENSHOTS_KEPT = 50
 MAX_SNAPSHOT_CHARS = 6000
 MAX_LAYOUT_LABELS = 60
 # A report stays in the conversation for every later call (AGENT-0038 kept eight of 10-29k characters), so
@@ -40,10 +46,11 @@ LAB_ENV = "KODA_VERIFICATION_LAB"
 RENDER_DIRECTORY = ".koda/render"
 
 RENDER_TOOL_DESCRIPTION = (
-    "Open a Desk page of the live site in a fresh headless browser, signed in as Administrator, run steps "
-    "on it, and report what the user saw. route is the Desk path, e.g. '/desk/warehouse_traceability' (a "
-    "Page's name; '/app/<page-name>' on older sites). steps is a JSON list run in order after the page "
-    "loads: {\"click\": \"<button, link or option name, text or CSS>\"}, {\"fill\": \"<label, placeholder or "
+    "Open a Desk page of the live site in a fresh headless browser, signed in (as Administrator unless the "
+    "report says otherwise), run steps on it, and report what the user saw. route is the Desk path, e.g. "
+    "'/desk/warehouse_traceability' (a Page's name; '/app/<page-name>' on older sites). steps is a JSON list "
+    f"of at most {MAX_STEPS} steps, run in order after the page loads: "
+    "{\"click\": \"<button, link or option name, text or CSS>\"}, {\"fill\": \"<label, placeholder or "
     "CSS>\", \"value\": \"...\"}, {\"select\": \"<drop-down label>\", \"value\": \"<option>\"}, {\"press\": "
     "\"Enter\"}, {\"wait_ms\": 800}, {\"viewport\": [390, 844]}. Each step waits for the server calls it "
     "triggers. Any step may add \"expect\" (one or a list), checked after it: \"<text>\" (visible somewhere), "
@@ -72,6 +79,8 @@ RENDER_TOOL_DESCRIPTION = (
     "registered from its JSON before each check (a live-site change); in planning and review it is not, and "
     "the site shows the Page as last registered. Steps run the page's real server calls on the live site "
     "and are NOT rolled back: do not click actions that create, submit, cancel or delete records."
+    "\npage_path: only when a report asks for it, the app-relative path of the Page JSON this route should "
+    "register, when more than one Page JSON in the app could be that route."
 )
 
 RUNNER = Path(__file__).with_name("render_runner.py")
@@ -176,6 +185,8 @@ def _format(report: dict) -> str:
         problems.append(report["runner_error"])
     lines = [("RENDER_FAILED: " + "; ".join(problems)) if problems else "RENDER_OK",
              f"url: {report.get('url')} (HTTP {report.get('status')})"]
+    if report.get("user") and report["user"] != "Administrator":
+        lines.append(f"signed in as {report['user']} (the request's owner), with that user's roles and permissions")
     if report.get("registered"):
         lines.append("registered the Page from its JSON before loading (as bench migrate would)")
     if report.get("unregistered"):
@@ -207,18 +218,86 @@ def _format(report: dict) -> str:
     return "\n".join(lines)
 
 
+def browser_check_user(request_name: str | None) -> str:
+    """Who check_page signs in as: Administrator, or the request's owner when Agent Settings asks for that."""
+    if not request_name:
+        return "Administrator"
+    # Not get_single_value: it throws for a field the site has not migrated yet.
+    if frappe.get_single("Agent Settings").get("browser_check_user") != "Request owner":
+        return "Administrator"
+    return frappe.db.get_value("Agent Request", request_name, "owner") or "Administrator"
+
+
+def _session_file_name(user: str) -> str:
+    """One saved browser session per user, so checks as different users never reuse each other's sign-in."""
+    if user == "Administrator":
+        return ".session.json"
+    return ".session-" + hashlib.sha256(user.encode("utf-8")).hexdigest()[:12] + ".json"
+
+
+def _prune_screenshots(shots: Path) -> None:
+    """Keep the newest SCREENSHOTS_KEPT screenshots. Runs before a check takes its own, so never deletes that."""
+    screenshots = sorted(shots.glob("*.png"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for old in screenshots[SCREENSHOTS_KEPT:]:
+        old.unlink(missing_ok=True)
+
+
+def _page_name_in(path: Path) -> str:
+    try:
+        return str(json.loads(path.read_text(encoding="utf-8")).get("name") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def _page_json(root: Path, page_name: str, page_path: str) -> tuple[str, str]:
+    """The Page JSON to register for /app/<page_name>, as (path, ""), or ("", why the check cannot start).
+
+    Matched on the Page's name inside the JSON, not on its folder: Frappe turns "-" into "_" for folders, so
+    sales-board and sales_board share one. Two files with the same name are not guessed between: the
+    report lists them and the agent says which one with page_path.
+    """
+    if page_path:
+        candidate = (root / page_path).resolve()
+        inside_app = candidate.is_relative_to(root)
+        shaped = re.fullmatch(r"(?:.*/)?page/([^/]+)/\1\.json", candidate.as_posix())
+        if not (inside_app and shaped and candidate.is_file()):
+            return "", (f"RENDER_FAILED: page_path {page_path} is not a Page JSON in this app "
+                        "(<module>/page/<name>/<name>.json); the browser was not started.")
+        named = _page_name_in(candidate)
+        if named != page_name:
+            return "", (f"RENDER_FAILED: {page_path} is the Page {named or '(unnamed)'}, not {page_name}; "
+                        "the browser was not started.")
+        return str(candidate), ""
+
+    folder = page_name.replace("-", "_")
+    # Frappe keeps every Page at <module>/page/<name>/<name>.json under the app's package folder, so one
+    # fixed-depth glob finds them without walking node_modules, .git or build output.
+    candidates = sorted(root.glob(f"*/page/{folder}/{folder}.json"))
+    found = [path for path in candidates if _page_name_in(path) == page_name]
+    if len(found) > 1:
+        listed = ", ".join(path.relative_to(root).as_posix() for path in found)
+        return "", (f"RENDER_FAILED: {len(found)} Page JSON files in this app are named {page_name} ({listed}). "
+                    "Pass the one this route should register as page_path; if only one should exist, delete "
+                    "the others. The browser was not started.")
+    return (str(found[0]) if found else ""), ""
+
+
 def check_page(app_name: str, route: str, steps: list | None = None, env: dict | None = None, *,
-               register: bool = True, record_dir: Path | None = None) -> str:
+               register: bool = True, record_dir: Path | None = None, user: str = "Administrator",
+               page_path: str = "") -> str:
     """``register=False`` (planning, review) never imports Page JSON into the live site or commits.
 
-    ``record_dir``: save a replayable recording of the check there.
+    ``record_dir``: save a replayable recording of the check there. ``user``: who the browser signs in as.
+    ``page_path``: which Page JSON to register when more than one has the route's name.
     """
     route = "/" + str(route or "").strip().lstrip("/")
     if not re.fullmatch(r"/[A-Za-z0-9_\-./?=&%]*", route) or route.startswith("//"):
         return "RENDER_FAILED: route must be a site path such as /desk/my_page."
-    if steps is not None and not isinstance(steps, list):
-        return "RENDER_FAILED: steps must be a JSON list of step objects."
-    steps = list(steps or [])[:MAX_STEPS]
+    steps = list(steps or [])
+    if len(steps) > MAX_STEPS:
+        # Cutting the list would report a check of fewer steps than the agent believes it ran.
+        return (f"RENDER_FAILED: steps allows at most {MAX_STEPS} steps and got {len(steps)}; "
+                "split this into focused checks. The browser was not started.")
     root = Path(_app_root(app_name)).resolve()
     command_env = verification._runner_environment(root, env)
     if not command_env.get("KODA_SITE"):
@@ -229,17 +308,26 @@ def check_page(app_name: str, route: str, steps: list | None = None, env: dict |
     browsers = _browsers_path()
     if browsers:
         command_env["PLAYWRIGHT_BROWSERS_PATH"] = browsers
+    page_route = re.fullmatch(r"/(?:desk|app)/([A-Za-z0-9_\-]+)/?", route.split("?", 1)[0])
+    page_json = ""
+    if page_route:
+        page_json, refused = _page_json(root, page_route.group(1), page_path)
+        if refused:
+            return refused
+    elif page_path:
+        return ("RENDER_FAILED: page_path applies only to a Page route such as /app/<page-name>; the browser "
+                "was not started.")
     if record_dir:
         command_env["KODA_RECORD_DIR"] = str(record_dir)
+    command_env["KODA_RENDER_USER"] = user
     shots = root / RENDER_DIRECTORY
     shots.mkdir(parents=True, exist_ok=True)
+    try:
+        _prune_screenshots(shots)
+    except OSError:
+        # A screenshot in use or a permission problem: the next check tries again.
+        pass
     shot = shots / f"{re.sub(r'[^A-Za-z0-9_-]+', '_', route).strip('_') or 'page'}-{time.strftime('%H%M%S')}.png"
-    name = re.fullmatch(r"/(?:desk|app)/([A-Za-z0-9_\-]+)/?", route.split("?", 1)[0])
-    page_json = ""
-    if name:
-        slug = name.group(1).replace("-", "_")
-        found = sorted(root.glob(f"**/page/{slug}/{slug}.json"))
-        page_json = str(found[0]) if found else ""
     unregistered = ""
     if page_json and not register:
         unregistered, page_json = Path(page_json).relative_to(root).as_posix(), ""
@@ -249,7 +337,7 @@ def check_page(app_name: str, route: str, steps: list | None = None, env: dict |
             # The report goes through a file: _execute keeps only a bounded head and tail of stdout.
             report_file = Path(scratch) / "report.json"
             argv = [sys.executable, str(RUNNER), route, json.dumps(steps, default=str), str(shot), page_json,
-                    str(shots / ".session.json"), str(report_file)]
+                    str(shots / _session_file_name(user)), str(report_file)]
             code, output, timed_out = verification._execute(
                 argv, Path(command_env["KODA_SITES_PATH"]),
                 {**command_env, "TMPDIR": scratch, "TEMP": scratch, "TMP": scratch}, RENDER_TIMEOUT)
