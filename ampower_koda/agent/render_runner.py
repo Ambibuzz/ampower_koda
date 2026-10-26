@@ -1,7 +1,7 @@
 """The browser side of check_page, run as its own process (the worker never imports Playwright).
 
-argv: route, steps (JSON), screenshot path, Page JSON path ("" for none), session file, report file.
-KODA_RECORD_DIR: where to save a replayable recording of the check.
+argv: route, steps (a JSON list), screenshot path, Page JSON path ("" for none), session file, report file.
+KODA_RENDER_USER: who to sign in as. KODA_RECORD_DIR: where to save a replayable recording.
 Writes the report as JSON to the report file (the caller keeps only a bounded tail of stdout) and prints
 ``KODA_RENDER_REPORT_FILE``; without a report file it prints one ``KODA_RENDER_REPORT {json}`` line. Each step is reported by what it did while the page
 settled, not only by the end state: the server calls it made, what changed on the page and in dialogs,
@@ -623,29 +623,59 @@ def body_summary(body, status):
     return json.dumps(data.get("message"), default=str, separators=(",", ":"))[:RESPONSE_CHARS]
 
 
-def sign_in(context, page, base, login, session_file):
-    """Reuse the last check's session: Frappe rate-limits one-time login keys per address."""
-    sid = None
+def site_session(user, session_file):
+    """A session id signed in as `user`: the last check's while the site still has it, otherwise a new one.
+
+    The new one is made here with the calls Frappe's own API tests use, not through a one-time login link:
+    login_via_key allows five sign-ins an hour per address, and every check on the bench signs in from one.
+    """
+    import frappe
+    from frappe.auth import CookieManager, LoginManager
+    from frappe.sessions import get_expired_threshold
+    from frappe.utils import set_request
+
+    saved = None
     try:
-        sid = json.load(open(session_file)).get("sid")
+        with open(session_file) as handle:
+            saved = json.load(handle).get("sid")
     except (OSError, ValueError):
         pass
-    if sid:
-        context.add_cookies([{"name": "sid", "value": sid, "url": base}])
-        probe = context.request.get(base + "/api/method/frappe.auth.get_logged_user")
-        if not (probe.ok and probe.json().get("message") == "Administrator"):
-            sid = None
-            context.clear_cookies()
-    if not sid:
-        signed = page.goto(login, wait_until="domcontentloaded")
-        if signed is not None and signed.status == 429:
-            print("KODA_RENDER_UNAVAILABLE the site rate-limited the sign-in; check again in a minute.", flush=True)
-            sys.exit(4)
-        sid = next((c["value"] for c in context.cookies() if c["name"] == "sid"), None)
-        if sid and sid != "Guest":
-            with open(session_file, "w") as handle:
-                json.dump({"sid": sid}, handle)
-            os.chmod(session_file, 0o600)
+    if saved:
+        # The same test Frappe applies when it resumes a session from the database.
+        sessions = frappe.qb.DocType("Sessions")
+        still_signed_in = (
+            frappe.qb.from_(sessions)
+            .select(sessions.sid)
+            .where(sessions.sid == saved)
+            .where(sessions.user == user)
+            .where(sessions.lastupdate > get_expired_threshold())
+        ).run()
+        if still_signed_in:
+            return saved
+
+    set_request(path="/")
+    frappe.local.cookie_manager = CookieManager()
+    frappe.local.login_manager = LoginManager()
+    # Frappe saves and commits the new session itself (Session.start).
+    frappe.local.login_manager.login_as(user)
+    sid = frappe.session.sid
+    # Created readable by the bench user only: the file signs anyone who has it in as `user`.
+    descriptor = os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump({"sid": sid}, handle)
+    return sid
+
+
+def sign_in(context, base, sid, user, session_file):
+    """Give the browser the session from site_session, and confirm the site takes it as `user`."""
+    context.add_cookies([{"name": "sid", "value": sid, "url": base}])
+    probe = context.request.get(base + "/api/method/frappe.auth.get_logged_user")
+    if not (probe.ok and probe.json().get("message") == user):
+        # Not reused next time: the next check makes a new session.
+        Path(session_file).unlink(missing_ok=True)
+        print(f"KODA_RENDER_UNAVAILABLE the site did not accept the browser's session as {user} "
+              f"(HTTP {probe.status}); check again.", flush=True)
+        sys.exit(4)
 
 
 class Page:
@@ -937,8 +967,9 @@ def main():
                 report["registered"] = page_json
             except Exception as exc:
                 report["registration_error"] = " ".join(str(exc).split())[:300]
-        from frappe.www.login import _generate_temporary_login_link
-        login = _generate_temporary_login_link("Administrator", 2)
+        user = os.environ.get("KODA_RENDER_USER") or "Administrator"
+        report["user"] = user
+        sid = site_session(user, session_file)
         base = (os.environ.get("KODA_RENDER_BASE_URL") or frappe.utils.get_url()).rstrip("/")
         frappe.destroy()
     except Exception:
@@ -961,7 +992,7 @@ def main():
             context.add_init_script(SMOOTH_JS)
             tab = Page(context, context.new_page())
             try:
-                sign_in(context, tab.page, base, login, session_file)
+                sign_in(context, base, sid, user, session_file)
             except SystemExit:
                 raise
             except Exception as exc:
