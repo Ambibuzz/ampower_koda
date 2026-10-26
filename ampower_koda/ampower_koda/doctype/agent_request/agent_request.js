@@ -661,6 +661,13 @@ function setup_action_buttons(frm) {
             frappe.set_route('koda-ide', frm.doc.name);
         }, __('Actions'));
     }
+
+    // Lists this request's recorded browser checks; the page itself says when there are none yet.
+    if (frm.doc.target_app_name && !frm.is_new()) {
+        frm.add_custom_button(__('Browser Check Replays'), function () {
+            frappe.set_route('koda-replay', frm.doc.name);
+        }, __('Actions'));
+    }
 }
 
 function open_follow_up_dialog(frm) {
@@ -1435,6 +1442,9 @@ function setup_live_log_panel(frm) {
         frm._log_panel = $panel;
         frm._log_container = $panel.find('.agent-log-container');
         frm._log_status = $panel.find('.agent-log-status');
+        frm._log_container.on('click', '.koda-replay-link', function () {
+            frappe.set_route('koda-replay', frm.doc.name, $(this).attr('data-recording'));
+        });
 
         frappe.realtime.on('agent_log', function (data) {
             if (!data || data.request_name !== frm.doc.name) return;
@@ -1560,8 +1570,10 @@ function append_log_entry(frm, data) {
                 [frappe.utils.escape_html(data.route || ''), frappe.utils.escape_html(data.error)])
             + '</div>';
     } else if (data.type === 'check_recording') {
-        html = '<div style="color:var(--text-muted);margin-bottom:3px;padding-left:14px;">'
-            + ts + __('Browser check of {0} recorded', [frappe.utils.escape_html(data.route || '')])
+        html = '<div style="color:var(--blue-500);margin-bottom:3px;padding-left:14px;">'
+            + ts + '\u25B6 ' + __('Browser check of {0} recorded', [frappe.utils.escape_html(data.route || '')]) + ' '
+            + '<button class="btn btn-xs btn-default koda-replay-link" data-recording="'
+            + frappe.utils.escape_html(data.recording || '') + '">' + __('Replay') + '</button>'
             + '</div>';
     } else {
         html = '<div style="margin-bottom:3px;">'
