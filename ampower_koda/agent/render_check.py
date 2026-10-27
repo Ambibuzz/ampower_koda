@@ -47,7 +47,9 @@ RENDER_DIRECTORY = ".koda/render"
 
 RENDER_TOOL_DESCRIPTION = (
     "Open a Desk page of the live site in a fresh headless browser, signed in as the request's owner, run "
-    "steps on it, and report what the user saw. route is the Desk path, e.g. "
+    "steps on it, and report what the user saw. Not permitted there means the owner lacks a role for that "
+    "page or data: tell the user which role is missing; do not change code, roles or permissions to get "
+    "around it. route is the Desk path, e.g. "
     "'/desk/warehouse_traceability' (a Page's name; '/app/<page-name>' on older sites). steps is a JSON list "
     f"of at most {MAX_STEPS} steps, run in order after the page loads: "
     "{\"click\": \"<button, link or option name, text or CSS>\"}, {\"fill\": \"<label, placeholder or "
