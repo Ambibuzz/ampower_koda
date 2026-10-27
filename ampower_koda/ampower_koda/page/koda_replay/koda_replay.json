@@ -12,7 +12,7 @@
     "page_name": "koda-replay",
     "roles": [
         {
-            "role": "All"
+            "role": "System Manager"
         }
     ],
     "standard": "Yes",

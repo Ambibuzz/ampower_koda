@@ -17,10 +17,8 @@ from ampower_koda.agent.tools import _app_root
 
 DOCTYPE_NAME = "Agent Request"
 RECORDINGS_DIRECTORY = Path(".koda", "render", "recordings")
-# <time>-<random part>-<route>, as new_recording_dir names the folder.
 RECORDING_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}-[A-Za-z0-9_-]{1,60}$")
 REQUEST_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
-# Served at run time rather than bundled, so `bench build` works on a bench where node_modules is not installed.
 REPLAYER_FILE = Path("node_modules", "@rrweb", "replay", "dist", "replay.umd.min.cjs")
 
 
@@ -62,8 +60,8 @@ def recording_error(folder):
 def _request(request_name):
     if not request_name or not REQUEST_NAME.match(request_name):
         frappe.throw(_("Invalid request name."))
-    # No permission check: anyone signed in with the link can watch a replay.
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
+    doc.check_permission("read")
     if not doc.target_app_name:
         frappe.throw(_("This request has no target app, so it has no recordings."))
     return doc
@@ -121,7 +119,6 @@ def replayer_script():
                      frappe.DoesNotExistError)
     frappe.local.response.filename = "rrweb-replay.js"
     frappe.local.response.filecontent = path.read_bytes()
-    # "download" sends content_type as is; "binary" would send octet-stream, which a <script> tag refuses.
     frappe.local.response.type = "download"
     frappe.local.response.content_type = "text/javascript"
     frappe.local.response.display_content_as = "inline"
