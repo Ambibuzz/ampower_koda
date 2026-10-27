@@ -2,9 +2,9 @@
 
 The model cannot otherwise see the pages it builds: a client script that never loads, a route that
 is not found, a control whose handler throws, or a whitelisted method that fails only when the page
-calls it. Each check runs in its own process (the worker never imports Playwright), signs in (as
-Administrator, or the request's owner) with a session the runner makes on the site, and can drive the page
-with a short list of steps.
+calls it. Each check runs in its own process (the worker never imports Playwright), signs in as the
+request's owner with a session the runner makes on the site, and can drive the page with a short list
+of steps.
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ LAB_ENV = "KODA_VERIFICATION_LAB"
 RENDER_DIRECTORY = ".koda/render"
 
 RENDER_TOOL_DESCRIPTION = (
-    "Open a Desk page of the live site in a fresh headless browser, signed in (as Administrator unless the "
-    "report says otherwise), run steps on it, and report what the user saw. route is the Desk path, e.g. "
+    "Open a Desk page of the live site in a fresh headless browser, signed in as the request's owner, run "
+    "steps on it, and report what the user saw. route is the Desk path, e.g. "
     "'/desk/warehouse_traceability' (a Page's name; '/app/<page-name>' on older sites). steps is a JSON list "
     f"of at most {MAX_STEPS} steps, run in order after the page loads: "
     "{\"click\": \"<button, link or option name, text or CSS>\"}, {\"fill\": \"<label, placeholder or "
@@ -219,11 +219,8 @@ def _format(report: dict) -> str:
 
 
 def browser_check_user(request_name: str | None) -> str:
-    """Who check_page signs in as: Administrator, or the request's owner when Agent Settings asks for that."""
+    """Who check_page signs in as: the request's owner, so pages show with that user's roles and permissions."""
     if not request_name:
-        return "Administrator"
-    # Not get_single_value: it throws for a field the site has not migrated yet.
-    if frappe.get_single("Agent Settings").get("browser_check_user") != "Request owner":
         return "Administrator"
     return frappe.db.get_value("Agent Request", request_name, "owner") or "Administrator"
 

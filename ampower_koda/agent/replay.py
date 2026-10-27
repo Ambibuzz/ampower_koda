@@ -62,8 +62,8 @@ def recording_error(folder):
 def _request(request_name):
     if not request_name or not REQUEST_NAME.match(request_name):
         frappe.throw(_("Invalid request name."))
+    # No permission check: anyone signed in with the link can watch a replay.
     doc = frappe.get_doc(DOCTYPE_NAME, request_name)
-    doc.check_permission("read")
     if not doc.target_app_name:
         frappe.throw(_("This request has no target app, so it has no recordings."))
     return doc

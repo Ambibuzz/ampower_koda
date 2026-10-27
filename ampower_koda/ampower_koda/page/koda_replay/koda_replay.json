@@ -4,7 +4,7 @@
     "docstatus": 0,
     "doctype": "Page",
     "idx": 0,
-    "modified": "2026-10-14 10:00:00.000000",
+    "modified": "2026-10-27 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "Ampower Koda",
     "name": "koda-replay",
@@ -12,7 +12,7 @@
     "page_name": "koda-replay",
     "roles": [
         {
-            "role": "System Manager"
+            "role": "All"
         }
     ],
     "standard": "Yes",

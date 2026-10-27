@@ -21,8 +21,6 @@
         "anthropic_api_key",
         "openrouter_section",
         "openrouter_api_key",
-        "browser_checks_section",
-        "browser_check_user",
         "tracing_tab",
         "langsmith_section",
         "enable_langsmith",
@@ -150,20 +148,6 @@
             "mandatory_depends_on": "eval:doc.default_ai_provider === 'OpenRouter'"
         },
         {
-            "fieldname": "browser_checks_section",
-            "fieldtype": "Section Break",
-            "label": "Browser Checks",
-            "depends_on": "enable_ai_agent"
-        },
-        {
-            "fieldname": "browser_check_user",
-            "fieldtype": "Select",
-            "label": "Sign In As",
-            "options": "Administrator\nRequest owner",
-            "default": "Administrator",
-            "description": "Who the agent's browser checks sign in as. Request owner shows pages with that user's roles and permissions, so permission and filtering problems show up; pages the owner cannot open report Not permitted."
-        },
-        {
             "fieldname": "tracing_tab",
             "fieldtype": "Tab Break",
             "label": "Tracing"
@@ -211,7 +195,7 @@
     ],
     "issingle": 1,
     "links": [],
-    "modified": "2026-10-23 12:00:00.000000",
+    "modified": "2026-10-27 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "Ampower Koda",
     "name": "Agent Settings",
