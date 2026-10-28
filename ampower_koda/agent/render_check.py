@@ -47,9 +47,7 @@ RENDER_DIRECTORY = ".koda/render"
 
 RENDER_TOOL_DESCRIPTION = (
     "Open a Desk page of the live site in a fresh headless browser, signed in as the request's owner, run "
-    "steps on it, and report what the user saw. Not permitted there means the owner lacks a role for that "
-    "page or data: tell the user which role is missing; do not change code, roles or permissions to get "
-    "around it. route is the Desk path, e.g. "
+    "steps on it, and report what the user saw. route is the Desk path, e.g. "
     "'/desk/warehouse_traceability' (a Page's name; '/app/<page-name>' on older sites). steps is a JSON list "
     f"of at most {MAX_STEPS} steps, run in order after the page loads: "
     "{\"click\": \"<button, link or option name, text or CSS>\"}, {\"fill\": \"<label, placeholder or "
@@ -162,6 +160,20 @@ def _layout(items: list, viewport: dict, limit: int = MAX_LAYOUT_LABELS) -> str:
             + "\n".join(rows) + ("\n" + " ".join(notes) if notes else ""))
 
 
+def _context_lines(report: dict) -> list[str]:
+    """Who the check signed in as and what it registered, which explain a failure as much as a pass."""
+    lines = []
+    if report.get("user") and report["user"] != "Administrator":
+        lines.append(f"signed in as {report['user']} (the request's owner), with that user's roles and permissions")
+    if report.get("registered"):
+        lines.append("registered the Page from its JSON before loading (as bench migrate would)")
+    if report.get("unregistered"):
+        lines.append(f"not registered: {report['unregistered']} was not imported, since this phase is read-only; "
+                     "the site shows the Page as last registered (or not found if it never was). "
+                     "Implementation registers it before its checks.")
+    return lines
+
+
 def _format(report: dict) -> str:
     problems = []
     if report.get("login_page"):
@@ -183,18 +195,24 @@ def _format(report: dict) -> str:
         problems.append(f"{failed_expects} expect(s) failed")
     if report.get("registration_error"):
         problems.insert(0, "the Page JSON could not be registered: " + report["registration_error"])
+    if report.get("preflight"):
+        problems.append(report["preflight"])
+        # Nothing was loaded, so there is no url, snapshot or step to show; who checked and what was registered still apply.
+        lines = ["RENDER_FAILED: " + "; ".join(problems) + ". The browser was not started."]
+        lines += _context_lines(report)
+        return "\n".join(lines)
     if report.get("runner_error"):
         problems.append(report["runner_error"])
     lines = [("RENDER_FAILED: " + "; ".join(problems)) if problems else "RENDER_OK",
              f"url: {report.get('url')} (HTTP {report.get('status')})"]
-    if report.get("user") and report["user"] != "Administrator":
-        lines.append(f"signed in as {report['user']} (the request's owner), with that user's roles and permissions")
-    if report.get("registered"):
-        lines.append("registered the Page from its JSON before loading (as bench migrate would)")
-    if report.get("unregistered"):
-        lines.append(f"not registered: {report['unregistered']} was not imported, since this phase is read-only; "
-                     "the site shows the Page as last registered (or not found if it never was). "
-                     "Implementation registers it before its checks.")
+    lines += _context_lines(report)
+    if report.get("preflight_skipped"):
+        lines.append(f"the route check before the browser did not run ({report['preflight_skipped']}); "
+                     "this result is from the browser alone")
+    if report.get("preflight_calls"):
+        # Found by scanning the script for method names, which can misread it, so they do not decide the result.
+        lines.append("warning: its script names server methods that would fail when called: "
+                     + "; ".join(report["preflight_calls"]))
     if report.get("load"):
         lines += ["first two seconds after load:", *report["load"]]
     steps = report.get("steps", [])
