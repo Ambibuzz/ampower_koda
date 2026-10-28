@@ -13,6 +13,7 @@
         "default_ai_model",
         "reasoning_effort",
         "review_reasoning_effort",
+        "plan_check_reasoning_effort",
         "openai_section",
         "openai_api_key",
         "gemini_section",
@@ -76,9 +77,9 @@
             "fieldname": "reasoning_effort",
             "fieldtype": "Select",
             "label": "Reasoning Effort",
-            "options": "Provider default\nlow\nmedium\nhigh",
+            "options": "low\nmedium\nhigh\nxhigh\nmax",
             "default": "high",
-            "description": "Effort for OpenAI reasoning models, directly or through OpenRouter. Higher effort favors planning and repair quality over speed. Other models keep their provider defaults."
+            "description": "Reasoning effort for the agent's main work: planning, coding and repair. Applies to reasoning models on OpenAI and OpenRouter; if a model does not support the chosen level, its nearest supported level is used. Gemini and Claude use their provider defaults."
         },
         {
             "fieldname": "review_reasoning_effort",
@@ -86,7 +87,15 @@
             "label": "Review Reasoning Effort",
             "options": "Same as Reasoning Effort\nlow\nmedium\nhigh",
             "default": "medium",
-            "description": "Effort for the independent review's turns. It only lowers Reasoning Effort, never raises it. Medium found the same defects as high in replays, with about 35-40% less output."
+            "description": "Reasoning effort for the review that checks the finished work. Never higher than Reasoning Effort."
+        },
+        {
+            "fieldname": "plan_check_reasoning_effort",
+            "fieldtype": "Select",
+            "label": "Plan Check Reasoning Effort",
+            "options": "low\nmedium\nhigh",
+            "default": "medium",
+            "description": "Reasoning effort for the check that the plan covers every part of the request. Never higher than Reasoning Effort."
         },
         {
             "fieldname": "openai_section",
@@ -195,7 +204,7 @@
     ],
     "issingle": 1,
     "links": [],
-    "modified": "2026-10-27 12:00:00.000000",
+    "modified": "2026-10-28 12:00:00.000000",
     "modified_by": "Administrator",
     "module": "Ampower Koda",
     "name": "Agent Settings",
