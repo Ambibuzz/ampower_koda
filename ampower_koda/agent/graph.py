@@ -28,6 +28,7 @@ from ampower_koda.agent import verification
 from ampower_koda.agent import render_check
 from ampower_koda.agent import replay
 from ampower_koda.agent import python_diagnostics
+from ampower_koda.agent import reasoning_catalog
 from ampower_koda.agent.advisor import Advisor, directive as advisor_directive
 from ampower_koda.agent import repair_budget
 from ampower_koda.agent.run_control import (
@@ -445,20 +446,31 @@ def _tag_llm_run(run_manager, provider_name) -> None:
         pass
 
 
-def _configured_reasoning_effort(provider: str, model: str) -> str | None:
-    # These OpenAI reasoning families support high effort through either route.
-    # Other models retain their provider defaults; do not send unsupported fields.
-    family = model.rsplit('/', 1)[-1].lower()
-    if provider not in {'OpenAI', 'OpenRouter'} or not _re.match(r'^(gpt-[56](?:[.\-]|$)|o[134](?:[\-]|$))', family):
-        return None
+# Every effort Agent Settings offers, cheapest first.
+EFFORT_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
+# The highest effort sent to a model whose catalog entry names no levels: every model that maps
+# effort to a thinking budget takes low to high, xhigh and max only where listed.
+UNLISTED_EFFORT_CEILING = 'high'
+
+
+def _configured_reasoning_effort() -> str:
     try:
         setting = frappe.db.get_single_value('Agent Settings', 'reasoning_effort')
     except Exception:
         setting = None  # installations not yet migrated still use the default
-    setting = str(setting or '')
-    if setting.lower() == 'provider default':
-        return None
-    return str(setting) if setting in {'low', 'medium', 'high'} else 'high'
+    # A site still saved on the removed "Provider default" option runs at the default.
+    return setting if setting in EFFORT_LEVELS else 'high'
+
+
+def _model_effort(effort: str, entry: dict) -> str:
+    """``effort``, or the nearest level the model lists, the cheaper on a tie."""
+    supported = [level for level in (entry.get('supported_efforts') or []) if level in EFFORT_LEVELS]
+    if not supported:
+        supported = EFFORT_LEVELS[:EFFORT_LEVELS.index(UNLISTED_EFFORT_CEILING) + 1]
+    if effort in supported:
+        return effort
+    wanted = EFFORT_LEVELS.index(effort)
+    return min(supported, key=lambda level: (abs(EFFORT_LEVELS.index(level) - wanted), EFFORT_LEVELS.index(level)))
 
 
 # Review turns (first pass, recovery pass, forced verdict, every recheck) run at this effort.
@@ -466,17 +478,16 @@ def _configured_reasoning_effort(provider: str, model: str) -> str | None:
 # format low often claimed its tools were unavailable (AGENT-0034), medium did not.
 # Agent Settings "Review Reasoning Effort" overrides it; it only ever lowers the configured effort.
 REVIEW_REASONING_EFFORT = 'medium'
-_EFFORT_ORDER = ('low', 'medium', 'high')
 
 
 def _lower_effort(configured: str | None, wanted: str | None) -> str | None:
     """``wanted`` when it is a known effort below ``configured``; None keeps the configured one."""
-    if configured not in _EFFORT_ORDER or wanted not in _EFFORT_ORDER:
+    if configured not in EFFORT_LEVELS or wanted not in EFFORT_LEVELS:
         return None
-    return wanted if _EFFORT_ORDER.index(wanted) < _EFFORT_ORDER.index(configured) else None
+    return wanted if EFFORT_LEVELS.index(wanted) < EFFORT_LEVELS.index(configured) else None
 
 
-def _phase_reasoning_effort(phase: str, provider: str, model: str) -> str | None:
+def _phase_reasoning_effort(phase: str) -> str | None:
     """The effort override for one phase's turn, or None for the configured effort.
 
     Effort is part of the provider's prompt-cache key: in the replays, each change of effort on
@@ -492,7 +503,20 @@ def _phase_reasoning_effort(phase: str, provider: str, model: str) -> str | None
     setting = str(setting or REVIEW_REASONING_EFFORT)
     if setting.lower().startswith('same'):
         return None
-    return _lower_effort(_configured_reasoning_effort(provider, model), setting)
+    return _lower_effort(_configured_reasoning_effort(), setting)
+
+
+def _side_agent_reasoning_effort(fieldname: str, default: str) -> str:
+    """The effort Agent Settings gives one side agent (the plan check).
+
+    _get_llm only lets it lower the configured Reasoning Effort, never raise it.
+    """
+    try:
+        setting = frappe.db.get_single_value('Agent Settings', fieldname)
+    except Exception:  # noqa: BLE001 - an unmigrated site has no such column
+        setting = None
+    setting = str(setting or default)
+    return setting if setting in EFFORT_LEVELS else default
 
 
 def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: str = "",
@@ -505,9 +529,6 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
     """
     provider = (provider or "OpenAI").strip()
     model = (model or "gpt-4o-mini").strip()
-    effort = _configured_reasoning_effort(provider, model)
-    if effort and reasoning_effort:
-        effort = reasoning_effort  # only where the model takes an effort at all
     if provider == "Gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
         # Google's retry setting counts attempts, including the initial call.
@@ -516,6 +537,15 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
     if provider == "Claude":
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES)
+    catalog_entry = reasoning_catalog.model_reasoning(provider, model)
+    # A model no source lists gets no reasoning field: under require_parameters a model no
+    # endpoint can reason with fails the call instead of ignoring the field.
+    effort = None
+    if catalog_entry is not None and catalog_entry["reasons"]:
+        effort = _configured_reasoning_effort()
+        # A caller's effort only lowers the configured one.
+        effort = _lower_effort(effort, reasoning_effort) or effort
+        effort = _model_effort(effort, catalog_entry)
     if provider == "OpenRouter":
         # OpenRouter speaks the OpenAI wire format, so ChatOpenAI drives it — only
         # the base URL and key differ. `usage.include` asks OpenRouter to return the
@@ -531,11 +561,10 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
             extra_body['reasoning'] = {'effort': effort}
             if openai_breakpoints(provider, model):
                 extra_body['reasoning']['context'] = 'all_turns'
-        elif ALWAYS_REASONING.search(model):
-            # Always-reasoning models need a limit or can spend the whole cap thinking.
-            # Others get no reasoning field: it would switch a hybrid model's thinking on.
-            extra_body['reasoning'] = ({'effort': reasoning_effort} if reasoning_effort
-                                       else {'max_tokens': MODEL_REASONING_BUDGET_TOKENS})
+        elif catalog_entry is None and ALWAYS_REASONING.search(model):
+            # The catalog lacks it (no list read yet, or released since), but it reasons on every
+            # call: without a limit it can spend the whole cap thinking.
+            extra_body['reasoning'] = {'max_tokens': MODEL_REASONING_BUDGET_TOKENS}
         if session_id:
             extra_body["session_id"] = str(session_id)[:256]
         # Namespaced IDs bypass ChatOpenAI's temperature guard. Let the routed
@@ -572,7 +601,11 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
         # Keep the rolling message-end boundary alongside our explicit stable
         # system/shared-context boundaries, with the documented minimum TTL.
         direct_options["prompt_cache_options"] = {"mode": "implicit", "ttl": "30m"}
-    return ChatOpenAI(model=model, temperature=None if effort else 0, use_responses_api=True,
+    # Reasoning models reject temperature=0; a model no source lists keeps its default.
+    temperature = None
+    if catalog_entry is not None and not catalog_entry["reasons"]:
+        temperature = 0
+    return ChatOpenAI(model=model, temperature=temperature, use_responses_api=True,
                       timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES,
                       **direct_options)
 
@@ -2202,7 +2235,7 @@ def _run_agent_turn(state: dict, phase: str, prompt: str, read_only_tools: bool,
             request_name=request_name,
         )
         llm = _get_llm(provider=provider, model=model, session_id=request_name,
-                       reasoning_effort=_phase_reasoning_effort(phase, provider, model))
+                       reasoning_effort=_phase_reasoning_effort(phase))
         system_prompt = get_system_prompt(app_name or "target_app", request_name=request_name)
         shared_context = (_shared_request_context(state)
                           if state.get("execution_tasks") and (session is None or session.get("shared_context"))
