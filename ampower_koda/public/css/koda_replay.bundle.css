@@ -1,0 +1,135 @@
+/* Koda Replay player. Colors come from Desk's theme variables, so light and dark mode follow the user's theme. */
+.kp {
+    --kp-accent: var(--primary, #2490ef);
+    --kp-bad: var(--red-500, #e24c4c);
+    --kp-highlight: rgba(36, 144, 239, 0.18);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 12px;
+    position: relative;
+    color: var(--text-color);
+}
+.kp * {
+    box-sizing: border-box;
+}
+.kp-main {
+    min-width: 0;
+}
+.kp-stage-wrap {
+    position: relative;
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius-md, 8px);
+    overflow: hidden;
+}
+.kp-stage {
+    position: relative;
+    overflow: hidden;
+}
+.kp-stage .replayer-wrapper {
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+.kp-stage iframe {
+    border: 0;
+    background: #fff;
+}
+/* The recording has no pointer movement, so rrweb's cursor would only sit in a corner. */
+.kp-stage .replayer-mouse,
+.kp-stage .replayer-mouse-tail {
+    display: none;
+}
+.kp-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+}
+.kp-track {
+    position: relative;
+    flex: 1;
+    padding-top: 12px;
+}
+.kp-scrub {
+    width: 100%;
+    accent-color: var(--kp-accent);
+}
+.kp-ticks {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 12px;
+}
+.kp-tick {
+    position: absolute;
+    width: 3px;
+    height: 10px;
+    padding: 0;
+    border: 0;
+    background: var(--text-muted);
+    border-radius: 1px;
+    cursor: pointer;
+    transform: translateX(-1px);
+}
+.kp-clock {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    min-width: 48px;
+    text-align: right;
+}
+.kp-btn {
+    font: inherit;
+    padding: 4px 12px;
+    border-radius: var(--border-radius, 6px);
+    border: 1px solid var(--border-color);
+    background: var(--control-bg);
+    color: var(--text-color);
+    cursor: pointer;
+}
+.kp-btn:hover {
+    border-color: var(--kp-accent);
+}
+.kp-side {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius-md, 8px);
+    padding: 10px 12px;
+    overflow: auto;
+    max-height: 80vh;
+}
+.kp-side h3 {
+    font-size: var(--text-xs, 11px);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin: 6px 0;
+}
+.kp-steps {
+    margin: 0 0 12px;
+    padding-left: 22px;
+}
+.kp-step {
+    padding: 3px 4px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.kp-step:hover,
+.kp-current {
+    background: var(--kp-highlight);
+}
+.kp-current {
+    font-weight: 600;
+}
+.kp-failed .kp-step-label {
+    color: var(--kp-bad);
+}
+@media (max-width: 760px) {
+    .kp {
+        grid-template-columns: 1fr;
+    }
+    .kp-side {
+        max-height: none;
+    }
+}
