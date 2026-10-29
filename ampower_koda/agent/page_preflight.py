@@ -2,11 +2,14 @@
 
 Desk resolves /desk/<first>/... in the browser (router.js convert_to_standard_route): a workspace the user
 sees, then /private/<workspace>, then a DocType the user can read or a DocType Layout, then a Page named
-<first>. This module asks the site the same questions, as the same user, so a route that would show
-"Page not found" or "No permission" is caught before Chromium starts. Needs a connected site
-(frappe.init and frappe.connect). It writes nothing, but like Desk it imports the Python modules the route
-reaches: a Page's get_context (for a jinja template) and the server methods its script names, so their
-module-level code runs.
+<first>. v16.50 first takes a leading sidebar off the route (/desk/stock/item). This module asks the site the
+same questions, as the same user, so a route that would show "Page not found" or "No permission" is caught
+before Chromium starts. Needs a connected site (frappe.init and frappe.connect). It writes nothing, but
+like Desk it imports the Python modules the route reaches: a Page's get_context (for a jinja template) and
+the server methods its script names, so their module-level code runs.
+
+Where router.js changed between releases (private workspace URLs, sidebars in routes), the installed
+release decides. A development build could carry any of them, so there a route any of them opens passes.
 
 Only verdicts the site answers for certain stop the browser. Server methods found by scanning the script
 are reported as call_problems, and the browser still runs.
@@ -19,6 +22,7 @@ From a console:
 from __future__ import annotations
 
 import re
+from functools import cached_property
 from urllib.parse import unquote
 
 import frappe
@@ -27,6 +31,8 @@ from frappe.utils.user import UserPermissions
 DESK_PREFIXES = ("desk", "app")
 # router.js render_page: /desk/<view>/<more> with a frappe.views.<View>Factory opens that view, not a Page.
 VIEW_FACTORY_ROUTES = ("List", "Form", "Tree", "Report")
+# Pages Desk registers in its own JavaScript (frappe.standard_pages), which have no Page document.
+STANDARD_PAGES = ("query-report", "Workspaces")
 # Server methods named literally in a Page's script: frappe.call({method: "a.b.c"}), frappe.call("a.b.c"),
 # frappe.xcall("a.b.c"). A path built at runtime is not seen. A method key without a dot is a document
 # method (frm.call), which this does not check; a positional name without a dot is a Server Script API.
@@ -63,24 +69,153 @@ def _route_parts(route: str) -> list[str] | None:
     return parts[1:]
 
 
-def _visible_workspaces() -> dict[str, str]:
+def _shell_slug(name: str) -> str:
+    """The URL segment v16 Desk makes from a sidebar or module name (router.js shell_slug)."""
+    return "-".join(name.lower().replace("&", " and ").split())
+
+
+def _visible_workspaces() -> dict[str, dict]:
     """The workspaces Desk lists for the session user, by URL segment (desk.js setup_workspaces).
 
-    The sidebar call applies the workspace roles, blocked modules and domains, and includes the user's
-    private workspaces.
+    The call applies the workspace roles and domains, and includes the user's private workspaces. It is
+    get_workspace_sidebar_items on v15 and get_workspaces on v16.
     """
-    from frappe.desk.desktop import get_workspace_sidebar_items
-    pages = get_workspace_sidebar_items()["pages"]
-    return {_slug(page["name"]): page["name"] for page in pages if page}
+    from frappe.desk import desktop
+    list_workspaces = getattr(desktop, "get_workspaces", None) or desktop.get_workspace_sidebar_items
+    pages = list_workspaces()["pages"]
+    return {_slug(page["name"]): page for page in pages if page}
 
 
-def _check_private_workspace(rest: list[str], user: str, workspaces: dict[str, str]) -> dict:
-    segment = rest[0] if rest else ""
-    # router.js looks private workspaces up as "<segment>-<user>", without slugging the user.
-    key = f"{segment}-{user.lower()}"
-    if segment and key in workspaces:
-        return _result("workspace", workspaces[key])
-    return _result("workspace", segment, f"{user} has no private workspace {segment!r}; Desk would say "
+def _frappe_release() -> tuple[int, int] | None:
+    """The installed Frappe as (major, minor), or None for a development build, whose router could be any."""
+    match = re.match(r"(\d+)\.(\d+)", frappe.__version__)
+    if not match or "dev" in frappe.__version__:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _desk_has_shells() -> bool:
+    """Whether router.js takes sidebars off routes and has the Private sidebar, which v16.50 added together."""
+    release = _frappe_release()
+    if release is None:
+        import frappe.boot
+        return hasattr(frappe.boot, "get_module_sidebars")
+    return release >= (16, 50)
+
+
+def _shell_slugs() -> set[str]:
+    """The segments v16 Desk takes off the front of a route as a sidebar: /desk/stock/item is the Item list.
+
+    router.js setup_shell_routes reads them from boot.module_sidebars, the session user's sidebars, and
+    every installed module whether or not the user sees it. private is left out, as router.js does: it
+    reads that one itself.
+    """
+    if not _desk_has_shells():
+        return set()
+    import frappe.boot
+    names = list(frappe.boot.get_module_sidebars()) + frappe.get_all("Module Def", pluck="name")
+    return {_shell_slug(name) for name in names} - {"private"}
+
+
+class DeskTables:
+    """What router.js reads a route against, for the session user; each table is read when first needed."""
+
+    def __init__(self, user: str):
+        self.user = user
+
+    @cached_property
+    def workspaces(self) -> dict[str, dict]:
+        return _visible_workspaces()
+
+    @cached_property
+    def readable(self) -> list[str]:
+        return UserPermissions(self.user).get_can_read()
+
+    @cached_property
+    def doctype_routes(self) -> dict[str, str]:
+        return _doctype_routes(self.readable)
+
+    @cached_property
+    def shells(self) -> set[str]:
+        return _shell_slugs()
+
+    @cached_property
+    def has_shells(self) -> bool:
+        return _desk_has_shells()
+
+
+def _segment_kind(segment: str, desk: DeskTables) -> str:
+    """What a segment names to v16 Desk (router.js segment_kind), or "" when it names nothing."""
+    if segment in desk.workspaces:
+        return "workspace"
+    if segment == "private":
+        return "private"
+    if segment in desk.doctype_routes:
+        return "doctype"
+    if segment in STANDARD_PAGES or frappe.db.exists("Page", segment):
+        return "page"
+    if segment.capitalize() in VIEW_FACTORY_ROUTES:
+        return "view"
+    return ""
+
+
+def _without_shell(parts: list[str], desk: DeskTables) -> list[str]:
+    """The route without a leading sidebar segment, as router.js take_shell_from drops it on v16."""
+    if len(parts) < 2 or parts[0] not in desk.shells:
+        return parts
+    # A sidebar named like a DocType stays that DocType, and the segment after it must name something.
+    if _segment_kind(parts[0], desk) == "doctype" or not _segment_kind(parts[1], desk):
+        return parts
+    return parts[1:]
+
+
+def _private_lookup(segment: str, user: str) -> tuple[set[str], bool]:
+    """How this release's router.js finds /desk/private/<segment>: the workspace names it matches, and
+    whether a title matches too.
+
+    Each release is the first v16 tag holding that change to router.js; v15 has looked up "<segment>-<user>"
+    as typed since 2024. A development build could hold any of them, so it accepts every one.
+    """
+    as_typed = f"{segment}-{user.lower()}"
+    release = _frappe_release()
+    if release is None:
+        return {as_typed, _slug(as_typed), _slug(segment)}, True
+    if release >= (16, 50):
+        return {_slug(segment)}, True
+    if release >= (16, 14):
+        return {_slug(segment)}, False
+    if release >= (16, 5):
+        return {_slug(as_typed)}, False
+    return {as_typed}, False
+
+
+def _own_private_workspace(segment: str, user: str, workspaces: dict[str, dict]) -> dict | None:
+    """The user's private workspace that ``segment`` names, as this release's router.js looks it up."""
+    names, title_matches = _private_lookup(segment, user)
+    for page in workspaces.values():
+        if page.get("public") or page.get("for_user") != user:
+            continue
+        if _slug(page["name"]) in names:
+            return page
+        if title_matches and _slug(page.get("title") or "") in names:
+            return page
+    return None
+
+
+def _check_private_workspace(rest: list[str], user: str, desk: DeskTables) -> dict:
+    if not rest and desk.has_shells:
+        # The Private sidebar opens its first page, or its empty state when it has none.
+        return _result("workspace", "private")
+    if not rest:
+        return _result("workspace", "private", "/desk/private needs a workspace after it; Desk would say "
+                                               "the workspace does not exist")
+    page = _own_private_workspace(rest[0], user, desk.workspaces)
+    if page:
+        return _result("workspace", page["name"])
+    if desk.has_shells and _segment_kind(rest[0], desk):
+        # v16 then reads private as the Private sidebar with an ordinary route inside it.
+        return _resolve(rest, user, desk)
+    return _result("workspace", rest[0], f"{user} has no private workspace {rest[0]!r}; Desk would say "
                                          "the workspace does not exist")
 
 
@@ -226,18 +361,16 @@ def _check_page(page_name: str) -> dict:
     return _result("page", page_name, call_problems=call_problems)
 
 
-def _resolve(parts: list[str], user: str) -> dict:
+def _resolve(parts: list[str], user: str, desk: DeskTables) -> dict:
     if not parts:
         return _result("home", "")
     first, rest = parts[0], parts[1:]
-    workspaces = _visible_workspaces()
-    if first in workspaces:
-        return _result("workspace", workspaces[first])
+    if first in desk.workspaces:
+        return _result("workspace", desk.workspaces[first]["name"])
     if first == "private":
-        return _check_private_workspace(rest, user, workspaces)
-    readable = UserPermissions(user).get_can_read()
-    doctype = _doctype_routes(readable).get(first, "")
-    if doctype and doctype not in readable:
+        return _check_private_workspace(rest, user, desk)
+    doctype = desk.doctype_routes.get(first, "")
+    if doctype and doctype not in desk.readable:
         # A DocType Layout is routed for every user, but its DocType still has to load for this one.
         return _result("list", doctype, f"{user} cannot read DocType {doctype!r}, which the DocType Layout "
                                         f"route {first!r} opens")
@@ -253,6 +386,9 @@ def _resolve(parts: list[str], user: str) -> dict:
         return _result("view", "/".join(parts))
     if first == "query-report":
         return _check_report(rest)
+    if first == "Workspaces":
+        # Desk's own workspace view, which has no Page document to look up.
+        return _result("workspace", "/".join(rest))
     return _check_page(first)
 
 
@@ -265,11 +401,29 @@ def preflight(route: str, user: str = "Administrator") -> dict:
     parts = _route_parts(route)
     if parts is None:
         return _result("other", str(route), "")
-    if not frappe.db.exists("User", user):
-        return _result("other", str(route), f"there is no User {user!r} to sign in as")
+    # What this request cached was worked out for the caller (v16 caches get_workspaces this way), so the
+    # check starts without it and leaves the caller's values as they were.
+    request_cache = getattr(frappe.local, "request_cache", None)
+    callers_request_cache = dict(request_cache or {})
+    if request_cache:
+        request_cache.clear()
+    try:
+        stored_user = frappe.db.get_value("User", user, "name")
+        if not stored_user:
+            return _result("other", str(route), f"there is no User {user!r} to sign in as")
+        # The lookup ignores case, but Desk compares user names exactly (a private workspace's for_user).
+        return _resolve_as(parts, stored_user)
+    finally:
+        if request_cache is not None:
+            request_cache.clear()
+            request_cache.update(callers_request_cache)
+
+
+def _resolve_as(parts: list[str], user: str) -> dict:
     previous_user = frappe.session.user
     frappe.set_user(user)
     try:
-        return _resolve(parts, user)
+        desk = DeskTables(user)
+        return _resolve(_without_shell(parts, desk), user, desk)
     finally:
         frappe.set_user(previous_user)
