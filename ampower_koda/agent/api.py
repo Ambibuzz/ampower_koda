@@ -39,6 +39,7 @@ from ampower_koda.agent.git_ops import (
 )
 from ampower_koda.agent.graph import _app_file_exists
 from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent import reasoning_catalog
 from ampower_koda.agent.run_control import enqueue_job, stop_job
 
 DOCTYPE_NAME = "Agent Request"
@@ -827,7 +828,12 @@ def get_model_defaults():
 _OPENAI_CHAT_MODEL = re.compile(r"^(gpt-(?!3)|o\d|codex)")
 _OPENAI_NOT_CHAT = re.compile(r"audio|realtime|transcribe|tts|image|search|embedding|moderation|instruct")
 _OPENAI_SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")  # dated pins of an alias that is listed anyway
+# OpenRouter's "openai/" ids that OpenAI's own API does not serve: open-weight models and
+# OpenRouter's effort aliases such as o4-mini-high.
+_OPENROUTER_ONLY_OPENAI = re.compile(r"^gpt-oss|-high$")
 OPENAI_MODELS_CACHE_SECONDS = 6 * 3600
+# A run usually starts from a form showing a picker, so this keeps the run's catalog fresh too.
+OPENROUTER_PICKER_MAX_AGE_SECONDS = 3600
 
 
 @frappe.whitelist()
@@ -835,15 +841,64 @@ OPENAI_MODELS_CACHE_SECONDS = 6 * 3600
 def get_provider_models(provider: str = "OpenAI", refresh: int = 0):
     """The provider's current models, newest first, for the model pickers.
 
-    Only OpenAI is listed live (GET /v1/models with the key in Agent Settings),
-    so a new model is offered the day it ships instead of after a code change.
-    Any other provider, or a failed fetch, returns no models and the form keeps
-    its built-in list. Model ids only; no secrets are returned.
+    OpenRouter's come from its public model list, the one the reasoning catalog keeps. OpenAI's
+    come from GET /v1/models with the key in Agent Settings, so a new model is offered the day
+    it ships; without a key, or when that fetch fails, OpenRouter's copies of OpenAI models
+    stand in. Any other provider returns no models and the form keeps its built-in list.
+    Model ids only; no secrets are returned.
     """
     if not (frappe.has_permission(DOCTYPE_NAME, "read") or frappe.has_permission("Agent Settings", "read")):
         frappe.throw(_("Not permitted to list models."), frappe.PermissionError)
-    if (provider or "").strip() != "OpenAI":
+    provider = (provider or "").strip()
+    if provider == "OpenRouter":
+        return {"models": _openrouter_tool_models(refresh)}
+    if provider != "OpenAI":
         return {"models": []}
+    live = _openai_live_models(refresh)
+    if live["models"]:
+        return live
+    openai_models_on_openrouter = _openai_models_on_openrouter(refresh)
+    if openai_models_on_openrouter:
+        return {"models": openai_models_on_openrouter}
+    return live
+
+
+def _openrouter_tool_models(refresh) -> list[str]:
+    """OpenRouter model ids that take tool calls, newest first."""
+    if int(refresh or 0):
+        reasoning_catalog.refresh_openrouter_models()
+    models = reasoning_catalog.openrouter_models(max_age_seconds=OPENROUTER_PICKER_MAX_AGE_SECONDS)
+    newest_first = sorted(models.items(),
+                          key=lambda item: item[1].get("created", 0), reverse=True)
+    model_ids = []
+    for model_id, entry in newest_first:
+        # Variants such as ":free" and ":batch" route a model that is listed anyway.
+        if ":" in model_id or not entry.get("tools"):
+            continue
+        model_ids.append(model_id)
+    return model_ids
+
+
+def _openai_models_on_openrouter(refresh) -> list[str]:
+    """OpenAI model names from OpenRouter's list that OpenAI's own API also serves, newest first."""
+    names = []
+    for model_id in _openrouter_tool_models(refresh):
+        if not model_id.startswith("openai/"):
+            continue
+        name = model_id.removeprefix("openai/")
+        if _is_openai_chat_model(name) and not _OPENROUTER_ONLY_OPENAI.search(name):
+            names.append(name)
+    return names
+
+
+def _is_openai_chat_model(model_id: str) -> bool:
+    return (_OPENAI_CHAT_MODEL.match(model_id) is not None
+            and not _OPENAI_NOT_CHAT.search(model_id)
+            and not _OPENAI_SNAPSHOT.search(model_id))
+
+
+def _openai_live_models(refresh) -> dict:
+    """GET /v1/models with the key in Agent Settings, newest first and cached; "error" says why it is empty."""
     cache_key = "koda:openai_models"
     if not int(refresh or 0):
         cached = frappe.cache().get_value(cache_key)
@@ -863,8 +918,7 @@ def get_provider_models(provider: str = "OpenAI", refresh: int = 0):
     except Exception as exc:  # noqa: BLE001 -- the form falls back to its built-in list
         return {"models": [], "error": f"Could not list OpenAI models: {type(exc).__name__}"}
     models = [row["id"] for row in sorted(rows, key=lambda row: int(row.get("created") or 0), reverse=True)
-              if isinstance(row.get("id"), str) and _OPENAI_CHAT_MODEL.match(row["id"])
-              and not _OPENAI_NOT_CHAT.search(row["id"]) and not _OPENAI_SNAPSHOT.search(row["id"])]
+              if isinstance(row.get("id"), str) and _is_openai_chat_model(row["id"])]
     if models:
         frappe.cache().set_value(cache_key, models, expires_in_sec=OPENAI_MODELS_CACHE_SECONDS)
     return {"models": models}

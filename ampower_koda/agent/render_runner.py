@@ -923,6 +923,28 @@ def one_line(exc):
     return " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
 
 
+def route_opens(route, user, report):
+    """Whether the route opens for ``user``, asked of the site before Chromium starts; notes the answer in ``report``.
+
+    A route that is not found or not permitted fails here. If the preflight itself breaks, the browser check
+    still runs and reports what it sees.
+    """
+    import frappe
+    try:
+        from ampower_koda.agent.page_preflight import preflight
+        route_check = preflight(route, user)
+    except Exception as exc:
+        # A failed query leaves a Postgres transaction aborted, and the sign-in after this needs the connection.
+        frappe.db.rollback()
+        report["preflight_skipped"] = one_line(exc)
+        return True
+    if route_check["call_problems"]:
+        report["preflight_calls"] = route_check["call_problems"]
+    if not route_check["ok"]:
+        report["preflight"] = route_check["problem"]
+    return route_check["ok"]
+
+
 def write_unrecorded(record_dir, message):
     """Why the check was not recorded, in the error.txt the worker reads (recording/bundle.py ERROR_FILE).
 
@@ -969,13 +991,19 @@ def main():
                 report["registration_error"] = " ".join(str(exc).split())[:300]
         user = os.environ.get("KODA_RENDER_USER") or "Administrator"
         report["user"] = user
-        sid = site_session(user, session_file)
-        base = (os.environ.get("KODA_RENDER_BASE_URL") or frappe.utils.get_url()).rstrip("/")
+        if route_opens(route, user, report):
+            sid = site_session(user, session_file)
+            base = (os.environ.get("KODA_RENDER_BASE_URL") or frappe.utils.get_url()).rstrip("/")
         frappe.destroy()
     except Exception:
         traceback.print_exc(limit=4)
         print("KODA_RUNNER_ERROR could not sign in to the site", flush=True)
         sys.exit(3)
+    if report.get("preflight"):
+        if record_dir:
+            write_unrecorded(record_dir, "the browser was not started: " + report["preflight"])
+        write_report(report, report_file)
+        return
 
     with sync_playwright() as playwright:
         try:
@@ -1057,6 +1085,10 @@ def main():
                                       if (c["status"] or 0) >= 400][:15]
         finally:
             browser.close()
+    write_report(report, report_file)
+
+
+def write_report(report, report_file):
     if report_file:
         with open(report_file, "w", encoding="utf-8") as handle:
             json.dump(report, handle, default=str)

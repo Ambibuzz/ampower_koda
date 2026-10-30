@@ -62,20 +62,25 @@ function set_model_options_for_provider(frm, reset) {
     });
 }
 
-// OpenAI's models are listed live (newest first, cached server-side), so a new
-// model is offered without a code change; the built-in list is the fallback.
+// OpenAI's and OpenRouter's models are listed live (newest first, cached server-side), so a
+// new model is offered without a code change; the built-in list is the fallback.
+var LIVE_MODEL_PROVIDERS = ['OpenAI', 'OpenRouter'];
+// The picker shows this many: the newest while the field is empty, else the newest that match.
+var MODEL_PICKER_ITEMS = 5;
+
 function with_provider_models(provider, done) {
     var fallback = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
-    if (provider !== 'OpenAI') return done(fallback);
-    if (window.koda_live_models) return done(window.koda_live_models);
+    if (LIVE_MODEL_PROVIDERS.indexOf(provider) === -1) return done(fallback);
+    window.koda_live_models = window.koda_live_models || {};
+    if (window.koda_live_models[provider]) return done(window.koda_live_models[provider]);
     frappe.call({
         method: 'ampower_koda.agent.api.get_provider_models',
         args: { provider: provider },
         callback: function(r) {
             var ids = (r.message || {}).models || [];
             if (!ids.length) return done(fallback);
-            window.koda_live_models = ids.map(function(id) { return { value: id, label: id }; });
-            done(window.koda_live_models);
+            window.koda_live_models[provider] = ids.map(function(id) { return { value: id, label: id }; });
+            done(window.koda_live_models[provider]);
         },
         error: function() { done(fallback); }
     });
@@ -96,6 +101,16 @@ function apply_model_options(frm, provider, entries, reset) {
     // suggestion, so a pasted provider model id must survive.
     frm.set_df_property('default_ai_model', 'ignore_validation', 1);
     frm.refresh_field('default_ai_model');
+
+    // The Autocomplete reads its options and item limit only when it is built, so a
+    // later list goes to the control itself.
+    var model_field = frm.fields_dict.default_ai_model;
+    if (model_field && model_field.set_data) {
+        model_field.set_data(model_ids);
+    }
+    if (model_field && model_field.awesomplete) {
+        model_field.awesomplete.maxItems = MODEL_PICKER_ITEMS;
+    }
 
     if (reset && model_ids.indexOf(current) === -1) {
         frm.set_value('default_ai_model', DEFAULT_MODELS[provider] || model_ids[0]);

@@ -459,12 +459,17 @@ function set_model_options_for_provider(frm, reset) {
     });
 }
 
-// OpenAI's models are listed live (newest first, cached server-side), so a new
-// model is offered without a code change; the built-in list is the fallback.
+// OpenAI's and OpenRouter's models are listed live (newest first, cached server-side), so a
+// new model is offered without a code change; the built-in list is the fallback.
+var LIVE_MODEL_PROVIDERS = ['OpenAI', 'OpenRouter'];
+// The picker shows this many: the newest while the field is empty, else the newest that match.
+var MODEL_PICKER_ITEMS = 5;
+
 function with_provider_models(provider, done) {
     var fallback = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
-    if (provider !== 'OpenAI') return done(fallback);
-    if (window.koda_live_models) return done(window.koda_live_models);
+    if (LIVE_MODEL_PROVIDERS.indexOf(provider) === -1) return done(fallback);
+    window.koda_live_models = window.koda_live_models || {};
+    if (window.koda_live_models[provider]) return done(window.koda_live_models[provider]);
     frappe.call({
         method: 'ampower_koda.agent.api.get_provider_models',
         args: { provider: provider },
@@ -473,10 +478,10 @@ function with_provider_models(provider, done) {
             if (!ids.length) return done(fallback);
             var labels = {};
             fallback.forEach(function (m) { labels[m.value] = m.label; });
-            window.koda_live_models = ids.map(function (id) {
-                return { value: id, label: labels[id] || (id + ': live from OpenAI') };
+            window.koda_live_models[provider] = ids.map(function (id) {
+                return { value: id, label: labels[id] || (id + ': live from ' + provider) };
             });
-            done(window.koda_live_models);
+            done(window.koda_live_models[provider]);
         },
         error: function () { done(fallback); }
     });
@@ -497,12 +502,23 @@ function apply_model_options(frm, provider, entries, reset) {
     frm.set_df_property('ai_model', 'ignore_validation', 1);
     frm.refresh_field('ai_model');
 
+    // The Autocomplete reads its options and item limit only when it is built, so a
+    // later list goes to the control itself.
+    var model_field = frm.fields_dict.ai_model;
+    if (model_field && model_field.set_data) {
+        model_field.set_data(model_ids);
+    }
+    if (model_field && model_field.awesomplete) {
+        model_field.awesomplete.maxItems = MODEL_PICKER_ITEMS;
+    }
+
     if (reset && model_ids.indexOf(current) === -1) {
         frm.set_value('ai_model', settings_model);
     }
 
-    var desc = entries === window.koda_live_models
-        ? __('Live list from OpenAI, newest first ({0} models).', [entries.length])
+    var live_models = (window.koda_live_models || {})[provider];
+    var desc = entries === live_models
+        ? __('Live list from {0}, newest first ({1} models); type to search.', [provider, entries.length])
         : entries.map(function (m) {
             return '<b>' + m.value + '</b>: ' + m.label.split(': ')[1];
         }).join(' &nbsp;|&nbsp; ');
