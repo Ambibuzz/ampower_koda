@@ -533,10 +533,10 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
     provider = (provider or "OpenAI").strip()
     model = (model or "gpt-4o-mini").strip()
     if provider == "Gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
+        from ampower_koda.agent.gemini_chat import GeminiChat
         # Google's retry setting counts attempts, including the initial call.
-        return ChatGoogleGenerativeAI(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS,
-                                      max_retries=MODEL_MAX_RETRIES + 1)
+        return GeminiChat(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS,
+                          max_retries=MODEL_MAX_RETRIES + 1)
     if provider == "Claude":
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES)
