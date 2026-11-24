@@ -4,13 +4,14 @@ Network and Redis are faked, so no site or internet is needed.
 Run with: bench --site <site> run-tests --module ampower_koda.agent.test_reasoning_catalog
 """
 
+import inspect
 import os
 import signal
 import time
 import unittest
 from unittest import mock
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from ampower_koda.agent import api, cache_usage, graph, reasoning_catalog, run_control
 
@@ -527,6 +528,13 @@ class TestGeminiCap(unittest.TestCase):
         self.assertEqual(prepare.call_args.kwargs["max_output_tokens"], 1234)
         self.assertNotIn("max_tokens", prepare.call_args.kwargs)
 
+    def test_no_temperature_is_sent(self):
+        for model in ("gemini-2.5-pro", "gemini-3.8-flash", "gemini-4-carbon"):
+            with mock.patch.dict(os.environ, {"GOOGLE_API_KEY": "test-key"}):
+                llm = graph._get_llm(provider="Gemini", model=model)
+            request = llm._prepare_request([HumanMessage(content="hi")])
+            self.assertIsNone(request["config"].temperature)
+
 
 class TestModelPickers(unittest.TestCase):
     def setUp(self):
@@ -540,10 +548,65 @@ class TestModelPickers(unittest.TestCase):
     def test_openrouter_picker_lists_tool_models_newest_first_without_variants(self):
         self.assertEqual(api._openrouter_tool_models(0), [
             "z-ai/glm-5", "openai/gpt-5-image", "openai/gpt-5", "openai/o4-mini-high",
-            "openai/gpt-oss-120b", "openai/gpt-4o-mini", "anthropic/claude-opus-5.5", "anthropic/claude-haiku-4.5"])
+            "openai/gpt-oss-120b", "anthropic/claude-opus-5.5"])
 
     def test_openai_fallback_keeps_only_models_openai_serves(self):
-        self.assertEqual(api._openai_models_on_openrouter(0), ["gpt-5", "gpt-4o-mini"])
+        self.assertEqual(api._openai_models_on_openrouter(0), ["gpt-5"])
+
+    def test_openai_live_list_drops_older_models_and_keeps_unlisted_new_ones(self):
+        names = ["gpt-9-new", "gpt-5", "gpt-4o-mini", "gpt-4-turbo", "gpt-5-chat-latest"]
+        self.assertEqual(api._current_openai_models(names), ["gpt-9-new", "gpt-5"])
+
+    def test_settings_default_that_is_older_is_not_offered(self):
+        for model, offered in (("gpt-4o-mini", ""), ("gpt-5", "gpt-5")):
+            settings = mock.Mock(default_ai_provider="OpenAI", default_ai_model=model)
+            with mock.patch.object(api.frappe, "get_single", return_value=settings):
+                self.assertEqual(inspect.unwrap(api.get_model_defaults)()["model"], offered)
+
+
+class TestOlderModels(CatalogTestCase):
+    """Older models cannot be selected, whether picked or typed."""
+
+    OLDER = (("OpenAI", "gpt-4o-mini"), ("OpenAI", "gpt-4.1-2025-04-14"), ("OpenAI", "gpt-5-chat-latest"),
+             ("OpenAI", "o1-mini"), ("Gemini", "gemini-2.0-flash"), ("Gemini", "gemini-2.5-pro-001"),
+             ("Claude", "claude-3-5-haiku-20241022"), ("Claude", "claude-sonnet-4-20250514"),
+             ("Claude", "claude-haiku-4-5"), ("Claude", "claude-opus-4-1-20250805"),
+             ("OpenRouter", "anthropic/claude-sonnet-4"), ("OpenRouter", "anthropic/claude-haiku-4.5"),
+             ("OpenRouter", "openai/gpt-4o-mini:nitro"), ("OpenRouter", "google/gemini-2.5-pro"))
+    CURRENT = (("OpenAI", "gpt-6-luna"), ("OpenAI", "gpt-6.2-sol"), ("OpenAI", "o3"),
+               ("Gemini", "gemini-3.8-flash"), ("Gemini", "gemini-4-carbon"), ("Claude", "claude-sonnet-4-6"),
+               ("Claude", "claude-opus-5-5"), ("Claude", "claude-sonnet-5-20260630"),
+               ("OpenRouter", "anthropic/claude-sonnet-5.5"), ("OpenRouter", "z-ai/glm-5:nitro"),
+               ("OpenRouter", "deepseek/deepseek-v4-flash-0731"))
+
+    def check(self):
+        for provider, model in self.OLDER:
+            self.assertTrue(reasoning_catalog.is_older_model(provider, model), model)
+        for provider, model in self.CURRENT:
+            self.assertFalse(reasoning_catalog.is_older_model(provider, model), model)
+
+    def test_with_the_list(self):
+        self.fetch_returns(FakeResponse(json_body={"data": OPENROUTER_ROWS}))
+        reasoning_catalog.refresh_openrouter_models()
+        self.check()
+        # Only the list tells that these do not reason.
+        self.assertTrue(reasoning_catalog.is_older_model("OpenRouter", "deepseek/deepseek-chat:free"))
+        self.assertTrue(reasoning_catalog.is_older_model("OpenAI", "gpt-routed"))
+
+    def test_without_the_list(self):
+        with mock.patch.object(reasoning_catalog, "openrouter_models", return_value={}):
+            self.check()
+
+    def test_only_an_older_model_stops_the_save(self):
+        refused = []
+        with mock.patch.object(reasoning_catalog, "openrouter_models", return_value={}), \
+                mock.patch.object(reasoning_catalog, "frappe") as fake_frappe:
+            fake_frappe.throw.side_effect = refused.append
+            for model in ("gpt-6-luna", "", None):
+                reasoning_catalog.refuse_older_model("OpenAI", model)
+            self.assertEqual(refused, [])
+            reasoning_catalog.refuse_older_model(None, "gpt-4o-mini")
+            self.assertEqual(len(refused), 1)
 
 
 if __name__ == "__main__":
