@@ -914,12 +914,39 @@ MODEL_WINDOWS = {
 }
 
 
+#: Bare model ids the direct OpenAI provider serves; OpenRouter ids carry a ``vendor/`` prefix.
+OPENAI_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "codex")
+
+
+def _catalog_window(model_id: str) -> int:
+    """The context window OpenRouter's model list states for a direct provider's model, or 0."""
+    from ampower_koda.agent.reasoning_catalog import model_limits
+
+    identifier = (model_id or "").strip()
+    lowered = identifier.lower()
+    if lowered.startswith("claude"):
+        provider = "Claude"
+    elif lowered.startswith(OPENAI_MODEL_PREFIXES):
+        provider = "OpenAI"
+    else:
+        return 0
+    try:
+        return model_limits(provider, identifier)[0]
+    except Exception:
+        # The list is a refinement; without it the table below still answers.
+        return 0
+
+
 def _window_for(model_id: str) -> int:
     """The model's context window, or 0 to let the core decide.
 
-    Longest match first: ``deepseek/deepseek-v4-flash-0731`` must not be scored
-    against a shorter key that happens to be a prefix of a different model.
+    The published list comes first, so a new model is not squeezed into the core's default.
+    The table is the fallback, longest match first: ``deepseek/deepseek-v4-flash-0731`` must
+    not be scored against a shorter key that happens to be a prefix of a different model.
     """
+    published = _catalog_window(model_id)
+    if published:
+        return published
     identifier = (model_id or "").lower()
     for name in sorted(MODEL_WINDOWS, key=len, reverse=True):
         if name in identifier:
