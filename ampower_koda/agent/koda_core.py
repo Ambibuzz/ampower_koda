@@ -43,7 +43,7 @@ from pathlib import Path
 
 import frappe
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.cache_usage import persist_usage, provider_cost
+from ampower_koda.agent.cache_usage import cache_write_tokens, persist_usage, provider_cost
 from ampower_koda.agent import recovery
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -445,7 +445,7 @@ def _usage(reply) -> TurnUsage:
     metadata = getattr(reply, "usage_metadata", None) or {}
     details = metadata.get("input_token_details") or {}
     cache_read = int(details.get("cache_read") or 0)
-    cache_write = int(details.get("cache_creation") or 0)
+    cache_write = cache_write_tokens(details)
     total_input = int(metadata.get("input_tokens") or 0)
     return TurnUsage(
         input_tokens=max(0, total_input - cache_read - cache_write),

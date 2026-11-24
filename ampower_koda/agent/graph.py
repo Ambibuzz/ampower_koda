@@ -20,7 +20,7 @@ from ampower_koda.agent.prompt_caching import mark_message, native_cache_message
 from langchain_openai import ChatOpenAI
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.cache_usage import persist_usage, provider_cost
+from ampower_koda.agent.cache_usage import cache_write_tokens, persist_usage, provider_cost
 from ampower_koda.agent import koda_core
 from ampower_koda.agent import checkpoint
 from ampower_koda.agent import recovery
@@ -1611,7 +1611,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         details = usage.get("input_token_details") or {}
         _persist_token_usage(request_name, total_tokens, input_tokens=int(usage.get("input_tokens") or 0),
                              cache_read_tokens=int(details.get("cache_read") or 0),
-                             cache_write_tokens=int(details.get("cache_creation") or 0),
+                             cache_write_tokens=cache_write_tokens(details),
                              cost_delta=provider_cost(reply))
         if progress is not None:
             progress["tokens"] = total_tokens
@@ -1699,7 +1699,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             total_tokens += int(usage.get("total_tokens") or 0)
             details = usage.get("input_token_details") or {}
             cache_read = int(details.get("cache_read") or 0)
-            cache_write = int(details.get("cache_creation") or 0)
+            cache_write = cache_write_tokens(details)
             history["previous_context_input_tokens"] = context_input
             cost = provider_cost(response)
             uncached_input = max(
@@ -2350,7 +2350,7 @@ def _charge_plan_call(raw_response, request_name: str, total_tokens: int, *, rou
     details = usage.get("input_token_details") or {}
     input_tokens = int(usage.get('input_tokens') or 0)
     cache_read = int(details.get('cache_read') or 0)
-    cache_write = int(details.get('cache_creation') or 0)
+    cache_write = cache_write_tokens(details)
     cost = provider_cost(raw_response)
     _publish_agent_log(request_name, "token_usage",
         round=round_label,
