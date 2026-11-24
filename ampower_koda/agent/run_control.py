@@ -4,6 +4,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 import os
+import signal
+import threading
 import time
 from uuid import uuid4
 
@@ -80,6 +82,28 @@ def check_active(*, reserve: float = 0, max_age: float = 0) -> None:
         run.checked_at = now
     if reserve and now + reserve >= run.deadline:
         raise RunDeadline("Execution time slice exhausted. Resume Execution continues from the saved checkpoint.")
+
+
+def _stop_at_job_limit(signum, frame):
+    raise RunDeadline("Execution time slice exhausted during a model call. "
+                      "Resume Execution continues from the saved checkpoint.")
+
+
+@contextmanager
+def job_limit_stops_run():
+    """Within it, RQ's alarm raises ``RunDeadline``; the job then has about a minute to save its state.
+
+    RQ's own exception is an ordinary one: an SDK takes it for a lost connection and sends the call again.
+    """
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    if not hasattr(signal, "SIGALRM") or not on_main_thread:
+        yield
+        return
+    previous_handler = signal.signal(signal.SIGALRM, _stop_at_job_limit)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def set_request_value(request_name: str, values, value=None, **kwargs):
