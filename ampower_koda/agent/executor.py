@@ -331,8 +331,12 @@ def _get_doc_config(request_name: str) -> dict:
 
 
 def _update_status(request_name: str, user: str, status: str, message: str = "", **kwargs):
-    """Persist the status (plus any allowed fields) and broadcast progress via realtime."""
-    set_request_value(request_name, "status", status)
+    """Persist the status (plus any allowed fields) and broadcast progress via realtime.
+
+    The status and its fields are one write, so a reader never sees one without the other. The
+    broadcast comes after the commit and cannot fail the step: the record is already true, and a
+    lost notification only means an open form refreshes later.
+    """
     allowed_fields = [
         "branch_name", "pr_url", "pr_number", "conversation_log",
         "agent_plan", "files_changed", "error_log", "tokens_used",
@@ -340,14 +344,16 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
         "pending_bench_commands", "change_summary",
         "implementation_snapshot", "follow_up_message", "follow_up_count",
     ]
-    if kwargs:
-        for k, v in kwargs.items():
-            if k in allowed_fields:
-                set_request_value(request_name, k, v)
+    values = {"status": status}
+    values.update({field: value for field, value in kwargs.items() if field in allowed_fields})
+    set_request_value(request_name, values)
     frappe.db.commit()
     check_active()
     payload = {"request_name": request_name, "status": status, "message": message, **kwargs}
-    frappe.publish_realtime("agent_progress", payload, user=user)
+    try:
+        frappe.publish_realtime("agent_progress", payload, user=user)
+    except Exception:
+        log_agent_error("Koda: progress notification failed", frappe.get_traceback())
 
 
 def _config_failed(request_name: str, title: str, error: Exception) -> None:
