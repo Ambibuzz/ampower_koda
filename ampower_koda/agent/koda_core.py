@@ -965,6 +965,7 @@ MODEL_WINDOWS = {
     "gpt-6": 1_050_000,  # luna, sol, astra (OpenRouter model list, 2026-09)
     "gemini-2.0-flash": 1_000_000,
     "gemini-2.5-pro": 1_000_000,
+    "gemini-3": 1_000_000,
     "claude-3-5": 200_000,
     "claude-sonnet-4": 200_000,
 }

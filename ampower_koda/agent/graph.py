@@ -619,7 +619,8 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
     if provider == "Gemini":
         from ampower_koda.agent.gemini_chat import GeminiChat
         # Google's retry setting counts attempts, including the initial call.
-        return GeminiChat(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS,
+        # None, not left out: the adapter sends 0.7 for the models it does not know as Gemini 3.
+        return GeminiChat(model=model, temperature=None, timeout=MODEL_TIMEOUT_SECONDS,
                           max_retries=MODEL_MAX_RETRIES + 1)
     if provider == "Claude":
         return _claude_llm(model, reasoning_effort)
@@ -709,7 +710,7 @@ def _effort_for(catalog_entry: dict, reasoning_effort: str | None) -> str:
 # OpenAI models that take low, medium and high, for when neither source can be read. Left out: pro, chat,
 # search and deep-research variants, which reject some of those levels or do not reason.
 OPENAI_EFFORT_MODEL = _re.compile(
-    r"(?:o1|o3|o3-mini|o4-mini|gpt-[5-9](?:\.\d+)?(?:-(?:mini|nano|codex|codex-mini|codex-max|luna|sol|astra))?)"
+    r"(?:o1|o3|o3-mini|o4-mini|gpt-[5-9](?:\.\d+)?(?:-(?:mini|nano|codex|codex-mini|codex-max|luna|terra|sol|astra))?)"
     r"(?:-\d{4}-\d{2}-\d{2})?")
 # Newer Claude models (Opus, Sonnet and Haiku 5.5, Fable 5.1+) reject a replayed thinking block
 # once anything before it changed. Koda prunes and compacts its history by design, so it asks the
