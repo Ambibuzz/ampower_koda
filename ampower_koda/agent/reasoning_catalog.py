@@ -35,6 +35,13 @@ CLAUDE_VERSION_HYPHEN = re.compile(r"(?<=\d)-(?=\d)")
 ANTHROPIC_PREFIX = "anthropic/"
 # Google pins releases as gemini-2.0-flash-001; OpenRouter may list only the plain name.
 GEMINI_RELEASE_SUFFIX = re.compile(r"-\d{3}$")
+# Models that do not reason or that take no effort level, for when OpenRouter's list does not have them.
+# Dots are read as hyphens.
+OLDER_MODEL_NAME = re.compile(
+    r"gpt-[0-4]|gpt-(?:.*-)?chat|chatgpt|o1-(?:mini|preview)|gemini-[0-2](?:-|$)"
+    r"|claude-(?:[0-3]|instant|[a-z]+-4(?:-[0-5])?(?:$|[-@]\d{8}|[-@]latest))")
+# Their models take effort levels from Claude 4.6 and Gemini 3 on; the ones before list none.
+EFFORT_FAMILIES = ("claude-", "gemini-")
 
 
 def claude_openrouter_id(api_id: str) -> str:
@@ -93,14 +100,52 @@ def model_price_tiers(model: str) -> list:
     if name.startswith("claude"):
         entry = _openrouter_entry(claude_openrouter_id(name))
     elif name.startswith("gemini"):
-        entry = _openrouter_entry("google/" + name)
-        if entry is None:
-            entry = _openrouter_entry("google/" + GEMINI_RELEASE_SUFFIX.sub("", name))
+        entry = _gemini_on_openrouter(name)
     else:
         entry = _openai_on_openrouter(name)
     if entry is None:
         return []
     return entry.get("price_tiers") or []
+
+
+def is_older_model(provider: str, model: str) -> bool:
+    """Whether ``model`` may not be selected; a model nothing is known about may, as it can be new."""
+    name = model.strip().lower()
+    if provider == "OpenRouter":
+        entry = _openrouter_entry(name)
+    elif provider == "Claude":
+        entry = _openrouter_entry(claude_openrouter_id(name))
+    elif provider == "Gemini":
+        entry = _gemini_on_openrouter(name)
+    else:
+        entry = _openai_on_openrouter(name)
+    return is_older_entry(name, entry)
+
+
+def is_older_entry(name: str, entry: dict | None) -> bool:
+    """``is_older_model`` for a model whose entry in OpenRouter's list is at hand (None: not listed)."""
+    plain_name = _without_variant(name).rsplit("/", 1)[-1].replace(".", "-")
+    if OLDER_MODEL_NAME.match(plain_name):
+        return True
+    if entry is None:
+        return False
+    if not entry["reasons"]:
+        return True
+    return plain_name.startswith(EFFORT_FAMILIES) and not entry.get("supported_efforts")
+
+
+def refuse_older_model(provider: str, model: str) -> None:
+    """Stop a save that selects an older model."""
+    if model and is_older_model(provider or "OpenAI", model):
+        frappe.throw(frappe._("{0} is an older model and can no longer be selected. Choose a current model.").format(
+            frappe.bold(frappe.utils.escape_html(model))))
+
+
+def _gemini_on_openrouter(name: str) -> dict | None:
+    entry = _openrouter_entry("google/" + name)
+    if entry is None:
+        entry = _openrouter_entry("google/" + GEMINI_RELEASE_SUFFIX.sub("", name))
+    return entry
 
 
 def _openai_on_openrouter(name: str) -> dict | None:

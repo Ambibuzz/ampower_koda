@@ -841,10 +841,12 @@ def get_model_defaults():
     from that catalogue instead of from Settings. No secrets are returned.
     """
     settings = frappe.get_single("Agent Settings")
-    return {
-        "provider": (settings.default_ai_provider or "OpenAI").strip(),
-        "model": (settings.default_ai_model or "").strip(),
-    }
+    provider = (settings.default_ai_provider or "OpenAI").strip()
+    model = (settings.default_ai_model or "").strip()
+    # A request cannot be saved with an older model, so the form's own default stands in.
+    if model and reasoning_catalog.is_older_model(provider, model):
+        model = ""
+    return {"provider": provider, "model": model}
 
 
 # Tool-calling text families on /v1/models; everything else there (embeddings, audio, images,
@@ -879,6 +881,7 @@ def get_provider_models(provider: str = "OpenAI", refresh: int = 0):
     if provider != "OpenAI":
         return {"models": []}
     live = _openai_live_models(refresh)
+    live["models"] = _current_openai_models(live["models"])
     if live["models"]:
         return live
     openai_models_on_openrouter = _openai_models_on_openrouter(refresh)
@@ -888,7 +891,7 @@ def get_provider_models(provider: str = "OpenAI", refresh: int = 0):
 
 
 def _openrouter_tool_models(refresh) -> list[str]:
-    """OpenRouter model ids that take tool calls, newest first."""
+    """Ids of OpenRouter's current models that take tool calls, newest first."""
     if int(refresh or 0):
         reasoning_catalog.refresh_openrouter_models()
     models = reasoning_catalog.openrouter_models(max_age_seconds=OPENROUTER_PICKER_MAX_AGE_SECONDS)
@@ -899,8 +902,17 @@ def _openrouter_tool_models(refresh) -> list[str]:
         # Variants such as ":free" and ":batch" route a model that is listed anyway.
         if ":" in model_id or not entry.get("tools"):
             continue
+        if reasoning_catalog.is_older_entry(model_id, entry):
+            continue
         model_ids.append(model_id)
     return model_ids
+
+
+def _current_openai_models(names: list[str]) -> list[str]:
+    """The names without older models. The list is read once: each read loads all of it from Redis."""
+    models = reasoning_catalog.openrouter_models(max_age_seconds=OPENROUTER_PICKER_MAX_AGE_SECONDS)
+    return [name for name in names
+            if not reasoning_catalog.is_older_entry(name, models.get("openai/" + name))]
 
 
 def _openai_models_on_openrouter(refresh) -> list[str]:
