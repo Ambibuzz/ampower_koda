@@ -15,9 +15,9 @@ var PROVIDER_MODELS = {
         { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro — most capable' }
     ],
     'Claude': [
-        { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4 — balanced' },
-        { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet — proven' },
-        { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku — fast, light' }
+        { value: 'claude-opus-5-5', label: 'Claude Opus 5.5 — most capable' },
+        { value: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 — balanced' },
+        { value: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 — fast, light' }
     ],
     'OpenRouter': [
         { value: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash — fast, cheap' },
@@ -31,7 +31,7 @@ var PROVIDER_MODELS = {
 var DEFAULT_MODELS = {
     'OpenAI': 'gpt-4o-mini',
     'Gemini': 'gemini-2.0-flash',
-    'Claude': 'claude-sonnet-4-20250514',
+    'Claude': 'claude-sonnet-5-5',
     'OpenRouter': 'deepseek/deepseek-v4-flash-0731'
 };
 

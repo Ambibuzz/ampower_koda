@@ -141,7 +141,7 @@
    "fieldname": "ai_model",
    "fieldtype": "Autocomplete",
    "label": "Model",
-   "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022\ndeepseek/deepseek-v4-flash-0731\ndeepseek/deepseek-chat\nanthropic/claude-sonnet-4\nopenai/gpt-4o-mini\nqwen/qwen-2.5-coder-32b-instruct",
+   "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-opus-5-5\nclaude-sonnet-5-5\nclaude-haiku-5-5\ndeepseek/deepseek-v4-flash-0731\ndeepseek/deepseek-chat\nanthropic/claude-sonnet-4\nopenai/gpt-4o-mini\nqwen/qwen-2.5-coder-32b-instruct",
    "reqd": 1
   },
   {

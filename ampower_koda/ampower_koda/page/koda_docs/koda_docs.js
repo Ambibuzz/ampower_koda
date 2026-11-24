@@ -118,7 +118,7 @@ frappe.pages['koda-docs'].on_page_load = function(wrapper) {
             </tr>
             <tr>
                 <td style="padding:8px;">Claude</td>
-                <td style="padding:8px;">claude-sonnet-4, claude-3-5-sonnet, claude-3-5-haiku</td>
+                <td style="padding:8px;">claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5</td>
             </tr>
         </table>
 
@@ -126,7 +126,7 @@ frappe.pages['koda-docs'].on_page_load = function(wrapper) {
 
         <h3>Tips</h3>
         <ul>
-            <li>Use a more capable model (gpt-5.2-codex, claude-sonnet-4, gemini-2.5-pro) for complex tasks.</li>
+            <li>Use a more capable model (gpt-5.2-codex, claude-opus-5-5, gemini-2.5-pro) for complex tasks.</li>
             <li>Write detailed descriptions -- the more context, the better the result.</li>
             <li>Edit the plan before approving if you see something wrong.</li>
             <li>Test changes on the instance before approving the push.</li>
