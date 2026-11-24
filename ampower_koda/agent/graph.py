@@ -86,6 +86,7 @@ REVIEW_HISTORY_RECHECKS = 4
 # stays below the executor's recursion limit of 100, which would end it as Failed.
 MAX_REVIEW_PASSES = 45
 MAX_REVIEW_RECHECKS = 2           # source changed while being reviewed; take a fresh bounded snapshot
+MAX_CUT_OFF_REPLIES = 3           # replies cut off amid their tool calls that a pass asks for again
 MAX_PLAN_AMENDMENTS = 2           # blocked-implementation plan patches per run
 MAX_PLAN_AMENDMENTS_HARD = 6      # even a run that keeps finding new blockers stops here
 BASE_EXECUTION_CALL_BUDGET = 56   # includes room for diagnosis and re-testing
@@ -1661,6 +1662,12 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
            "already know.")
     )
 
+    cut_off_replies = 0
+    CUT_OFF_TEXT = (
+        "Your last reply was cut off before it was complete, so none of its tool calls ran and nothing changed. "
+        "Send the work again in smaller pieces: one tool call per reply, and a large file in several edits."
+    )
+
     def build_messages():
         msgs = [system_msg, *([shared_msg] if shared_msg is not None else []), task_msg]
         if compacted:
@@ -1967,6 +1974,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                                round=label, reasks=reasks, problem=problem[:300])
         return fixed
 
+    rounds_used = max_rounds
     for round_num in range(max_rounds):
         check_active(reserve=MODEL_TIME_RESERVE)
         label = round_base + round_num + 1
@@ -2024,6 +2032,17 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 continue
             history["rounds_done"] = label
             return finish(response_text, (), label), edited_paths, total_tokens, round_num + 1, False
+
+        if last_truncated or recovery.stopped_early(response):
+            # The last call is half written, yet it can still parse: none of them run.
+            cut_off_replies += 1
+            names = ", ".join(str(call.get("name") or "?") for call in response.tool_calls)
+            _publish_agent_log(request_name, "cut_off_reply", round=label, attempt=cut_off_replies, tools=names)
+            if cut_off_replies > MAX_CUT_OFF_REPLIES:
+                rounds_used = round_num + 1
+                break
+            _queue_followup(history, response_text.strip(), CUT_OFF_TEXT)
+            continue
 
         round_entry = {"number": label, "ai": response, "tools": [], "summary": []}
         round_had_write = False
@@ -2241,9 +2260,9 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     if stop_when is not None:
         # A turn that ends on a tool call (investigation's submit_plan) has no report to ask
         # for: its caller decides what the time-up message says.
-        history["rounds_done"] = round_base + max_rounds
+        history["rounds_done"] = round_base + rounds_used
         total_tokens += _SIDE_TOKENS.pop(request_name, 0)
-        return "", edited_paths, total_tokens, max_rounds, True
+        return "", edited_paths, total_tokens, rounds_used, True
 
     # Tool calls are forbidden on this call. Without saying so, a model that still
     # wants to work writes its next tool calls as prose instead of a report.
@@ -2256,14 +2275,14 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     final_messages = maybe_trim(extra=(final_notice,), with_tools=final_tools_bound, output_tokens=final_cap.value)
     final_context_chars = sum(message_chars(m) for m in final_messages)
     if progress is not None:
-        progress["calls"] = max_rounds + 1
-    checkpoint.update(tool_rounds_used=(state or {}).get("tool_rounds_used", 0) + max_rounds + 1)
-    final_label = round_base + max_rounds + 1
+        progress["calls"] = rounds_used + 1
+    checkpoint.update(tool_rounds_used=(state or {}).get("tool_rounds_used", 0) + rounds_used + 1)
+    final_label = round_base + rounds_used + 1
     final = invoke_growing(llm_final, final_messages, final_cap, final_label,
                            estimate_messages(final_messages, schemas if final_tools_bound else ()), final_context_chars)
     history["rounds_done"] = final_label
     text = finish(_llm_response_text(final), (final_notice,), final_label)
-    return text, edited_paths, total_tokens, max_rounds + 1, True
+    return text, edited_paths, total_tokens, rounds_used + 1, True
 
 
 # Agent turn helper

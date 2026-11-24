@@ -89,6 +89,12 @@ def hit_output_limit(reply, max_tokens: int | None = None) -> bool:
     return str(metadata.get("status") or "").lower() == "incomplete"
 
 
+def stopped_early(reply) -> bool:
+    """Whether Claude ended ``reply`` partway for a reason more output room cannot clear."""
+    metadata = getattr(reply, "response_metadata", None) or {}
+    return metadata.get("stop_reason") in ("refusal", "model_context_window_exceeded")
+
+
 def truncated_usage(exc, raw) -> tuple[int, object]:
     """``(reasoning_tokens, chargeable)`` for a call that ran out of output.
 
