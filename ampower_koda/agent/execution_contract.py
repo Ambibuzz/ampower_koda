@@ -225,7 +225,9 @@ def review_decision(payload, criteria: list[str]) -> tuple[str, str]:
         return "pass", json.dumps({**payload, "review_passed": True,
                                    "advisory": "Only P2/P3 findings remain; recorded, not blocking."},
                                   ensure_ascii=True)
-    if "unmet" in statuses and issues:
+    # A P0/P1 finding may concern a regression or a wrong test rather than a criterion.
+    blocking = any(issue.startswith(tuple(f"[{severity}]" for severity in BLOCKING_SEVERITIES)) for issue in issues)
+    if blocking or (issues and "unmet" in statuses):
         return "repair", json.dumps(payload, ensure_ascii=True)
     return "invalid", invalid
 
