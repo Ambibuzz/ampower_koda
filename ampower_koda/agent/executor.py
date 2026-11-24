@@ -365,7 +365,7 @@ def _get_doc_config(request_name: str) -> dict:
         # retried or replayed without passing back through start_agent.
         "target_app_name": validate_target_app(doc.target_app_name),
         "ai_provider": provider,
-        "ai_model": (doc.ai_model or settings.default_ai_model or "gpt-4o-mini").strip(),
+        "ai_model": (doc.ai_model or settings.default_ai_model or "gpt-6-luna").strip(),
         "github_repo_url": (doc.github_repo_url or "").strip(),
         "github_token": (doc.get_password("github_token") or "").strip(),
         "base_branch": (doc.base_branch or "main").strip(),
