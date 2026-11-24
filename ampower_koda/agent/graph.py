@@ -76,6 +76,9 @@ REVIEW_COST_PRESSURE_ATTEMPT = 4
 # Retain review reads/deltas across repairs, then refresh from current source so
 # an indefinitely recoverable run cannot accumulate an indefinitely large tail.
 REVIEW_HISTORY_RECHECKS = 4
+# Reviews of one run. Each is at most two graph steps (implement, review), so with "prepare" a run
+# stays below the executor's recursion limit of 100, which would end it as Failed.
+MAX_REVIEW_PASSES = 45
 MAX_REVIEW_RECHECKS = 2           # source changed while being reviewed; take a fresh bounded snapshot
 MAX_PLAN_AMENDMENTS = 2           # blocked-implementation plan patches per run
 MAX_PLAN_AMENDMENTS_HARD = 6      # even a run that keeps finding new blockers stops here
@@ -2646,7 +2649,7 @@ def prepare_execution_node(state: dict) -> dict:
             "copied_files": {}, "called_methods": [], "test_repair_rounds": 0,
             "plan_scope_repairs": scope_repairs,
             "task_completion": {}, "turn_exhausted": False,
-            "review_attempts": 0, "review_notes": "", "review_passed": False,
+            "review_attempts": 0, "review_notes": "", "review_passed": False, "review_passes": 0,
             "review_fingerprint": "", "review_fingerprints_seen": [],
             "review_failure_fingerprints_seen": [],
             "repair_strategy_level": 0, "review_format_retries": 0,
@@ -3523,6 +3526,10 @@ def review_node(state: dict) -> dict:
             attempts=attempt,
             action="continue repair with compact evidence",
         )
+    passes = int(state.get("review_passes") or 0) + 1
+    updates["review_passes"] = passes
+    if passes >= MAX_REVIEW_PASSES and not passed and not halted():
+        updates["review_stopped"] = f"The work did not pass {passes} reviews: {notes[:2000]}"
     results = list(state.get("task_results") or [])
     result = {
         "task_id": active["id"], "status": "passed" if passed else "failed",

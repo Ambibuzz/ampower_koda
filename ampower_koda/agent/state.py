@@ -73,6 +73,7 @@ class AgentState(TypedDict, total=False):
     review_fingerprint: str  # changed-file state at the last failed review; unchanged = no progress
     review_fingerprints_seen: list[str]  # detects A→B→A repair oscillation before the hard valve
     review_failure_fingerprints_seen: list[str]  # repeated deterministic check failure despite unrelated edits
+    review_passes: int  # reviews run; bounded below the graph's recursion limit
     review_repairable: bool  # failed review is owned by implementation; resume there instead of re-reviewing
     review_retry_requested: bool  # review snapshot/provider state changed; retry review rather than edit source
     review_rechecks: int  # bounded review-only retries that do not consume implementation repair attempts
