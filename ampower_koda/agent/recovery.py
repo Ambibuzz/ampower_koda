@@ -115,12 +115,66 @@ def truncated_usage(exc, raw) -> tuple[int, object]:
 _CAP_WORDS = re.compile(r"max_(?:completion_|output_)?tokens", re.IGNORECASE)
 
 
+_NUMBER = r"(\d[\d,]*)"
+#: How providers word the largest output they accept.
+_STATED_LIMITS = [re.compile(pattern, re.IGNORECASE) for pattern in (
+    rf"> {_NUMBER}, which is the maximum",
+    rf"(?:<=|at most|less than or equal to|no more than|up to|limit of) {_NUMBER}",
+    rf"between \d+ and {_NUMBER}",
+    rf"\[\s*\d+\s*,\s*{_NUMBER}\s*\]",
+)]
+#: The same, worded as the first value that is too large.
+_STATED_BOUND = re.compile(rf"to {_NUMBER} \(exclusive\)", re.IGNORECASE)
+#: A cap that does not fit beside the prompt: prompt and window, or window and prompt plus cap.
+_PROMPT_THEN_WINDOW = re.compile(rf"{_NUMBER} \+ [\d,]+ > {_NUMBER}")
+_WINDOW_LESS_PROMPT = re.compile(rf"> {_NUMBER} - {_NUMBER}")
+_WINDOW_THEN_TOTAL = re.compile(rf"context length is {_NUMBER} tokens.{{0,40}}?requested (?:about )?{_NUMBER}",
+                                re.IGNORECASE)
+
+
 def rejected_cap(exc) -> bool:
     """Whether a provider 400 says the output cap we sent is too large."""
     status = getattr(exc, "status_code", None)
     if status not in (400, 422):
         return False
-    return bool(_CAP_WORDS.search(str(getattr(exc, "message", None) or exc)))
+    text = str(getattr(exc, "message", None) or exc)
+    # The second wording names no cap field.
+    return bool(_CAP_WORDS.search(text) or _WINDOW_THEN_TOTAL.search(text))
+
+
+def stated_cap_limit(exc, sent: int) -> int:
+    """The output room the rejection states, or 0: the model's maximum, else what the prompt leaves.
+
+    Only wordings known to state it are read. Any other number in the text can be the prompt's
+    size or part of a model id.
+    """
+    text = str(getattr(exc, "message", None) or exc).replace("`", "")
+
+    def whole(number: str) -> int:
+        return int(number.replace(",", ""))
+
+    limits = [whole(number) for pattern in _STATED_LIMITS for number in pattern.findall(text)]
+    limits += [whole(bound) - 1 for bound in _STATED_BOUND.findall(text)]
+    limits += [whole(window) - whole(prompt) for prompt, window in _PROMPT_THEN_WINDOW.findall(text)]
+    limits += [whole(window) - whole(prompt) for window, prompt in _WINDOW_LESS_PROMPT.findall(text)]
+    limits += [whole(window) - (whole(total) - sent) for window, total in _WINDOW_THEN_TOTAL.findall(text)]
+    return max((limit for limit in limits if MIN_OUTPUT_TOKENS <= limit < sent), default=0)
+
+
+def _bad_request_errors() -> tuple:
+    """The provider SDKs' 400 classes that are installed."""
+    errors = []
+    try:
+        from openai import BadRequestError as OpenAIBadRequest
+        errors.append(OpenAIBadRequest)
+    except ImportError:  # pragma: no cover - provider SDK absent
+        pass
+    try:
+        from anthropic import BadRequestError as AnthropicBadRequest
+        errors.append(AnthropicBadRequest)
+    except ImportError:  # pragma: no cover - provider SDK absent
+        pass
+    return tuple(errors)
 
 
 @dataclass
@@ -142,14 +196,15 @@ def invoke_growing(call: Callable[[int], object], cap: OutputCap, *,
     Truncated attempts other than the reply go to ``Outcome.wasted``; the caller charges each once.
     ``raw_of(reply)`` picks the chat message out of a structured
     output envelope; ``on_retry(previous_cap, new_cap, reasoning_tokens)``
-    lets the caller log what happened. When the provider rejects a grown cap as too
-    large, the ceiling drops to the last accepted value and the call is sent
-    once more at that value; whatever comes back is final.
+    lets the caller log what happened. When the provider rejects a cap as too
+    large, the ceiling drops to the limit the rejection states, or else to the
+    last accepted value, and the call is sent again at that value.
     """
     try:
-        from openai import BadRequestError, LengthFinishReasonError
+        from openai import LengthFinishReasonError
     except ImportError:  # pragma: no cover - provider SDK absent
-        BadRequestError = LengthFinishReasonError = ()  # type: ignore[assignment]
+        LengthFinishReasonError = ()  # type: ignore[assignment]
+    bad_request_errors = _bad_request_errors()
 
     wasted: list = []
     accepted: int | None = None
@@ -167,14 +222,17 @@ def invoke_growing(call: Callable[[int], object], cap: OutputCap, *,
         except LengthFinishReasonError as exc:
             accepted = sent
             reasoning, chargeable = truncated_usage(exc, None)
-        except BadRequestError as exc:
-            # Only a grown cap can be lowered; a rejection at an accepted cap would loop forever.
-            if accepted is None or sent <= accepted or not rejected_cap(exc):
+        except bad_request_errors as exc:
+            if not rejected_cap(exc):
                 raise
-            # The grown cap is above what this model accepts. Go back to the
-            # last accepted value, which is now the true ceiling, and finish
-            # with one more call there.
-            cap.lower_ceiling(accepted)
+            # Every retry sends a strictly smaller cap than the one rejected, so this ends.
+            limit = stated_cap_limit(exc, sent)
+            if accepted is not None and accepted < sent:
+                # A cap this model took is never too large, whatever other number the text holds.
+                limit = max(limit, accepted)
+            if not limit:
+                raise
+            cap.lower_ceiling(limit)
             if before_retry:
                 before_retry()
             continue
