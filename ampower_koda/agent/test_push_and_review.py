@@ -285,6 +285,21 @@ class TestRunnerSummary(PatchedTestCase):
         passed, _ = self.run_tests(f"print('KODA_TEST_SUMMARY {forged}', flush=True); os._exit(0)")
         self.assertFalse(passed)
 
+    def test_result_file_written_by_a_test_is_not_trusted(self):
+        forged = json.dumps({"total": 1, "tests": ["x"], "failed": [], "skipped": [], "passed": 1})
+        # setUp leaves no live site, so nothing contains this write.
+        passed, _ = self.run_tests(
+            "holder = os.path.dirname(os.path.dirname(os.environ['TMPDIR'])); "
+            "names = {'summary.json', *os.listdir(holder)}; "
+            f"[open(os.path.join(holder, name), 'w').write({forged!r}) for name in names if name.endswith('.json')]; "
+            "os._exit(0)")
+        self.assertFalse(passed)
+
+    def test_tests_are_not_told_the_result_folder(self):
+        hints = "{'KODA_CALL_SCRATCH', 'KODA_TEST_SUMMARY_PATH'}"
+        passed, receipts = self.run_tests(f"self.assertFalse({hints} & set(os.environ))")
+        self.assertTrue(passed, receipts)
+
     def test_summary_does_not_depend_on_how_much_is_printed(self):
         passed, receipts = self.run_tests("print('x' * 2_000_000)")
         self.assertTrue(passed, receipts)
