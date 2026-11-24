@@ -73,6 +73,7 @@ from ampower_koda.agent.core import (
 from ampower_koda.agent.core.constants import DEFAULT_ARCHITECT_MODEL
 from ampower_koda.agent.git_ops import get_repo_root, run_git, worktree_signature
 from ampower_koda.agent.core.contracts.escalation import SideUsage
+from ampower_koda.agent.core.elide.compact import SUMMARY_HEADER
 from ampower_koda.agent.core.contracts.model import Completion
 from ampower_koda.agent.core.retrieval.excerpts import excerpt
 from ampower_koda.agent.core.retrieval.query import plain_query
@@ -206,7 +207,7 @@ class LangChainChatModel:
             for marker in (request.plan.previous_marker, request.plan.marker):
                 if marker is not None:
                     markers[marker.index] = marker.ttl
-        messages.extend(_replay(request.transcript, markers))
+        messages.extend(_replay(request.transcript, markers, self.provider))
         return native_cache_messages(messages, self.provider)
 
     def _system(self, request: ModelRequest):
@@ -291,9 +292,7 @@ class LangChainChatModel:
             calls=calls,
             usage=usage,
             stopped_at_limit=recovery.hit_output_limit(reply),
-            provider_context_json=(json.dumps({key: reply.additional_kwargs[key]
-                for key in ('reasoning_details', 'reasoning') if key in getattr(reply, 'additional_kwargs', {})})
-                if any(key in getattr(reply, 'additional_kwargs', {}) for key in ('reasoning_details', 'reasoning')) else ''),
+            provider_context_json=_provider_context_json(reply),
         )
 
     def _failed(self, detail: str, error: Exception) -> ModelTurn:
@@ -327,7 +326,57 @@ class LangChainChatModel:
                 )
 
 
-def _replay(transcript, markers=None) -> list:
+#: Reasoning that OpenRouter and OpenAI return beside the message, replayed unchanged.
+REASONING_KWARGS = ("reasoning_details", "reasoning")
+#: Claude returns its reasoning as content blocks of these types, signed; they go back unchanged.
+THINKING_BLOCK_TYPES = ("thinking", "redacted_thinking")
+THINKING_BLOCK_KEYS = ("type", "thinking", "signature", "data")
+#: Where the Claude blocks travel inside ``provider_context_json``.
+THINKING_BLOCKS_KEY = "thinking_blocks"
+
+
+def _provider_context_json(reply) -> str:
+    """The reply's provider reasoning as JSON, for the round's replay; "" when it has none."""
+    extra = getattr(reply, "additional_kwargs", None) or {}
+    context = {key: extra[key] for key in REASONING_KWARGS if key in extra}
+    thinking_blocks = _thinking_blocks(reply)
+    if thinking_blocks:
+        context[THINKING_BLOCKS_KEY] = thinking_blocks
+    return json.dumps(context) if context else ""
+
+
+def _thinking_blocks(reply) -> list[dict]:
+    """Claude's thinking blocks in the reply, without streaming bookkeeping such as ``index``."""
+    content = getattr(reply, "content", None)
+    if not isinstance(content, list):
+        return []
+    blocks = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") in THINKING_BLOCK_TYPES:
+            blocks.append({key: part[key] for key in THINKING_BLOCK_KEYS if key in part})
+    return blocks
+
+
+def _round_text(transcript, index: int) -> str:
+    """The text the model wrote in the same reply as the tool call at ``index``; "" when none."""
+    if index == 0:
+        return ""
+    previous = transcript.blocks[index - 1]
+    if previous.role != "assistant" or not previous.is_prose:
+        return ""
+    if previous.text.startswith(SUMMARY_HEADER) or not previous.text.strip():
+        return ""
+    return previous.text
+
+
+def _text_parts(content) -> list:
+    """A message's content as content blocks, with any cache marker it already carries."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return list(content)
+
+
+def _replay(transcript, markers=None, provider="") -> list:
     """The transcript as LangChain messages, pairs kept together.
 
     A ``tool_use`` block becomes an ``AIMessage`` carrying one tool call, and its
@@ -353,7 +402,14 @@ def _replay(transcript, markers=None) -> list:
                 call_blocks = [calls_by_id[i] for i in block.parallel_call_ids]
                 grouped.update(block.parallel_call_ids)
                 provider_context = json.loads(block.provider_context_json)
-            messages.append(AIMessage(content='', tool_calls=[{
+            # Claude expects its thinking blocks first in the assistant turn, before the tool calls.
+            thinking_blocks = provider_context.pop(THINKING_BLOCKS_KEY, [])
+            content = thinking_blocks or ''
+            if thinking_blocks and provider == "Claude" and _round_text(transcript, index):
+                # One reply is one message: its text goes between its thinking and its tool calls.
+                text_message = messages.pop()
+                content = [*thinking_blocks, *_text_parts(text_message.content)]
+            messages.append(AIMessage(content=content, tool_calls=[{
                 'name': call.tool, 'args': _arguments(call), 'id': call.call_id,
             } for call in call_blocks], additional_kwargs=provider_context))
         elif block.is_result:
