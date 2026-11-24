@@ -135,10 +135,12 @@ def is_older_entry(name: str, entry: dict | None) -> bool:
 
 
 def refuse_older_model(provider: str, model: str) -> None:
-    """Stop a save that selects an older model."""
+    """Stop a save that selects a model Koda does not support."""
     if model and is_older_model(provider or "OpenAI", model):
-        frappe.throw(frappe._("{0} is an older model and can no longer be selected. Choose a current model.").format(
-            frappe.bold(frappe.utils.escape_html(model))))
+        frappe.throw(frappe._(
+            "{0} cannot be selected. Koda supports only reasoning models: "
+            "for Claude, 4.6 or newer; for Gemini, 3 or newer."
+        ).format(frappe.bold(frappe.utils.escape_html(model))))
 
 
 def _gemini_on_openrouter(name: str) -> dict | None:
