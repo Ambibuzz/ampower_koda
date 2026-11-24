@@ -41,6 +41,12 @@ from ampower_koda.agent.git_ops import (
 
 DOCTYPE_NAME = "Agent Request"
 
+# Statuses where the agent is actively working, so manual actions must wait.
+BUSY_STATUSES = (
+    "Understanding", "Planning", "Implementing",
+    "Reviewing", "Building", "Pushing",
+)
+
 
 #: Files under .koda/ that are the team's configuration, not Koda's generated state.
 _KODA_CONFIG_FILES = {"config.toml", "verification.json", "verification.md"}
@@ -84,6 +90,46 @@ def _uncommitted_paths(repo_root: str) -> list[str]:
             continue
         paths.append(path)
     return paths
+
+
+def other_busy_requests(app_name: str, request_name: str) -> list[str]:
+    """Other requests now working in this app's checkout."""
+    return frappe.get_all(DOCTYPE_NAME, pluck="name", filters={
+        "target_app_name": app_name,
+        "status": ["in", BUSY_STATUSES],
+        "name": ["!=", request_name],
+    })
+
+
+def other_work_problem(app_name: str, branch_name: str, request_name: str) -> str:
+    """Why the checkout must not move to ``branch_name`` now, or "" when it may.
+
+    A request running in the checkout would go on writing on the wrong branch. Git carries
+    uncommitted changes along to the branch it checks out, so another branch's work would be
+    committed with this request's.
+    """
+    current = get_current_branch(app_name)
+    if not branch_name or current == branch_name:
+        return ""
+    busy_requests = other_busy_requests(app_name, request_name)
+    if busy_requests:
+        return (
+            f"{', '.join(busy_requests)} is still running in the '{app_name}' checkout, which would have to move "
+            f"from branch '{current or '(unknown)'}' to this request's branch '{branch_name}'. Wait for it to "
+            "finish or cancel it, then try again. Nothing was changed."
+        )
+    dirty = _uncommitted_paths(get_repo_root(app_name))
+    if not dirty:
+        return ""
+    shown = "\n".join(f"  - {path}" for path in dirty[:10])
+    if len(dirty) > 10:
+        shown += f"\n  (and {len(dirty) - 10} more)"
+    return (
+        f"The '{app_name}' checkout is on branch '{current or '(unknown)'}' with uncommitted changes that belong "
+        f"to other work, not to this request's branch '{branch_name}':\n{shown}\n\n"
+        "Commit or stash them there, then try again. If they are this request's own, check out "
+        f"'{branch_name}' first. Nothing was changed."
+    )
 
 
 def bench_branch_refusal(app_name: str, branch_name: str, allowed=()) -> str:
@@ -502,12 +548,13 @@ def restore_execution_state(doc, plan_object: dict, app_name: str) -> dict:
 
 @managed_job
 def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_up: int = 0,
-                        resume: int = 0) -> None:
+                        resume: int = 0, previous_status: str = "Failed") -> None:
     """Create/reuse the working branch, run implement + review, then await bench approval.
 
     When preserve_branch is set, reuse the request's existing branch for a follow-up
     patch instead of creating a fresh one. is_follow_up enables patch-only mode
-    without replacing the approved plan.
+    without replacing the approved plan. previous_status is where a follow-up that
+    could not start leaves the request.
     """
     frappe.set_user("Administrator")
     try:
@@ -553,6 +600,11 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
             repo_root = get_repo_root(app_name)
             current = get_current_branch(app_name)
             if current != branch_name:
+                problem = other_work_problem(app_name, branch_name, request_name)
+                if problem:
+                    _update_status(request_name, user, previous_status,
+                        f"The follow-up was not started. {problem}", error_log=problem)
+                    return
                 ok, msg = run_git(["checkout", branch_name], cwd=repo_root)
                 if not ok:
                     _update_status(request_name, user, "Failed",
@@ -1276,6 +1328,11 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
         current = get_current_branch(app_name)
         if current != branch_name:
             repo_root = get_repo_root(app_name)
+            problem = other_work_problem(app_name, branch_name, request_name)
+            if problem:
+                _update_status(request_name, user, "Awaiting Push Approval",
+                    f"Nothing was pushed. {problem}", error_log=problem)
+                return
             ok, out = run_git(["checkout", branch_name], cwd=repo_root)
             if not ok:
                 _update_status(request_name, user, "Awaiting Push Approval",

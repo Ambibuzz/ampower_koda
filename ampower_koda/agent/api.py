@@ -14,12 +14,15 @@ from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.execution_contract import load_plan
 from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdown
 from ampower_koda.agent.executor import (
+    BUSY_STATUSES,
     _generate_patch_diff,
     _is_request_branch,
     _uncommitted_paths,
     _update_status,
     bench_branch_refusal,
     normalize_bench_selection,
+    other_busy_requests,
+    other_work_problem,
     restore_execution_state,
     validate_target_app,
 )
@@ -53,12 +56,6 @@ RESTARTABLE_STATUSES = (
 # Statuses from which the saved structured plan may be edited or (re)executed.
 PLAN_EXECUTABLE_STATUSES = (
     "Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval",
-)
-
-# Statuses where the agent is actively working, so manual actions must wait.
-BUSY_STATUSES = (
-    "Understanding", "Planning", "Implementing",
-    "Reviewing", "Building", "Pushing",
 )
 
 # Cap on the request's bench log. Matches the field's own 50k truncation, named
@@ -228,6 +225,7 @@ def submit_follow_up(request_name: str, follow_up_message: str):
     except PlanValidationError as exc:
         frappe.throw(str(exc))
     _validate_provider_key(doc)
+    _refuse_other_work(doc)
 
     follow_up = (follow_up_message or "").strip()
     follow_up_count = int(doc.follow_up_count or 0) + 1
@@ -252,8 +250,57 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         request_name=request_name,
         preserve_branch=1,
         is_follow_up=1,
+        previous_status=doc.status,
     )
     return {"status": "ok", "message": _("Follow-up patch started on existing branch (plan preserved).")}
+
+
+def _refuse_other_work(doc) -> None:
+    """Stop before queueing a job that would move the checkout from under another request or another
+    branch's uncommitted work."""
+    for busy_request in other_busy_requests(doc.target_app_name, doc.name):
+        _reconcile_if_dead(frappe.get_doc(DOCTYPE_NAME, busy_request))
+    try:
+        problem = other_work_problem(doc.target_app_name, (doc.branch_name or "").strip(), doc.name)
+    except (RuntimeError, OSError) as exc:
+        log_agent_error("Agent API: working tree check", frappe.get_traceback())
+        frappe.throw(_("Could not check the working tree of {0}: {1}").format(doc.target_app_name, exc))
+    if problem:
+        frappe.throw(
+            '<div style="white-space: pre-wrap">' + frappe.utils.escape_html(problem) + "</div>",
+            title=_("The checkout is in use by other work"),
+        )
+
+
+def _start_push(doc, push_branch: int, create_pr: int) -> dict:
+    """Queue the commit, push and pull request of a request whose caller has checked that it may push."""
+    push_branch = int(push_branch or 0)
+    create_pr = int(create_pr or 0)
+    if not push_branch and not create_pr:
+        frappe.throw(_("Select at least one action (push branch or create PR)."))
+
+    _refuse_other_work(doc)
+    # A failed push or PR leaves its error while the push awaits approval again.
+    frappe.db.set_value(DOCTYPE_NAME, doc.name, {"status": "Pushing", "error_log": ""})
+    frappe.db.commit()
+
+    enqueue_job(
+        "ampower_koda.agent.executor.run_deploy_phase",
+        queue="default",
+        timeout=600,
+        request_name=doc.name,
+        clear_checkpoint=True,
+        do_push=bool(push_branch),
+        do_pr=bool(create_pr),
+    )
+
+    if push_branch and create_pr:
+        msg = _("Committing, pushing, and creating PR...")
+    elif push_branch:
+        msg = _("Committing and pushing branch {0}...").format(doc.branch_name)
+    else:
+        msg = _("Committing and creating PR...")
+    return {"status": "ok", "message": msg}
 
 
 def _approve_structured_plan(doc, value=None):
@@ -636,31 +683,7 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     if doc.status != "Awaiting Push Approval":
         frappe.throw(_("Cannot push. Agent status is {0}.").format(doc.status))
 
-    push_branch = int(push_branch or 0)
-    create_pr = int(create_pr or 0)
-    if not push_branch and not create_pr:
-        frappe.throw(_("Select at least one action (push branch or create PR)."))
-
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
-    frappe.db.commit()
-
-    enqueue_job(
-        "ampower_koda.agent.executor.run_deploy_phase",
-        queue="default",
-        timeout=600,
-        request_name=request_name,
-        clear_checkpoint=True,
-        do_push=bool(push_branch),
-        do_pr=bool(create_pr),
-    )
-
-    if push_branch and create_pr:
-        msg = _("Pushing branch and creating PR...")
-    elif push_branch:
-        msg = _("Pushing branch {0}...").format(doc.branch_name)
-    else:
-        msg = _("Creating PR...")
-    return {"status": "ok", "message": msg}
+    return _start_push(doc, push_branch, create_pr)
 
 
 @frappe.whitelist()
@@ -1536,34 +1559,10 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
 
     _require_request_branch(doc)
 
-    push_branch = int(push_branch or 0)
-    create_pr = int(create_pr or 0)
-    if not push_branch and not create_pr:
-        frappe.throw(_("Select at least one action (push branch or create PR)."))
-
     if not _has_pushable_changes(doc):
         return {"status": "noop", "message": _("No changes to push.")}
 
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
-    frappe.db.commit()
-
-    enqueue_job(
-        "ampower_koda.agent.executor.run_deploy_phase",
-        queue="default",
-        timeout=600,
-        request_name=request_name,
-        clear_checkpoint=True,
-        do_push=bool(push_branch),
-        do_pr=bool(create_pr),
-    )
-
-    if push_branch and create_pr:
-        msg = _("Committing, pushing, and creating PR...")
-    elif push_branch:
-        msg = _("Committing and pushing branch {0}...").format(doc.branch_name)
-    else:
-        msg = _("Committing and creating PR...")
-    return {"status": "ok", "message": msg}
+    return _start_push(doc, push_branch, create_pr)
 
 
 @frappe.whitelist()
