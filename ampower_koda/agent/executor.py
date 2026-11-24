@@ -356,15 +356,15 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
         log_agent_error("Koda: progress notification failed", frappe.get_traceback())
 
 
-def _config_failed(request_name: str, title: str, error: Exception) -> None:
-    """Fail a job whose configuration could not load, through the normal status path.
+def _config_failed(request_name: str, title: str, error: Exception, status: str = "Failed") -> None:
+    """Stop a job whose configuration could not load, through the normal status path.
 
     Setting the fields without publishing left a request that was still Queued in
     an open form showing Queued until someone reloaded it.
     """
     log_agent_error(title, frappe.get_traceback())
     owner = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
-    _update_status(request_name, owner, "Failed", f"Configuration error: {error}", error_log=str(error))
+    _update_status(request_name, owner, status, f"Configuration error: {error}", error_log=str(error))
 
 
 # Phase 1: Planning (investigate + plan, or revise the plan from the user's feedback)
@@ -1261,7 +1261,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        _config_failed(request_name, "Agent Deploy Config Error", e)
+        _config_failed(request_name, "Agent Deploy Config Error", e, status="Awaiting Push Approval")
         return
 
     user = config["user"]
@@ -1278,7 +1278,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
             repo_root = get_repo_root(app_name)
             ok, out = run_git(["checkout", branch_name], cwd=repo_root)
             if not ok:
-                _update_status(request_name, user, "Failed",
+                _update_status(request_name, user, "Awaiting Push Approval",
                     f"Could not checkout branch '{branch_name}': {out}",
                     error_log=f"checkout failed: {out}")
                 return
@@ -1317,10 +1317,10 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                     pass
                 else:
                     status = "Completed" if existing_pr else "Awaiting Push Approval"
-                    _update_status(request_name, user, status, "No changes to push.")
+                    _update_status(request_name, user, status, "No changes to push.", error_log="")
                     return
             else:
-                _update_status(request_name, user, "Failed",
+                _update_status(request_name, user, "Awaiting Push Approval",
                     f"Failed to commit changes: {msg}",
                     error_log=f"commit_changes failed: {msg}")
                 return
@@ -1336,7 +1336,9 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                 config["github_repo_url"], config["github_token"],
             )
             if not ok:
-                _update_status(request_name, user, "Failed",
+                # The commit is kept, so the push can be retried once the
+                # token or remote is fixed: a "Failed" status would refuse it.
+                _update_status(request_name, user, "Awaiting Push Approval",
                     f"Push failed: {msg}", error_log=f"push_branch: {msg}")
                 return
 
@@ -1352,7 +1354,8 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                 config["base_branch"],
             )
             if not ok:
-                _update_status(request_name, user, "Failed",
+                # Retryable for the same reason as a failed push.
+                _update_status(request_name, user, "Awaiting Push Approval",
                     f"PR creation failed: {msg}", error_log=f"create_pull_request: {msg}")
                 return
 
@@ -1368,7 +1371,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
             summary_parts.append(f"{len(unshipped)} regression test(s) not committed because git ignores them: "
                                  f"{', '.join(unshipped[:5])}")
 
-        extra = {"branch_name": branch_name}
+        extra = {"branch_name": branch_name, "error_log": ""}
         if pr_url:
             extra["pr_url"] = pr_url
         if pr_number:
@@ -1383,7 +1386,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
     except Exception as e:
         tb = frappe.get_traceback()
         log_agent_error("Agent Deploy Error", tb)
-        _update_status(request_name, user, "Failed", str(e), error_log=tb)
+        _update_status(request_name, user, "Awaiting Push Approval", str(e), error_log=tb)
 
 
 # Helpers

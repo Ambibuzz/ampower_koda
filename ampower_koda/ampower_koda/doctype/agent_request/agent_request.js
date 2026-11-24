@@ -226,7 +226,8 @@ function render_status_dashboard(frm) {
     }
 
     var error_html = '';
-    if (status === 'Failed' && frm.doc.error_log) {
+    // A failed push or PR awaits its approval again with the error.
+    if (['Failed', 'Awaiting Push Approval'].indexOf(status) !== -1 && frm.doc.error_log) {
         var full_error = String(frm.doc.error_log || '');
         var err_preview = full_error.substring(0, 300) + (full_error.length > 300 ? '…' : '');
         error_html = '<div class="agent-error-preview">'
@@ -543,8 +544,11 @@ function toggle_config_readonly(frm) {
         'base_branch', 'branch_prefix', 'git_user_name', 'git_user_email',
         'ai_provider', 'ai_model', 'request_type', 'user_message', 'request_title'
     ];
+    // A push that failed on one of these can only be retried with the value corrected.
+    var push_fields = frm.doc.status === 'Awaiting Push Approval'
+        ? ['github_repo_url', 'github_token', 'base_branch', 'git_user_name', 'git_user_email'] : [];
     config_fields.forEach(function (f) {
-        frm.set_df_property(f, 'read_only', editable ? 0 : 1);
+        frm.set_df_property(f, 'read_only', editable || push_fields.indexOf(f) !== -1 ? 0 : 1);
     });
 }
 
@@ -983,24 +987,28 @@ function approve_push(frm) {
                 return;
             }
             d.hide();
-            frappe.call({
-                method: 'ampower_koda.agent.api.approve_push',
-                args: {
-                    request_name: frm.doc.name,
-                    push_branch: do_push ? 1 : 0,
-                    create_pr: do_pr ? 1 : 0
-                },
-                freeze: true,
-                freeze_message: __('Processing...'),
-                callback: function (r) {
-                    if (r.message && r.message.status === 'ok') {
-                        frappe.show_alert({
-                            message: r.message.message || __('Done'),
-                            indicator: 'green'
-                        });
-                        frm.reload_doc();
+            // The worker reads the saved row. A failed save also resolves, with the form still dirty.
+            (frm.is_dirty() ? frm.save() : Promise.resolve()).then(function () {
+                if (frm.is_dirty()) return;
+                frappe.call({
+                    method: 'ampower_koda.agent.api.approve_push',
+                    args: {
+                        request_name: frm.doc.name,
+                        push_branch: do_push ? 1 : 0,
+                        create_pr: do_pr ? 1 : 0
+                    },
+                    freeze: true,
+                    freeze_message: __('Processing...'),
+                    callback: function (r) {
+                        if (r.message && r.message.status === 'ok') {
+                            frappe.show_alert({
+                                message: r.message.message || __('Done'),
+                                indicator: 'green'
+                            });
+                            frm.reload_doc();
+                        }
                     }
-                }
+                });
             });
         }
     });

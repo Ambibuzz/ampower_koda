@@ -68,7 +68,7 @@ BENCH_LOG_MAX_CHARS = 50000
 
 
 def _reconcile_if_dead(doc) -> bool:
-    """Flip a busy request to Failed when its RQ job is no longer running.
+    """Flip a busy request to Failed, or a push to awaiting approval, when its RQ job is no longer running.
 
     A Queued request with a job counts too: a job lost before it started would
     otherwise leave the form polling a request that never starts.
@@ -94,7 +94,8 @@ def _reconcile_if_dead(doc) -> bool:
         return False
 
     _update_status(
-        doc.name, doc.owner or frappe.session.user, "Failed",
+        doc.name, doc.owner or frappe.session.user,
+        "Awaiting Push Approval" if doc.status == "Pushing" else "Failed",
         "Background job was terminated unexpectedly (worker likely killed by "
         "an OOM condition or a bench/service restart). Please retry.",
         error_log=(

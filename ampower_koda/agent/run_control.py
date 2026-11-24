@@ -84,6 +84,11 @@ def check_active(*, reserve: float = 0, max_age: float = 0) -> None:
         raise RunDeadline("Execution time slice exhausted. Resume Execution continues from the saved checkpoint.")
 
 
+def stopped_status(phase: str) -> str:
+    """Where a phase that could not finish leaves its request: a push can simply be approved again."""
+    return "Awaiting Push Approval" if phase == "run_deploy_phase" else "Failed"
+
+
 def _stop_at_job_limit(signum, frame):
     raise RunDeadline("Execution time slice exhausted during a model call. "
                       "Resume Execution continues from the saved checkpoint.")
@@ -133,12 +138,13 @@ def managed_job(fn):
                     message = str(exc) if current_run().journal else (
                         "Worker time budget reached. Retry this phase; "
                         "execution has not produced a resumable checkpoint.")
-                    set_request_value(request_name, {"status": "Failed", "error_log": message})
+                    status = stopped_status(fn.__name__)
+                    set_request_value(request_name, {"status": status, "error_log": message})
                     frappe.db.commit()
                     owner = frappe.db.get_value(DOCTYPE, request_name, "owner") or "Administrator"
                     check_active()
                     frappe.publish_realtime("agent_progress", {"request_name": request_name,
-                        "status": "Failed", "message": message}, user=owner)
+                        "status": status, "message": message}, user=owner)
                 except RunStopped:
                     pass
                 return
@@ -165,9 +171,10 @@ def enqueue_job(method: str, *, request_name: str, queue="default", timeout=WORK
         job = frappe.enqueue(method, queue=queue, timeout=timeout, job_id=run_id,
                              request_name=request_name, run_id=run_id, run_timeout=timeout, **kwargs)
     except Exception:
+        status = stopped_status(method.rpartition(".")[2])
         frappe.db.set_value(DOCTYPE, {"name": request_name, "agent_run_id": run_id,
                                      "status": ["!=", "Cancelled"]},
-                            {"status": "Failed", "error_log": "Could not enqueue the agent job. Retry the request."})
+                            {"status": status, "error_log": "Could not enqueue the agent job. Retry the request."})
         frappe.db.commit()
         raise
     job_id = getattr(job, "id", None)
