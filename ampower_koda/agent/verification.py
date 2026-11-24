@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -160,6 +161,7 @@ if SITE:
         print('KODA_RUNNER_ERROR could not contain the tests', flush=True)
         site_disconnect()
         sys.exit(3)
+os.environ.pop('KODA_CALL_SCRATCH', None)  # its folder holds the summary file
 def case_ids(group):
     for case in group:
         if isinstance(case, unittest.TestSuite): yield from case_ids(case)
@@ -1117,7 +1119,8 @@ def run_verification(app_name: str, contract: dict, *, env: dict | None = None,
                     with tempfile.TemporaryDirectory(prefix="koda-tests-", ignore_cleanup_errors=True) as holder:
                         holder = os.path.realpath(holder)
                         # Beside the scratch directory, not in it, so a contained test's writes cannot reach it.
-                        summary_path = os.path.join(holder, "summary.json")
+                        # Without a site nothing is contained: the name is random so a test cannot guess it.
+                        summary_path = os.path.join(holder, f"summary-{secrets.token_hex(16)}.json")
                         scratch = os.path.join(holder, "scratch")
                         temporary = os.path.join(scratch, "tmp")
                         os.makedirs(temporary)
