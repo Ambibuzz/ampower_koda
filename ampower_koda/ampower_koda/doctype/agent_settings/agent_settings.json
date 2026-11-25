@@ -69,8 +69,8 @@
             "fieldname": "default_ai_model",
             "fieldtype": "Autocomplete",
             "label": "AI Model",
-            "default": "gpt-4o-mini",
-            "options": "gpt-4o-mini\ngpt-5-mini\ngpt-5.1-codex-mini\ngpt-5-codex\ngpt-5.1-codex\ngpt-5.2-codex\ngemini-2.0-flash\ngemini-2.5-pro\nclaude-sonnet-4-20250514\nclaude-3-5-sonnet-20241022\nclaude-3-5-haiku-20241022\ndeepseek/deepseek-v4-flash-0731\ndeepseek/deepseek-chat\nanthropic/claude-sonnet-4\nopenai/gpt-4o-mini\nqwen/qwen-2.5-coder-32b-instruct",
+            "default": "gpt-6-luna",
+            "options": "gpt-6-luna\ngpt-6.1-terra\ngpt-6.2-sol\ngpt-6.2-astra\ngemini-3.8-flash\ngemini-3.6-flash\ngemini-3.5-flash-lite\nclaude-opus-5-5\nclaude-sonnet-5-5\nclaude-haiku-5-5\ndeepseek/deepseek-v4-flash-0731\ndeepseek/deepseek-v4.1-flash\nanthropic/claude-sonnet-5.5\nopenai/gpt-6-luna",
             "description": "Default model for new requests. Changes with provider selection."
         },
         {
@@ -79,7 +79,7 @@
             "label": "Reasoning Effort",
             "options": "low\nmedium\nhigh\nxhigh\nmax",
             "default": "high",
-            "description": "Reasoning effort for the agent's main work: planning, coding and repair. Applies to reasoning models on OpenAI and OpenRouter; if a model does not support the chosen level, its nearest supported level is used. Gemini and Claude use their provider defaults."
+            "description": "Reasoning effort for the agent's main work: planning, coding and repair. Applies to reasoning models on OpenAI and OpenRouter, and to Claude models that take effort levels; if a model does not support the chosen level, its nearest supported level is used. Older Claude models run without thinking, and Gemini uses its provider default. Two helpers, the one that condenses long file reads and the one that checks code changes as they are written, always run at low."
         },
         {
             "fieldname": "review_reasoning_effort",
@@ -153,7 +153,7 @@
             "fieldname": "openrouter_api_key",
             "fieldtype": "Password",
             "label": "OpenRouter API Key",
-            "description": "API key from openrouter.ai. Models are namespaced, e.g. deepseek/deepseek-chat.",
+            "description": "API key from openrouter.ai. Models are namespaced, e.g. deepseek/deepseek-v4-flash-0731.",
             "mandatory_depends_on": "eval:doc.default_ai_provider === 'OpenRouter'"
         },
         {

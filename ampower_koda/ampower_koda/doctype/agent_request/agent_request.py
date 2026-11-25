@@ -5,6 +5,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 
+from ampower_koda.agent import reasoning_catalog
 from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.execution_contract import load_plan
 from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdown
@@ -30,7 +31,7 @@ class AgentRequest(Document):
             if not self.ai_provider:
                 self.ai_provider = settings.default_ai_provider or "OpenAI"
             if not self.ai_model:
-                self.ai_model = settings.default_ai_model or "gpt-4o-mini"
+                self.ai_model = settings.default_ai_model or "gpt-6-luna"
         except Exception:
             log_agent_error(
                 "Agent Request: defaults from settings",
@@ -39,6 +40,9 @@ class AgentRequest(Document):
 
     def validate(self):
         self._normalize_json_fields()
+        # Only when it is chosen: a saved request keeps the model it was run with.
+        if self.is_new() or self.has_value_changed("ai_model") or self.has_value_changed("ai_provider"):
+            reasoning_catalog.refuse_older_model(self.ai_provider, self.ai_model)
         if self.get("plan_json"):
             try:
                 plan = load_plan(self.plan_json)

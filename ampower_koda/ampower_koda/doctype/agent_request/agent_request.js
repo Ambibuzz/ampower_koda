@@ -3,35 +3,33 @@
 
 var PROVIDER_MODELS = {
     'OpenAI': [
-        { value: 'gpt-4o-mini', label: 'GPT-4o Mini: fast, cost-effective' },
-        { value: 'gpt-5-mini', label: 'GPT-5 Mini: next-gen, efficient' },
-        { value: 'gpt-5.1-codex-mini', label: 'GPT-5.1 Codex Mini: compact coding' },
-        { value: 'gpt-5-codex', label: 'GPT-5 Codex: coding model' },
-        { value: 'gpt-5.1-codex', label: 'GPT-5.1 Codex: coding model' },
-        { value: 'gpt-5.2-codex', label: 'GPT-5.2 Codex: latest coding model' }
+        { value: 'gpt-6-luna', label: 'GPT-6 Luna: fast, cost-effective' },
+        { value: 'gpt-6.1-terra', label: 'GPT-6.1 Terra: efficient' },
+        { value: 'gpt-6.2-sol', label: 'GPT-6.2 Sol: everyday coding' },
+        { value: 'gpt-6.2-astra', label: 'GPT-6.2 Astra: most capable' }
     ],
     'Gemini': [
-        { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash: fast, multimodal' },
-        { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro: most capable' }
+        { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash: most capable Flash' },
+        { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash: balanced' },
+        { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite: fast, light' }
     ],
     'Claude': [
-        { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4: balanced' },
-        { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet: proven' },
-        { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku: fast, light' }
+        { value: 'claude-opus-5-5', label: 'Claude Opus 5.5: most capable' },
+        { value: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5: balanced' },
+        { value: 'claude-haiku-5-5', label: 'Claude Haiku 5.5: fast, light' }
     ],
     'OpenRouter': [
         { value: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash: fast, cheap' },
-        { value: 'deepseek/deepseek-chat', label: 'DeepSeek Chat: general' },
-        { value: 'anthropic/claude-sonnet-4', label: 'Claude Sonnet 4: via OpenRouter' },
-        { value: 'openai/gpt-4o-mini', label: 'GPT-4o Mini: via OpenRouter' },
-        { value: 'qwen/qwen-2.5-coder-32b-instruct', label: 'Qwen 2.5 Coder 32B: coding' }
+        { value: 'deepseek/deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash: newer Flash' },
+        { value: 'anthropic/claude-sonnet-5.5', label: 'Claude Sonnet 5.5: via OpenRouter' },
+        { value: 'openai/gpt-6-luna', label: 'GPT-6 Luna: via OpenRouter' }
     ]
 };
 
 var DEFAULT_MODELS = {
-    'OpenAI': 'gpt-4o-mini',
-    'Gemini': 'gemini-2.0-flash',
-    'Claude': 'claude-sonnet-4-20250514',
+    'OpenAI': 'gpt-6-luna',
+    'Gemini': 'gemini-3.8-flash',
+    'Claude': 'claude-sonnet-5-5',
     'OpenRouter': 'deepseek/deepseek-v4-flash-0731'
 };
 
@@ -226,7 +224,8 @@ function render_status_dashboard(frm) {
     }
 
     var error_html = '';
-    if (status === 'Failed' && frm.doc.error_log) {
+    // A failed push or PR awaits its approval again with the error.
+    if (['Failed', 'Awaiting Push Approval'].indexOf(status) !== -1 && frm.doc.error_log) {
         var full_error = String(frm.doc.error_log || '');
         var err_preview = full_error.substring(0, 300) + (full_error.length > 300 ? '…' : '');
         error_html = '<div class="agent-error-preview">'
@@ -543,8 +542,11 @@ function toggle_config_readonly(frm) {
         'base_branch', 'branch_prefix', 'git_user_name', 'git_user_email',
         'ai_provider', 'ai_model', 'request_type', 'user_message', 'request_title'
     ];
+    // A push that failed on one of these can only be retried with the value corrected.
+    var push_fields = frm.doc.status === 'Awaiting Push Approval'
+        ? ['github_repo_url', 'github_token', 'base_branch', 'git_user_name', 'git_user_email'] : [];
     config_fields.forEach(function (f) {
-        frm.set_df_property(f, 'read_only', editable ? 0 : 1);
+        frm.set_df_property(f, 'read_only', editable || push_fields.indexOf(f) !== -1 ? 0 : 1);
     });
 }
 
@@ -983,24 +985,28 @@ function approve_push(frm) {
                 return;
             }
             d.hide();
-            frappe.call({
-                method: 'ampower_koda.agent.api.approve_push',
-                args: {
-                    request_name: frm.doc.name,
-                    push_branch: do_push ? 1 : 0,
-                    create_pr: do_pr ? 1 : 0
-                },
-                freeze: true,
-                freeze_message: __('Processing...'),
-                callback: function (r) {
-                    if (r.message && r.message.status === 'ok') {
-                        frappe.show_alert({
-                            message: r.message.message || __('Done'),
-                            indicator: 'green'
-                        });
-                        frm.reload_doc();
+            // The worker reads the saved row. A failed save also resolves, with the form still dirty.
+            (frm.is_dirty() ? frm.save() : Promise.resolve()).then(function () {
+                if (frm.is_dirty()) return;
+                frappe.call({
+                    method: 'ampower_koda.agent.api.approve_push',
+                    args: {
+                        request_name: frm.doc.name,
+                        push_branch: do_push ? 1 : 0,
+                        create_pr: do_pr ? 1 : 0
+                    },
+                    freeze: true,
+                    freeze_message: __('Processing...'),
+                    callback: function (r) {
+                        if (r.message && r.message.status === 'ok') {
+                            frappe.show_alert({
+                                message: r.message.message || __('Done'),
+                                indicator: 'green'
+                            });
+                            frm.reload_doc();
+                        }
                     }
-                }
+                });
             });
         }
     });
@@ -1650,8 +1656,12 @@ function load_user_defaults(frm) {
         // Setting the provider above already reset the model to its default, so
         // the user's last-used model must win unconditionally here.
         var saved_model = stored['ai_agent_ai_model'];
-        if (saved_model) {
-            frm.set_value('ai_model', saved_model);
-        }
+        if (!saved_model) return;
+        with_provider_models(frm.doc.ai_provider || 'OpenAI', function (entries) {
+            // A model no longer offered is not restored. A variant such as ":nitro" is listed without it.
+            var listed_name = saved_model.split(':')[0];
+            var is_offered = entries.some(function (m) { return m.value === listed_name; });
+            if (is_offered) frm.set_value('ai_model', saved_model);
+        });
     }, 100);
 }

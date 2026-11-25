@@ -5,6 +5,8 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 
+from ampower_koda.agent import reasoning_catalog
+
 
 PROVIDER_KEY_FIELDS = {
     "OpenAI": ("openai_api_key", "OpenAI API Key"),
@@ -18,6 +20,8 @@ class AgentSettings(Document):
     def validate(self):
         self._validate_provider_key()
         self._validate_langsmith()
+        if self.has_value_changed("default_ai_model") or self.has_value_changed("default_ai_provider"):
+            reasoning_catalog.refuse_older_model(self.default_ai_provider, self.default_ai_model)
 
     def _validate_provider_key(self):
         if not self.enable_ai_agent:

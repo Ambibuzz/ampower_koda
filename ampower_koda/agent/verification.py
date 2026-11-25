@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -149,6 +150,7 @@ def site_disconnect():
 _UNITTEST_BODY = """
 import importlib.util, json, os, pathlib, sys, unittest
 sys.path.insert(0, os.environ['KODA_APP_PARENT'])
+summary_path = os.environ.pop('KODA_TEST_SUMMARY_PATH')
 if SITE:
     print('KODA_SITE ' + SITE + ': tests run against the live site; database writes are rolled back.', flush=True)
     try:
@@ -159,6 +161,7 @@ if SITE:
         print('KODA_RUNNER_ERROR could not contain the tests', flush=True)
         site_disconnect()
         sys.exit(3)
+os.environ.pop('KODA_CALL_SCRATCH', None)  # its folder holds the summary file
 def case_ids(group):
     for case in group:
         if isinstance(case, unittest.TestSuite): yield from case_ids(case)
@@ -184,7 +187,9 @@ failed = sorted({identity(case) for case, _ in result.failures + result.errors} 
 skipped = sorted({identity(case) for case, _ in result.skipped + result.expectedFailures} - set(failed))
 summary = {'total': result.testsRun, 'tests': tests, 'failed': failed, 'skipped': skipped,
            'passed': max(0, result.testsRun - len(failed) - len(skipped))}
-print('KODA_TEST_SUMMARY ' + json.dumps(summary), flush=True)
+# A file, not stdout: the summary grows with the suite, and the kept output does not.
+with open(summary_path, 'w', encoding='utf-8') as handle:
+    json.dump(summary, handle)
 sys.exit(0 if result.wasSuccessful() and summary['passed'] else 1)
 """
 
@@ -610,6 +615,15 @@ def test_summary(output: str) -> dict | None:
         except (ValueError, TypeError):
             return None
     return None
+
+
+def _read_summary(path: str) -> dict | None:
+    """The summary the Python runner wrote; None when it did not finish writing a valid one."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return test_summary('KODA_TEST_SUMMARY ' + text)
 
 
 def _flat_node_summary(output: str) -> dict | None:
@@ -1102,21 +1116,27 @@ def run_verification(app_name: str, contract: dict, *, env: dict | None = None,
             try:
                 if command.get("python"):
                     # The contained tests' overlay and temporary files live here and go with it.
-                    with tempfile.TemporaryDirectory(prefix="koda-tests-", ignore_cleanup_errors=True) as scratch:
-                        scratch = os.path.realpath(scratch)
+                    with tempfile.TemporaryDirectory(prefix="koda-tests-", ignore_cleanup_errors=True) as holder:
+                        holder = os.path.realpath(holder)
+                        # Beside the scratch directory, not in it, so a contained test's writes cannot reach it.
+                        # Without a site nothing is contained: the name is random so a test cannot guess it.
+                        summary_path = os.path.join(holder, f"summary-{secrets.token_hex(16)}.json")
+                        scratch = os.path.join(holder, "scratch")
                         temporary = os.path.join(scratch, "tmp")
-                        os.mkdir(temporary)
+                        os.makedirs(temporary)
                         code, output, timed_out = _execute(argv, _inside(root, command.get("cwd", ".")), {
-                            **runner_env, "KODA_CALL_SCRATCH": scratch,
+                            **runner_env, "KODA_CALL_SCRATCH": scratch, "KODA_TEST_SUMMARY_PATH": summary_path,
                             "TMPDIR": temporary, "TEMP": temporary, "TMP": temporary}, command["timeout_seconds"])
+                        # The only summary trusted here: a test can print a summary line of its own.
+                        summary = _read_summary(summary_path)
                     if runner_env.get("KODA_SITE"):
                         output, contained, discarded = _containment(output)
                         output += f"\n[containment] {contained}" + ("\n" + discarded if discarded else "")
                 else:
                     code, output, timed_out = _execute(argv, _inside(root, command.get("cwd", ".")),
                                                      runner_env, command["timeout_seconds"])
+                    summary = test_summary(output) or (_flat_node_summary(output) if command.get('node') else None)
                 passed = code == 0 and not timed_out
-                summary = test_summary(output) or (_flat_node_summary(output) if command.get('node') else None)
                 if command.get('python') and (not summary or not summary['passed'] or summary['failed']):
                     passed = False
                     output += '\nThe Python runner must finish and report at least one executed passing test.'

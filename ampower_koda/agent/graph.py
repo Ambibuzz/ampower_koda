@@ -10,17 +10,22 @@ import json
 import os
 import re as _re
 import shutil
+import time
 from copy import deepcopy
 from datetime import datetime
 
+import anthropic
 import frappe
+import httpx
 from langchain_core.tools import StructuredTool, tool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from ampower_koda.agent.prompt_caching import mark_message, native_cache_messages, openai_breakpoints, rolling_messages, terminal_model
+from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
 from ampower_koda.agent.errors import log_agent_error
-from ampower_koda.agent.cache_usage import persist_usage, provider_cost
+from ampower_koda.agent.cache_usage import cache_write_tokens, persist_usage, provider_cost
 from ampower_koda.agent import koda_core
 from ampower_koda.agent import checkpoint
 from ampower_koda.agent import recovery
@@ -32,7 +37,8 @@ from ampower_koda.agent import reasoning_catalog
 from ampower_koda.agent.advisor import Advisor, directive as advisor_directive
 from ampower_koda.agent import repair_budget
 from ampower_koda.agent.run_control import (
-    check_active, set_request_value, MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES, MODEL_TIME_RESERVE,
+    check_active, job_limit_stops_run, set_request_value,
+    MODEL_TIMEOUT_SECONDS, MODEL_MAX_RETRIES, MODEL_TIME_RESERVE,
 )
 from ampower_koda.agent.core.budget.calibrator import TokenCalibrator
 from ampower_koda.agent.core.budget.request import cleanup_target, estimate_messages, input_limit, serialized_tokens
@@ -76,7 +82,11 @@ REVIEW_COST_PRESSURE_ATTEMPT = 4
 # Retain review reads/deltas across repairs, then refresh from current source so
 # an indefinitely recoverable run cannot accumulate an indefinitely large tail.
 REVIEW_HISTORY_RECHECKS = 4
+# Reviews of one run. Each is at most two graph steps (implement, review), so with "prepare" a run
+# stays below the executor's recursion limit of 100, which would end it as Failed.
+MAX_REVIEW_PASSES = 45
 MAX_REVIEW_RECHECKS = 2           # source changed while being reviewed; take a fresh bounded snapshot
+MAX_CUT_OFF_REPLIES = 3           # replies cut off amid their tool calls that a pass asks for again
 MAX_PLAN_AMENDMENTS = 2           # blocked-implementation plan patches per run
 MAX_PLAN_AMENDMENTS_HARD = 6      # even a run that keeps finding new blockers stops here
 BASE_EXECUTION_CALL_BUDGET = 56   # includes room for diagnosis and re-testing
@@ -427,6 +437,83 @@ class _OpenRouterChat(ChatOpenAI):
         return result
 
 
+OUTPUT_CAP_FIELDS = ("max_tokens", "max_output_tokens", "max_completion_tokens")
+
+
+def _within_model_output(tokens: int, llm) -> int:
+    """``tokens``, or the model's maximum output when that is smaller (unknown maximum: unchanged)."""
+    max_output_tokens = getattr(llm, "max_output_limit", 0)
+    return min(tokens, max_output_tokens) if max_output_tokens else tokens
+
+
+class _OutputLimited(BaseModel):
+    """Makes a chat model never ask for more output than the model can produce; a larger cap is a 400."""
+
+    max_output_limit: int = 0
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        for field_name in OUTPUT_CAP_FIELDS:
+            if payload.get(field_name):
+                payload[field_name] = _within_model_output(int(payload[field_name]), self)
+        return payload
+
+
+class _OpenAIChat(_OutputLimited, ChatOpenAI):
+    """ChatOpenAI within the model's output limit."""
+
+
+class _ClaudeChat(_OutputLimited, ChatAnthropic):
+    """ChatAnthropic within the model's output limit that never accepts part of a reply."""
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        """The reply's chunks, handed on once the whole reply has arrived.
+
+        The SDK retries a call only until its first byte. Later failures are retried here, and a stream
+        that ends without a stop reason is one of them: its last tool call would be cut short unnoticed.
+        """
+        for attempt in range(self.max_retries + 1):
+            last = attempt == self.max_retries
+            chunks = []
+            complete = False
+            try:
+                with job_limit_stops_run():
+                    for chunk in super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs):
+                        # A cancelled run stops here; RQ's own alarm ends a reply that outlasts the slice.
+                        check_active(max_age=STREAM_CHECK_SECONDS)
+                        complete = complete or bool(chunk.message.response_metadata.get("stop_reason"))
+                        chunks.append(chunk)
+            except Exception as error:
+                if last or not _interrupted_stream(error):
+                    raise
+            else:
+                if complete:
+                    yield from chunks
+                    return
+                if last:
+                    raise ConnectionError("Claude's reply ended before it was complete.")
+            check_active(reserve=MODEL_TIME_RESERVE)
+            time.sleep(STREAM_RETRY_SECONDS)
+
+
+#: How often a streamed reply checks for a cancelled run, and the pause before a retry.
+STREAM_CHECK_SECONDS = 5
+STREAM_RETRY_SECONDS = 2
+#: Errors the API reports inside a stream that a retry can clear.
+RETRYABLE_STREAM_ERRORS = ("overloaded_error", "api_error", "timeout_error", "rate_limit_error")
+
+
+def _interrupted_stream(error: Exception) -> bool:
+    """Whether a reply broke off after it started: before that, the SDK has already retried."""
+    if isinstance(error, httpx.TransportError):
+        return True
+    if not isinstance(error, anthropic.APIStatusError) or error.response.status_code >= 400:
+        return False
+    body = error.body if isinstance(error.body, dict) else {}
+    detail = body.get("error") if isinstance(body.get("error"), dict) else body
+    return detail.get("type") in RETRYABLE_STREAM_ERRORS
+
+
 def _tag_llm_run(run_manager, provider_name) -> None:
     """Put ``upstream_provider`` on the LangSmith run for this very llm call.
 
@@ -530,22 +617,21 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
     provider = (provider or "OpenAI").strip()
     model = (model or "gpt-4o-mini").strip()
     if provider == "Gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
+        from ampower_koda.agent.gemini_chat import GeminiChat
         # Google's retry setting counts attempts, including the initial call.
-        return ChatGoogleGenerativeAI(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS,
-                                      max_retries=MODEL_MAX_RETRIES + 1)
+        # None, not left out: the adapter sends 0.7 for the models it does not know as Gemini 3.
+        return GeminiChat(model=model, temperature=None, timeout=MODEL_TIMEOUT_SECONDS,
+                          max_retries=MODEL_MAX_RETRIES + 1)
     if provider == "Claude":
-        from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model, temperature=0, timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES)
+        return _claude_llm(model, reasoning_effort)
     catalog_entry = reasoning_catalog.model_reasoning(provider, model)
     # A model no source lists gets no reasoning field: under require_parameters a model no
     # endpoint can reason with fails the call instead of ignoring the field.
     effort = None
     if catalog_entry is not None and catalog_entry["reasons"]:
-        effort = _configured_reasoning_effort()
-        # A caller's effort only lowers the configured one.
-        effort = _lower_effort(effort, reasoning_effort) or effort
-        effort = _model_effort(effort, catalog_entry)
+        effort = _effort_for(catalog_entry, reasoning_effort)
+    elif catalog_entry is None and provider != "OpenRouter" and OPENAI_EFFORT_MODEL.fullmatch(model.lower()):
+        effort = _effort_for({}, reasoning_effort)
     if provider == "OpenRouter":
         # OpenRouter speaks the OpenAI wire format, so ChatOpenAI drives it — only
         # the base URL and key differ. `usage.include` asks OpenRouter to return the
@@ -593,21 +679,75 @@ def _get_llm(provider: str = "OpenAI", model: str = "gpt-4o-mini", session_id: s
         direct_options['reasoning'] = {'effort': effort}
         if openai_breakpoints('OpenAI', model):
             direct_options['reasoning']['context'] = 'all_turns'
+    # Cache fields go in extra_body, not as keyword arguments: an openai SDK older than
+    # the field rejects an unknown keyword ("unexpected keyword argument"), while
+    # extra_body is sent as-is by every version.
+    extra_body = {}
     if session_id:
         # Earlier OpenAI models use this stable key to improve cache routing;
         # GPT-5.6+ uses it only for per-request cache accounting.
-        direct_options["extra_body"] = {"prompt_cache_key": str(session_id)[:256]}
+        extra_body["prompt_cache_key"] = str(session_id)[:256]
     if openai_breakpoints("OpenAI", model):
         # Keep the rolling message-end boundary alongside our explicit stable
         # system/shared-context boundaries, with the documented minimum TTL.
-        direct_options["prompt_cache_options"] = {"mode": "implicit", "ttl": "30m"}
-    # Reasoning models reject temperature=0; a model no source lists keeps its default.
-    temperature = None
-    if catalog_entry is not None and not catalog_entry["reasons"]:
-        temperature = 0
-    return ChatOpenAI(model=model, temperature=temperature, use_responses_api=True,
-                      timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES,
-                      **direct_options)
+        extra_body["prompt_cache_options"] = {"mode": "implicit", "ttl": "30m"}
+    if extra_body:
+        direct_options["extra_body"] = extra_body
+    # No temperature: reasoning models reject anything but their default.
+    _, max_output_tokens = reasoning_catalog.model_limits("OpenAI", model)
+    return _OpenAIChat(model=model, use_responses_api=True,
+                       timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES,
+                       max_output_limit=max_output_tokens, **direct_options)
+
+
+def _effort_for(catalog_entry: dict, reasoning_effort: str | None) -> str:
+    """The configured effort, lowered by the caller's, at the nearest level the model lists."""
+    effort = _configured_reasoning_effort()
+    effort = _lower_effort(effort, reasoning_effort) or effort
+    return _model_effort(effort, catalog_entry)
+
+
+# OpenAI models that take low, medium and high, for when neither source can be read. Left out: pro, chat,
+# search and deep-research variants, which reject some of those levels or do not reason.
+OPENAI_EFFORT_MODEL = _re.compile(
+    r"(?:o1|o3|o3-mini|o4-mini|gpt-[5-9](?:\.\d+)?(?:-(?:mini|nano|codex|codex-mini|codex-max|luna|terra|sol|astra))?)"
+    r"(?:-\d{4}-\d{2}-\d{2})?")
+# Newer Claude models (Opus, Sonnet and Haiku 5.5, Fable 5.1+) reject a replayed thinking block
+# once anything before it changed. Koda prunes and compacts its history by design, so it asks the
+# API to drop such blocks instead; the field needs this beta and adaptive thinking.
+CLAUDE_THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+CLAUDE_ADAPTIVE_THINKING = {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+# Claude 4.6 and later, for when OpenRouter's list cannot be read.
+CLAUDE_EFFORT_MODEL = _re.compile(r"claude-[a-z]+-(?:4-[6-9]|[5-9])")
+
+
+def _claude_llm(model: str, reasoning_effort: str | None = None):
+    """The Claude chat model, configured from OpenRouter's entry for it.
+
+    A model OpenRouter lists with effort levels (Opus and Sonnet 4.6 onward) takes adaptive
+    thinking and ``output_config.effort``; older ones (Haiku 4.5, Sonnet 4.5) take neither and
+    run without thinking. Without the list, the id decides. Calls stream: the httpx timeout counts
+    the wait for the next byte, and a non-streamed reply sends none until a long thinking turn has
+    finished.
+    """
+    catalog_entry = reasoning_catalog.model_reasoning("Claude", model)
+    _, max_output_tokens = reasoning_catalog.model_limits("Claude", model)
+    options = {}
+    if catalog_entry is None:
+        takes_effort = bool(CLAUDE_EFFORT_MODEL.match(model))
+    else:
+        takes_effort = bool(catalog_entry.get("supported_efforts"))
+    if takes_effort:
+        options["thinking"] = deepcopy(CLAUDE_ADAPTIVE_THINKING)
+        options["output_config"] = {"effort": _effort_for(catalog_entry or {}, reasoning_effort)}
+        options["betas"] = [CLAUDE_THINKING_BINDING_BETA]
+    # Calls that send no cap of their own (the advisor) get a round's worth, not the library's default.
+    default_cap = MODEL_ROUND_OUTPUT_TOKENS
+    if max_output_tokens:
+        default_cap = min(default_cap, max_output_tokens)
+    return _ClaudeChat(model=model, max_tokens=default_cap, streaming=True,
+                       timeout=MODEL_TIMEOUT_SECONDS, max_retries=MODEL_MAX_RETRIES,
+                       max_output_limit=max_output_tokens, **options)
 
 
 SUBMIT_PLAN_SCHEMA = {
@@ -1523,6 +1663,12 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
            "already know.")
     )
 
+    cut_off_replies = 0
+    CUT_OFF_TEXT = (
+        "Your last reply was cut off before it was complete, so none of its tool calls ran and nothing changed. "
+        "Send the work again in smaller pieces: one tool call per reply, and a large file in several edits."
+    )
+
     def build_messages():
         msgs = [system_msg, *([shared_msg] if shared_msg is not None else []), task_msg]
         if compacted:
@@ -1608,7 +1754,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
         details = usage.get("input_token_details") or {}
         _persist_token_usage(request_name, total_tokens, input_tokens=int(usage.get("input_tokens") or 0),
                              cache_read_tokens=int(details.get("cache_read") or 0),
-                             cache_write_tokens=int(details.get("cache_creation") or 0),
+                             cache_write_tokens=cache_write_tokens(details),
                              cost_delta=provider_cost(reply))
         if progress is not None:
             progress["tokens"] = total_tokens
@@ -1696,7 +1842,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
             total_tokens += int(usage.get("total_tokens") or 0)
             details = usage.get("input_token_details") or {}
             cache_read = int(details.get("cache_read") or 0)
-            cache_write = int(details.get("cache_creation") or 0)
+            cache_write = cache_write_tokens(details)
             history["previous_context_input_tokens"] = context_input
             cost = provider_cost(response)
             uncached_input = max(
@@ -1744,7 +1890,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
 
     # Grown caps are carried as plain ints so a retained history stays a
     # plain dict; the ceiling is the room the window leaves after the prompt.
-    output_room = recovery.output_ceiling(context_window, input_ceiling)
+    output_room = _within_model_output(recovery.output_ceiling(context_window, input_ceiling), llm)
     round_tokens = _output_share(context_window, MODEL_ROUND_OUTPUT_TOKENS)
     final_tokens = _output_share(context_window, MODEL_FINAL_OUTPUT_TOKENS)
     round_cap = recovery.OutputCap(history.get("round_cap_tokens", round_tokens), max(round_tokens, output_room))
@@ -1829,6 +1975,7 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                                round=label, reasks=reasks, problem=problem[:300])
         return fixed
 
+    rounds_used = max_rounds
     for round_num in range(max_rounds):
         check_active(reserve=MODEL_TIME_RESERVE)
         label = round_base + round_num + 1
@@ -1886,6 +2033,17 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
                 continue
             history["rounds_done"] = label
             return finish(response_text, (), label), edited_paths, total_tokens, round_num + 1, False
+
+        if last_truncated or recovery.stopped_early(response):
+            # The last call is half written, yet it can still parse: none of them run.
+            cut_off_replies += 1
+            names = ", ".join(str(call.get("name") or "?") for call in response.tool_calls)
+            _publish_agent_log(request_name, "cut_off_reply", round=label, attempt=cut_off_replies, tools=names)
+            if cut_off_replies > MAX_CUT_OFF_REPLIES:
+                rounds_used = round_num + 1
+                break
+            _queue_followup(history, response_text.strip(), CUT_OFF_TEXT)
+            continue
 
         round_entry = {"number": label, "ai": response, "tools": [], "summary": []}
         round_had_write = False
@@ -2103,9 +2261,9 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     if stop_when is not None:
         # A turn that ends on a tool call (investigation's submit_plan) has no report to ask
         # for: its caller decides what the time-up message says.
-        history["rounds_done"] = round_base + max_rounds
+        history["rounds_done"] = round_base + rounds_used
         total_tokens += _SIDE_TOKENS.pop(request_name, 0)
-        return "", edited_paths, total_tokens, max_rounds, True
+        return "", edited_paths, total_tokens, rounds_used, True
 
     # Tool calls are forbidden on this call. Without saying so, a model that still
     # wants to work writes its next tool calls as prose instead of a report.
@@ -2118,14 +2276,14 @@ def _run_tool_calling_loop(llm, tools, system_prompt: str, task_prompt: str,
     final_messages = maybe_trim(extra=(final_notice,), with_tools=final_tools_bound, output_tokens=final_cap.value)
     final_context_chars = sum(message_chars(m) for m in final_messages)
     if progress is not None:
-        progress["calls"] = max_rounds + 1
-    checkpoint.update(tool_rounds_used=(state or {}).get("tool_rounds_used", 0) + max_rounds + 1)
-    final_label = round_base + max_rounds + 1
+        progress["calls"] = rounds_used + 1
+    checkpoint.update(tool_rounds_used=(state or {}).get("tool_rounds_used", 0) + rounds_used + 1)
+    final_label = round_base + rounds_used + 1
     final = invoke_growing(llm_final, final_messages, final_cap, final_label,
                            estimate_messages(final_messages, schemas if final_tools_bound else ()), final_context_chars)
     history["rounds_done"] = final_label
     text = finish(_llm_response_text(final), (final_notice,), final_label)
-    return text, edited_paths, total_tokens, max_rounds + 1, True
+    return text, edited_paths, total_tokens, rounds_used + 1, True
 
 
 # Agent turn helper
@@ -2347,7 +2505,7 @@ def _charge_plan_call(raw_response, request_name: str, total_tokens: int, *, rou
     details = usage.get("input_token_details") or {}
     input_tokens = int(usage.get('input_tokens') or 0)
     cache_read = int(details.get('cache_read') or 0)
-    cache_write = int(details.get('cache_creation') or 0)
+    cache_write = cache_write_tokens(details)
     cost = provider_cost(raw_response)
     _publish_agent_log(request_name, "token_usage",
         round=round_label,
@@ -2491,6 +2649,7 @@ def _invoke_structured(llm, provider: str, schema: dict, messages: list, config:
     estimate = estimate_messages(messages) + serialized_tokens(schema)
     window = int(budget.get("window") or 0) or DEFAULT_WINDOW_TOKENS
     ceiling = max(int(budget["max_tokens"]), recovery.output_ceiling(window, estimate))
+    ceiling = _within_model_output(ceiling, llm)
     if budget.get("ceiling"):
         ceiling = min(ceiling, int(budget["ceiling"]))
     cap = recovery.OutputCap(budget["max_tokens"], ceiling)
@@ -2547,10 +2706,10 @@ def _structured_model(llm, provider: str, schema: dict, *, max_tokens: int | Non
         update["extra_body"] = body
     if update:
         llm = llm.model_copy(update=update)
-    # Native structured-output path per wrapper: OpenAI/OpenRouter enforce json_schema (strict),
-    # Claude only has json_schema on newer models so use tool input, Gemini rejects json_schema.
+    # Native structured-output path per wrapper: OpenAI/OpenRouter enforce json_schema (strict).
+    # Claude uses json_schema too: function_calling forces tool_choice, which thinking models and
+    # Opus/Sonnet 5.5 reject. Gemini rejects json_schema.
     method = {
-        "Claude": "function_calling",
         "Gemini": "json_mode",
     }.get(provider, "json_schema")
     options = {"method": method, "include_raw": True}
@@ -2646,7 +2805,7 @@ def prepare_execution_node(state: dict) -> dict:
             "copied_files": {}, "called_methods": [], "test_repair_rounds": 0,
             "plan_scope_repairs": scope_repairs,
             "task_completion": {}, "turn_exhausted": False,
-            "review_attempts": 0, "review_notes": "", "review_passed": False,
+            "review_attempts": 0, "review_notes": "", "review_passed": False, "review_passes": 0,
             "review_fingerprint": "", "review_fingerprints_seen": [],
             "review_failure_fingerprints_seen": [],
             "repair_strategy_level": 0, "review_format_retries": 0,
@@ -3523,6 +3682,10 @@ def review_node(state: dict) -> dict:
             attempts=attempt,
             action="continue repair with compact evidence",
         )
+    passes = int(state.get("review_passes") or 0) + 1
+    updates["review_passes"] = passes
+    if passes >= MAX_REVIEW_PASSES and not passed and not halted():
+        updates["review_stopped"] = f"The work did not pass {passes} reviews: {notes[:2000]}"
     results = list(state.get("task_results") or [])
     result = {
         "task_id": active["id"], "status": "passed" if passed else "failed",
