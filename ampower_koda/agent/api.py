@@ -14,12 +14,15 @@ from ampower_koda.agent.errors import log_agent_error
 from ampower_koda.agent.execution_contract import load_plan
 from ampower_koda.agent.plan_contract import PlanValidationError, plan_to_markdown
 from ampower_koda.agent.executor import (
+    BUSY_STATUSES,
     _generate_patch_diff,
     _is_request_branch,
     _uncommitted_paths,
     _update_status,
     bench_branch_refusal,
     normalize_bench_selection,
+    other_busy_requests,
+    other_work_problem,
     restore_execution_state,
     validate_target_app,
 )
@@ -39,6 +42,7 @@ from ampower_koda.agent.git_ops import (
 )
 from ampower_koda.agent.graph import _app_file_exists
 from ampower_koda.agent import tools as agent_tools
+from ampower_koda.agent import reasoning_catalog
 from ampower_koda.agent.run_control import enqueue_job, stop_job
 
 DOCTYPE_NAME = "Agent Request"
@@ -54,12 +58,6 @@ PLAN_EXECUTABLE_STATUSES = (
     "Awaiting Approval", "Failed", "Cancelled", "Completed", "Awaiting Push Approval",
 )
 
-# Statuses where the agent is actively working, so manual actions must wait.
-BUSY_STATUSES = (
-    "Understanding", "Planning", "Implementing",
-    "Reviewing", "Building", "Pushing",
-)
-
 # Cap on the request's bench log. Matches the field's own 50k truncation, named
 # here because two endpoints now append to the same field and a cap that only
 # one of them applied would let the other grow past it.
@@ -67,7 +65,7 @@ BENCH_LOG_MAX_CHARS = 50000
 
 
 def _reconcile_if_dead(doc) -> bool:
-    """Flip a busy request to Failed when its RQ job is no longer running.
+    """Flip a busy request to Failed, or a push to awaiting approval, when its RQ job is no longer running.
 
     A Queued request with a job counts too: a job lost before it started would
     otherwise leave the form polling a request that never starts.
@@ -93,7 +91,8 @@ def _reconcile_if_dead(doc) -> bool:
         return False
 
     _update_status(
-        doc.name, doc.owner or frappe.session.user, "Failed",
+        doc.name, doc.owner or frappe.session.user,
+        "Awaiting Push Approval" if doc.status == "Pushing" else "Failed",
         "Background job was terminated unexpectedly (worker likely killed by "
         "an OOM condition or a bench/service restart). Please retry.",
         error_log=(
@@ -226,6 +225,7 @@ def submit_follow_up(request_name: str, follow_up_message: str):
     except PlanValidationError as exc:
         frappe.throw(str(exc))
     _validate_provider_key(doc)
+    _refuse_other_work(doc)
 
     follow_up = (follow_up_message or "").strip()
     follow_up_count = int(doc.follow_up_count or 0) + 1
@@ -250,8 +250,57 @@ def submit_follow_up(request_name: str, follow_up_message: str):
         request_name=request_name,
         preserve_branch=1,
         is_follow_up=1,
+        previous_status=doc.status,
     )
     return {"status": "ok", "message": _("Follow-up patch started on existing branch (plan preserved).")}
+
+
+def _refuse_other_work(doc) -> None:
+    """Stop before queueing a job that would move the checkout from under another request or another
+    branch's uncommitted work."""
+    for busy_request in other_busy_requests(doc.target_app_name, doc.name):
+        _reconcile_if_dead(frappe.get_doc(DOCTYPE_NAME, busy_request))
+    try:
+        problem = other_work_problem(doc.target_app_name, (doc.branch_name or "").strip(), doc.name)
+    except (RuntimeError, OSError) as exc:
+        log_agent_error("Agent API: working tree check", frappe.get_traceback())
+        frappe.throw(_("Could not check the working tree of {0}: {1}").format(doc.target_app_name, exc))
+    if problem:
+        frappe.throw(
+            '<div style="white-space: pre-wrap">' + frappe.utils.escape_html(problem) + "</div>",
+            title=_("The checkout is in use by other work"),
+        )
+
+
+def _start_push(doc, push_branch: int, create_pr: int) -> dict:
+    """Queue the commit, push and pull request of a request whose caller has checked that it may push."""
+    push_branch = int(push_branch or 0)
+    create_pr = int(create_pr or 0)
+    if not push_branch and not create_pr:
+        frappe.throw(_("Select at least one action (push branch or create PR)."))
+
+    _refuse_other_work(doc)
+    # A failed push or PR leaves its error while the push awaits approval again.
+    frappe.db.set_value(DOCTYPE_NAME, doc.name, {"status": "Pushing", "error_log": ""})
+    frappe.db.commit()
+
+    enqueue_job(
+        "ampower_koda.agent.executor.run_deploy_phase",
+        queue="default",
+        timeout=600,
+        request_name=doc.name,
+        clear_checkpoint=True,
+        do_push=bool(push_branch),
+        do_pr=bool(create_pr),
+    )
+
+    if push_branch and create_pr:
+        msg = _("Committing, pushing, and creating PR...")
+    elif push_branch:
+        msg = _("Committing and pushing branch {0}...").format(doc.branch_name)
+    else:
+        msg = _("Committing and creating PR...")
+    return {"status": "ok", "message": msg}
 
 
 def _approve_structured_plan(doc, value=None):
@@ -634,31 +683,7 @@ def approve_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
     if doc.status != "Awaiting Push Approval":
         frappe.throw(_("Cannot push. Agent status is {0}.").format(doc.status))
 
-    push_branch = int(push_branch or 0)
-    create_pr = int(create_pr or 0)
-    if not push_branch and not create_pr:
-        frappe.throw(_("Select at least one action (push branch or create PR)."))
-
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
-    frappe.db.commit()
-
-    enqueue_job(
-        "ampower_koda.agent.executor.run_deploy_phase",
-        queue="default",
-        timeout=600,
-        request_name=request_name,
-        clear_checkpoint=True,
-        do_push=bool(push_branch),
-        do_pr=bool(create_pr),
-    )
-
-    if push_branch and create_pr:
-        msg = _("Pushing branch and creating PR...")
-    elif push_branch:
-        msg = _("Pushing branch {0}...").format(doc.branch_name)
-    else:
-        msg = _("Creating PR...")
-    return {"status": "ok", "message": msg}
+    return _start_push(doc, push_branch, create_pr)
 
 
 @frappe.whitelist()
@@ -816,10 +841,12 @@ def get_model_defaults():
     from that catalogue instead of from Settings. No secrets are returned.
     """
     settings = frappe.get_single("Agent Settings")
-    return {
-        "provider": (settings.default_ai_provider or "OpenAI").strip(),
-        "model": (settings.default_ai_model or "").strip(),
-    }
+    provider = (settings.default_ai_provider or "OpenAI").strip()
+    model = (settings.default_ai_model or "").strip()
+    # A request cannot be saved with an older model, so the form's own default stands in.
+    if model and reasoning_catalog.is_older_model(provider, model):
+        model = ""
+    return {"provider": provider, "model": model}
 
 
 # Tool-calling text families on /v1/models; everything else there (embeddings, audio, images,
@@ -827,7 +854,12 @@ def get_model_defaults():
 _OPENAI_CHAT_MODEL = re.compile(r"^(gpt-(?!3)|o\d|codex)")
 _OPENAI_NOT_CHAT = re.compile(r"audio|realtime|transcribe|tts|image|search|embedding|moderation|instruct")
 _OPENAI_SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")  # dated pins of an alias that is listed anyway
+# OpenRouter's "openai/" ids that OpenAI's own API does not serve: open-weight models and
+# OpenRouter's effort aliases such as o4-mini-high.
+_OPENROUTER_ONLY_OPENAI = re.compile(r"^gpt-oss|-high$")
 OPENAI_MODELS_CACHE_SECONDS = 6 * 3600
+# A run usually starts from a form showing a picker, so this keeps the run's catalog fresh too.
+OPENROUTER_PICKER_MAX_AGE_SECONDS = 3600
 
 
 @frappe.whitelist()
@@ -835,15 +867,74 @@ OPENAI_MODELS_CACHE_SECONDS = 6 * 3600
 def get_provider_models(provider: str = "OpenAI", refresh: int = 0):
     """The provider's current models, newest first, for the model pickers.
 
-    Only OpenAI is listed live (GET /v1/models with the key in Agent Settings),
-    so a new model is offered the day it ships instead of after a code change.
-    Any other provider, or a failed fetch, returns no models and the form keeps
-    its built-in list. Model ids only; no secrets are returned.
+    OpenRouter's come from its public model list, the one the reasoning catalog keeps. OpenAI's
+    come from GET /v1/models with the key in Agent Settings, so a new model is offered the day
+    it ships; without a key, or when that fetch fails, OpenRouter's copies of OpenAI models
+    stand in. Any other provider returns no models and the form keeps its built-in list.
+    Model ids only; no secrets are returned.
     """
     if not (frappe.has_permission(DOCTYPE_NAME, "read") or frappe.has_permission("Agent Settings", "read")):
         frappe.throw(_("Not permitted to list models."), frappe.PermissionError)
-    if (provider or "").strip() != "OpenAI":
+    provider = (provider or "").strip()
+    if provider == "OpenRouter":
+        return {"models": _openrouter_tool_models(refresh)}
+    if provider != "OpenAI":
         return {"models": []}
+    live = _openai_live_models(refresh)
+    live["models"] = _current_openai_models(live["models"])
+    if live["models"]:
+        return live
+    openai_models_on_openrouter = _openai_models_on_openrouter(refresh)
+    if openai_models_on_openrouter:
+        return {"models": openai_models_on_openrouter}
+    return live
+
+
+def _openrouter_tool_models(refresh) -> list[str]:
+    """Ids of OpenRouter's current models that take tool calls, newest first."""
+    if int(refresh or 0):
+        reasoning_catalog.refresh_openrouter_models()
+    models = reasoning_catalog.openrouter_models(max_age_seconds=OPENROUTER_PICKER_MAX_AGE_SECONDS)
+    newest_first = sorted(models.items(),
+                          key=lambda item: item[1].get("created", 0), reverse=True)
+    model_ids = []
+    for model_id, entry in newest_first:
+        # Variants such as ":free" and ":batch" route a model that is listed anyway.
+        if ":" in model_id or not entry.get("tools"):
+            continue
+        if reasoning_catalog.is_older_entry(model_id, entry):
+            continue
+        model_ids.append(model_id)
+    return model_ids
+
+
+def _current_openai_models(names: list[str]) -> list[str]:
+    """The names without older models. The list is read once: each read loads all of it from Redis."""
+    models = reasoning_catalog.openrouter_models(max_age_seconds=OPENROUTER_PICKER_MAX_AGE_SECONDS)
+    return [name for name in names
+            if not reasoning_catalog.is_older_entry(name, models.get("openai/" + name))]
+
+
+def _openai_models_on_openrouter(refresh) -> list[str]:
+    """OpenAI model names from OpenRouter's list that OpenAI's own API also serves, newest first."""
+    names = []
+    for model_id in _openrouter_tool_models(refresh):
+        if not model_id.startswith("openai/"):
+            continue
+        name = model_id.removeprefix("openai/")
+        if _is_openai_chat_model(name) and not _OPENROUTER_ONLY_OPENAI.search(name):
+            names.append(name)
+    return names
+
+
+def _is_openai_chat_model(model_id: str) -> bool:
+    return (_OPENAI_CHAT_MODEL.match(model_id) is not None
+            and not _OPENAI_NOT_CHAT.search(model_id)
+            and not _OPENAI_SNAPSHOT.search(model_id))
+
+
+def _openai_live_models(refresh) -> dict:
+    """GET /v1/models with the key in Agent Settings, newest first and cached; "error" says why it is empty."""
     cache_key = "koda:openai_models"
     if not int(refresh or 0):
         cached = frappe.cache().get_value(cache_key)
@@ -863,8 +954,7 @@ def get_provider_models(provider: str = "OpenAI", refresh: int = 0):
     except Exception as exc:  # noqa: BLE001 -- the form falls back to its built-in list
         return {"models": [], "error": f"Could not list OpenAI models: {type(exc).__name__}"}
     models = [row["id"] for row in sorted(rows, key=lambda row: int(row.get("created") or 0), reverse=True)
-              if isinstance(row.get("id"), str) and _OPENAI_CHAT_MODEL.match(row["id"])
-              and not _OPENAI_NOT_CHAT.search(row["id"]) and not _OPENAI_SNAPSHOT.search(row["id"])]
+              if isinstance(row.get("id"), str) and _is_openai_chat_model(row["id"])]
     if models:
         frappe.cache().set_value(cache_key, models, expires_in_sec=OPENAI_MODELS_CACHE_SECONDS)
     return {"models": models}
@@ -1481,34 +1571,10 @@ def ide_push(request_name: str, push_branch: int = 1, create_pr: int = 1):
 
     _require_request_branch(doc)
 
-    push_branch = int(push_branch or 0)
-    create_pr = int(create_pr or 0)
-    if not push_branch and not create_pr:
-        frappe.throw(_("Select at least one action (push branch or create PR)."))
-
     if not _has_pushable_changes(doc):
         return {"status": "noop", "message": _("No changes to push.")}
 
-    frappe.db.set_value(DOCTYPE_NAME, request_name, "status", "Pushing")
-    frappe.db.commit()
-
-    enqueue_job(
-        "ampower_koda.agent.executor.run_deploy_phase",
-        queue="default",
-        timeout=600,
-        request_name=request_name,
-        clear_checkpoint=True,
-        do_push=bool(push_branch),
-        do_pr=bool(create_pr),
-    )
-
-    if push_branch and create_pr:
-        msg = _("Committing, pushing, and creating PR...")
-    elif push_branch:
-        msg = _("Committing and pushing branch {0}...").format(doc.branch_name)
-    else:
-        msg = _("Committing and creating PR...")
-    return {"status": "ok", "message": msg}
+    return _start_push(doc, push_branch, create_pr)
 
 
 @frappe.whitelist()

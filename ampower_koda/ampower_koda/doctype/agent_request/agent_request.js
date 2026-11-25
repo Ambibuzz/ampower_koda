@@ -3,35 +3,33 @@
 
 var PROVIDER_MODELS = {
     'OpenAI': [
-        { value: 'gpt-4o-mini', label: 'GPT-4o Mini: fast, cost-effective' },
-        { value: 'gpt-5-mini', label: 'GPT-5 Mini: next-gen, efficient' },
-        { value: 'gpt-5.1-codex-mini', label: 'GPT-5.1 Codex Mini: compact coding' },
-        { value: 'gpt-5-codex', label: 'GPT-5 Codex: coding model' },
-        { value: 'gpt-5.1-codex', label: 'GPT-5.1 Codex: coding model' },
-        { value: 'gpt-5.2-codex', label: 'GPT-5.2 Codex: latest coding model' }
+        { value: 'gpt-6-luna', label: 'GPT-6 Luna: fast, cost-effective' },
+        { value: 'gpt-6.1-terra', label: 'GPT-6.1 Terra: efficient' },
+        { value: 'gpt-6.2-sol', label: 'GPT-6.2 Sol: everyday coding' },
+        { value: 'gpt-6.2-astra', label: 'GPT-6.2 Astra: most capable' }
     ],
     'Gemini': [
-        { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash: fast, multimodal' },
-        { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro: most capable' }
+        { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash: most capable Flash' },
+        { value: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash: balanced' },
+        { value: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite: fast, light' }
     ],
     'Claude': [
-        { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4: balanced' },
-        { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet: proven' },
-        { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku: fast, light' }
+        { value: 'claude-opus-5-5', label: 'Claude Opus 5.5: most capable' },
+        { value: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5: balanced' },
+        { value: 'claude-haiku-5-5', label: 'Claude Haiku 5.5: fast, light' }
     ],
     'OpenRouter': [
         { value: 'deepseek/deepseek-v4-flash-0731', label: 'DeepSeek V4 Flash: fast, cheap' },
-        { value: 'deepseek/deepseek-chat', label: 'DeepSeek Chat: general' },
-        { value: 'anthropic/claude-sonnet-4', label: 'Claude Sonnet 4: via OpenRouter' },
-        { value: 'openai/gpt-4o-mini', label: 'GPT-4o Mini: via OpenRouter' },
-        { value: 'qwen/qwen-2.5-coder-32b-instruct', label: 'Qwen 2.5 Coder 32B: coding' }
+        { value: 'deepseek/deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash: newer Flash' },
+        { value: 'anthropic/claude-sonnet-5.5', label: 'Claude Sonnet 5.5: via OpenRouter' },
+        { value: 'openai/gpt-6-luna', label: 'GPT-6 Luna: via OpenRouter' }
     ]
 };
 
 var DEFAULT_MODELS = {
-    'OpenAI': 'gpt-4o-mini',
-    'Gemini': 'gemini-2.0-flash',
-    'Claude': 'claude-sonnet-4-20250514',
+    'OpenAI': 'gpt-6-luna',
+    'Gemini': 'gemini-3.8-flash',
+    'Claude': 'claude-sonnet-5-5',
     'OpenRouter': 'deepseek/deepseek-v4-flash-0731'
 };
 
@@ -226,7 +224,8 @@ function render_status_dashboard(frm) {
     }
 
     var error_html = '';
-    if (status === 'Failed' && frm.doc.error_log) {
+    // A failed push or PR awaits its approval again with the error.
+    if (['Failed', 'Awaiting Push Approval'].indexOf(status) !== -1 && frm.doc.error_log) {
         var full_error = String(frm.doc.error_log || '');
         var err_preview = full_error.substring(0, 300) + (full_error.length > 300 ? '…' : '');
         error_html = '<div class="agent-error-preview">'
@@ -459,12 +458,17 @@ function set_model_options_for_provider(frm, reset) {
     });
 }
 
-// OpenAI's models are listed live (newest first, cached server-side), so a new
-// model is offered without a code change; the built-in list is the fallback.
+// OpenAI's and OpenRouter's models are listed live (newest first, cached server-side), so a
+// new model is offered without a code change; the built-in list is the fallback.
+var LIVE_MODEL_PROVIDERS = ['OpenAI', 'OpenRouter'];
+// The picker shows this many: the newest while the field is empty, else the newest that match.
+var MODEL_PICKER_ITEMS = 5;
+
 function with_provider_models(provider, done) {
     var fallback = PROVIDER_MODELS[provider] || PROVIDER_MODELS['OpenAI'];
-    if (provider !== 'OpenAI') return done(fallback);
-    if (window.koda_live_models) return done(window.koda_live_models);
+    if (LIVE_MODEL_PROVIDERS.indexOf(provider) === -1) return done(fallback);
+    window.koda_live_models = window.koda_live_models || {};
+    if (window.koda_live_models[provider]) return done(window.koda_live_models[provider]);
     frappe.call({
         method: 'ampower_koda.agent.api.get_provider_models',
         args: { provider: provider },
@@ -473,10 +477,10 @@ function with_provider_models(provider, done) {
             if (!ids.length) return done(fallback);
             var labels = {};
             fallback.forEach(function (m) { labels[m.value] = m.label; });
-            window.koda_live_models = ids.map(function (id) {
-                return { value: id, label: labels[id] || (id + ': live from OpenAI') };
+            window.koda_live_models[provider] = ids.map(function (id) {
+                return { value: id, label: labels[id] || (id + ': live from ' + provider) };
             });
-            done(window.koda_live_models);
+            done(window.koda_live_models[provider]);
         },
         error: function () { done(fallback); }
     });
@@ -497,12 +501,23 @@ function apply_model_options(frm, provider, entries, reset) {
     frm.set_df_property('ai_model', 'ignore_validation', 1);
     frm.refresh_field('ai_model');
 
+    // The Autocomplete reads its options and item limit only when it is built, so a
+    // later list goes to the control itself.
+    var model_field = frm.fields_dict.ai_model;
+    if (model_field && model_field.set_data) {
+        model_field.set_data(model_ids);
+    }
+    if (model_field && model_field.awesomplete) {
+        model_field.awesomplete.maxItems = MODEL_PICKER_ITEMS;
+    }
+
     if (reset && model_ids.indexOf(current) === -1) {
         frm.set_value('ai_model', settings_model);
     }
 
-    var desc = entries === window.koda_live_models
-        ? __('Live list from OpenAI, newest first ({0} models).', [entries.length])
+    var live_models = (window.koda_live_models || {})[provider];
+    var desc = entries === live_models
+        ? __('Live list from {0}, newest first ({1} models); type to search.', [provider, entries.length])
         : entries.map(function (m) {
             return '<b>' + m.value + '</b>: ' + m.label.split(': ')[1];
         }).join(' &nbsp;|&nbsp; ');
@@ -527,8 +542,11 @@ function toggle_config_readonly(frm) {
         'base_branch', 'branch_prefix', 'git_user_name', 'git_user_email',
         'ai_provider', 'ai_model', 'request_type', 'user_message', 'request_title'
     ];
+    // A push that failed on one of these can only be retried with the value corrected.
+    var push_fields = frm.doc.status === 'Awaiting Push Approval'
+        ? ['github_repo_url', 'github_token', 'base_branch', 'git_user_name', 'git_user_email'] : [];
     config_fields.forEach(function (f) {
-        frm.set_df_property(f, 'read_only', editable ? 0 : 1);
+        frm.set_df_property(f, 'read_only', editable || push_fields.indexOf(f) !== -1 ? 0 : 1);
     });
 }
 
@@ -659,6 +677,13 @@ function setup_action_buttons(frm) {
     if ((frm.doc.branch_name || frm.doc.patch_diff) && !frm.is_new()) {
         frm.add_custom_button(__('Open Koda IDE'), function () {
             frappe.set_route('koda-ide', frm.doc.name);
+        }, __('Actions'));
+    }
+
+    // Lists this request's recorded browser checks; the page itself says when there are none yet.
+    if (frm.doc.target_app_name && !frm.is_new()) {
+        frm.add_custom_button(__('Browser Check Replays'), function () {
+            frappe.set_route('koda-replay', frm.doc.name);
         }, __('Actions'));
     }
 }
@@ -960,24 +985,28 @@ function approve_push(frm) {
                 return;
             }
             d.hide();
-            frappe.call({
-                method: 'ampower_koda.agent.api.approve_push',
-                args: {
-                    request_name: frm.doc.name,
-                    push_branch: do_push ? 1 : 0,
-                    create_pr: do_pr ? 1 : 0
-                },
-                freeze: true,
-                freeze_message: __('Processing...'),
-                callback: function (r) {
-                    if (r.message && r.message.status === 'ok') {
-                        frappe.show_alert({
-                            message: r.message.message || __('Done'),
-                            indicator: 'green'
-                        });
-                        frm.reload_doc();
+            // The worker reads the saved row. A failed save also resolves, with the form still dirty.
+            (frm.is_dirty() ? frm.save() : Promise.resolve()).then(function () {
+                if (frm.is_dirty()) return;
+                frappe.call({
+                    method: 'ampower_koda.agent.api.approve_push',
+                    args: {
+                        request_name: frm.doc.name,
+                        push_branch: do_push ? 1 : 0,
+                        create_pr: do_pr ? 1 : 0
+                    },
+                    freeze: true,
+                    freeze_message: __('Processing...'),
+                    callback: function (r) {
+                        if (r.message && r.message.status === 'ok') {
+                            frappe.show_alert({
+                                message: r.message.message || __('Done'),
+                                indicator: 'green'
+                            });
+                            frm.reload_doc();
+                        }
                     }
-                }
+                });
             });
         }
     });
@@ -1435,6 +1464,9 @@ function setup_live_log_panel(frm) {
         frm._log_panel = $panel;
         frm._log_container = $panel.find('.agent-log-container');
         frm._log_status = $panel.find('.agent-log-status');
+        frm._log_container.on('click', '.koda-replay-link', function () {
+            frappe.set_route('koda-replay', frm.doc.name, $(this).attr('data-recording'));
+        });
 
         frappe.realtime.on('agent_log', function (data) {
             if (!data || data.request_name !== frm.doc.name) return;
@@ -1554,6 +1586,17 @@ function append_log_entry(frm, data) {
             + ts + (data.success ? '\u2713 OK' : '\u2717 FAILED') + ' '
             + '<span style="color:var(--text-light);">' + frappe.utils.escape_html((data.output_preview || '').substring(0, 180)) + '</span>'
             + '</div>';
+    } else if (data.type === 'check_recording' && data.error) {
+        html = '<div style="color:var(--text-muted);margin-bottom:3px;padding-left:14px;">'
+            + ts + __('Browser check of {0} was not recorded: {1}',
+                [frappe.utils.escape_html(data.route || ''), frappe.utils.escape_html(data.error)])
+            + '</div>';
+    } else if (data.type === 'check_recording') {
+        html = '<div style="color:var(--blue-500);margin-bottom:3px;padding-left:14px;">'
+            + ts + '\u25B6 ' + __('Browser check of {0} recorded', [frappe.utils.escape_html(data.route || '')]) + ' '
+            + '<button class="btn btn-xs btn-default koda-replay-link" data-recording="'
+            + frappe.utils.escape_html(data.recording || '') + '">' + __('Replay') + '</button>'
+            + '</div>';
     } else {
         html = '<div style="margin-bottom:3px;">'
             + ts + frappe.utils.escape_html(JSON.stringify(data).substring(0, 250))
@@ -1613,8 +1656,12 @@ function load_user_defaults(frm) {
         // Setting the provider above already reset the model to its default, so
         // the user's last-used model must win unconditionally here.
         var saved_model = stored['ai_agent_ai_model'];
-        if (saved_model) {
-            frm.set_value('ai_model', saved_model);
-        }
+        if (!saved_model) return;
+        with_provider_models(frm.doc.ai_provider || 'OpenAI', function (entries) {
+            // A model no longer offered is not restored. A variant such as ":nitro" is listed without it.
+            var listed_name = saved_model.split(':')[0];
+            var is_offered = entries.some(function (m) { return m.value === listed_name; });
+            if (is_offered) frm.set_value('ai_model', saved_model);
+        });
     }, 100);
 }

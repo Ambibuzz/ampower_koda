@@ -41,6 +41,12 @@ from ampower_koda.agent.git_ops import (
 
 DOCTYPE_NAME = "Agent Request"
 
+# Statuses where the agent is actively working, so manual actions must wait.
+BUSY_STATUSES = (
+    "Understanding", "Planning", "Implementing",
+    "Reviewing", "Building", "Pushing",
+)
+
 
 #: Files under .koda/ that are the team's configuration, not Koda's generated state.
 _KODA_CONFIG_FILES = {"config.toml", "verification.json", "verification.md"}
@@ -84,6 +90,46 @@ def _uncommitted_paths(repo_root: str) -> list[str]:
             continue
         paths.append(path)
     return paths
+
+
+def other_busy_requests(app_name: str, request_name: str) -> list[str]:
+    """Other requests now working in this app's checkout."""
+    return frappe.get_all(DOCTYPE_NAME, pluck="name", filters={
+        "target_app_name": app_name,
+        "status": ["in", BUSY_STATUSES],
+        "name": ["!=", request_name],
+    })
+
+
+def other_work_problem(app_name: str, branch_name: str, request_name: str) -> str:
+    """Why the checkout must not move to ``branch_name`` now, or "" when it may.
+
+    A request running in the checkout would go on writing on the wrong branch. Git carries
+    uncommitted changes along to the branch it checks out, so another branch's work would be
+    committed with this request's.
+    """
+    current = get_current_branch(app_name)
+    if not branch_name or current == branch_name:
+        return ""
+    busy_requests = other_busy_requests(app_name, request_name)
+    if busy_requests:
+        return (
+            f"{', '.join(busy_requests)} is still running in the '{app_name}' checkout, which would have to move "
+            f"from branch '{current or '(unknown)'}' to this request's branch '{branch_name}'. Wait for it to "
+            "finish or cancel it, then try again. Nothing was changed."
+        )
+    dirty = _uncommitted_paths(get_repo_root(app_name))
+    if not dirty:
+        return ""
+    shown = "\n".join(f"  - {path}" for path in dirty[:10])
+    if len(dirty) > 10:
+        shown += f"\n  (and {len(dirty) - 10} more)"
+    return (
+        f"The '{app_name}' checkout is on branch '{current or '(unknown)'}' with uncommitted changes that belong "
+        f"to other work, not to this request's branch '{branch_name}':\n{shown}\n\n"
+        "Commit or stash them there, then try again. If they are this request's own, check out "
+        f"'{branch_name}' first. Nothing was changed."
+    )
 
 
 def bench_branch_refusal(app_name: str, branch_name: str, allowed=()) -> str:
@@ -319,7 +365,7 @@ def _get_doc_config(request_name: str) -> dict:
         # retried or replayed without passing back through start_agent.
         "target_app_name": validate_target_app(doc.target_app_name),
         "ai_provider": provider,
-        "ai_model": (doc.ai_model or settings.default_ai_model or "gpt-4o-mini").strip(),
+        "ai_model": (doc.ai_model or settings.default_ai_model or "gpt-6-luna").strip(),
         "github_repo_url": (doc.github_repo_url or "").strip(),
         "github_token": (doc.get_password("github_token") or "").strip(),
         "base_branch": (doc.base_branch or "main").strip(),
@@ -331,8 +377,12 @@ def _get_doc_config(request_name: str) -> dict:
 
 
 def _update_status(request_name: str, user: str, status: str, message: str = "", **kwargs):
-    """Persist the status (plus any allowed fields) and broadcast progress via realtime."""
-    set_request_value(request_name, "status", status)
+    """Persist the status (plus any allowed fields) and broadcast progress via realtime.
+
+    The status and its fields are one write, so a reader never sees one without the other. The
+    broadcast comes after the commit and cannot fail the step: the record is already true, and a
+    lost notification only means an open form refreshes later.
+    """
     allowed_fields = [
         "branch_name", "pr_url", "pr_number", "conversation_log",
         "agent_plan", "files_changed", "error_log", "tokens_used",
@@ -340,25 +390,27 @@ def _update_status(request_name: str, user: str, status: str, message: str = "",
         "pending_bench_commands", "change_summary",
         "implementation_snapshot", "follow_up_message", "follow_up_count",
     ]
-    if kwargs:
-        for k, v in kwargs.items():
-            if k in allowed_fields:
-                set_request_value(request_name, k, v)
+    values = {"status": status}
+    values.update({field: value for field, value in kwargs.items() if field in allowed_fields})
+    set_request_value(request_name, values)
     frappe.db.commit()
     check_active()
     payload = {"request_name": request_name, "status": status, "message": message, **kwargs}
-    frappe.publish_realtime("agent_progress", payload, user=user)
+    try:
+        frappe.publish_realtime("agent_progress", payload, user=user)
+    except Exception:
+        log_agent_error("Koda: progress notification failed", frappe.get_traceback())
 
 
-def _config_failed(request_name: str, title: str, error: Exception) -> None:
-    """Fail a job whose configuration could not load, through the normal status path.
+def _config_failed(request_name: str, title: str, error: Exception, status: str = "Failed") -> None:
+    """Stop a job whose configuration could not load, through the normal status path.
 
     Setting the fields without publishing left a request that was still Queued in
     an open form showing Queued until someone reloaded it.
     """
     log_agent_error(title, frappe.get_traceback())
     owner = frappe.db.get_value(DOCTYPE_NAME, request_name, "owner") or "Administrator"
-    _update_status(request_name, owner, "Failed", f"Configuration error: {error}", error_log=str(error))
+    _update_status(request_name, owner, status, f"Configuration error: {error}", error_log=str(error))
 
 
 # Phase 1: Planning (investigate + plan, or revise the plan from the user's feedback)
@@ -496,12 +548,13 @@ def restore_execution_state(doc, plan_object: dict, app_name: str) -> dict:
 
 @managed_job
 def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_up: int = 0,
-                        resume: int = 0) -> None:
+                        resume: int = 0, previous_status: str = "Failed") -> None:
     """Create/reuse the working branch, run implement + review, then await bench approval.
 
     When preserve_branch is set, reuse the request's existing branch for a follow-up
     patch instead of creating a fresh one. is_follow_up enables patch-only mode
-    without replacing the approved plan.
+    without replacing the approved plan. previous_status is where a follow-up that
+    could not start leaves the request.
     """
     frappe.set_user("Administrator")
     try:
@@ -547,6 +600,11 @@ def run_execution_phase(request_name: str, preserve_branch: int = 0, is_follow_u
             repo_root = get_repo_root(app_name)
             current = get_current_branch(app_name)
             if current != branch_name:
+                problem = other_work_problem(app_name, branch_name, request_name)
+                if problem:
+                    _update_status(request_name, user, previous_status,
+                        f"The follow-up was not started. {problem}", error_log=problem)
+                    return
                 ok, msg = run_git(["checkout", branch_name], cwd=repo_root)
                 if not ok:
                     _update_status(request_name, user, "Failed",
@@ -853,113 +911,6 @@ def _needs_migrate(path: str) -> bool:
     if parts[-1] == "patches.txt":
         return True
     return parts[-1].endswith(".json") and any(folder in parts[:-1] for folder in MIGRATED_METADATA_FOLDERS)
-
-
-def _worktree_signature(repo_root: str) -> str:
-    """Hash the full working-tree content vs HEAD to detect net file changes.
-
-    Uses content diffs (not just file names) so a follow-up that patches a file
-    already in the changed set is still detected. Includes untracked file
-    contents so newly created files count too.
-    """
-    parts = []
-    # Full content diff of tracked files (staged + unstaged) against HEAD.
-    ok, out = run_git(["diff", "HEAD"], cwd=repo_root)
-    if ok and out:
-        parts.append(out)
-
-    # Untracked files: include their contents, not just their names.
-    ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
-    if ok and untracked:
-        for rel in sorted(untracked.splitlines()):
-            rel = rel.strip()
-            if not rel:
-                continue
-            parts.append(f"\n### UNTRACKED {rel}\n")
-            try:
-                with open(os.path.join(repo_root, rel), "r", encoding="utf-8", errors="replace") as fh:
-                    parts.append(fh.read())
-            except OSError:
-                parts.append(f"(unreadable: {rel})")
-
-    payload = "\n".join(parts)
-    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
-
-
-def _prior_changed_paths(doc) -> list:
-    """Canonical paths from the previous run's files_changed list."""
-    paths = []
-    for row in as_json_list(doc.files_changed):
-        if isinstance(row, dict):
-            p = (row.get("path") or "").strip()
-            if p and p not in paths:
-                paths.append(p)
-    return paths
-
-
-def _merge_file_edits(prior: list, new: list) -> list:
-    """Merge prior and new edit records, updating summaries for same paths."""
-    merged = [dict(e) for e in prior if isinstance(e, dict)]
-    index = {e.get("path"): i for i, e in enumerate(merged) if e.get("path")}
-    for entry in new:
-        if not isinstance(entry, dict):
-            continue
-        path = entry.get("path")
-        if path and path in index:
-            merged[index[path]]["summary"] = entry.get("summary", merged[index[path]].get("summary"))
-        elif path:
-            merged.append(dict(entry))
-            index[path] = len(merged) - 1
-        else:
-            merged.append(dict(entry))
-    return merged
-
-
-# Names/patterns that indicate throwaway "scratch" files the model sometimes
-# creates (progress notes, status markers, metadata dumps). These are never part
-# of a real code change and must not land in the PR.
-_SCRATCH_NAME_KEYWORDS = (
-    "note", "notes", "metadata", "summary", "readme", "changelog",
-    "finalize", "implementation_done", "done", "todo", "scratch",
-)
-
-
-def _is_scratch_file(rel_path: str) -> bool:
-    """True for agent-created doc/marker files that don't belong in the change set."""
-    name = os.path.basename(rel_path).lower()
-    _, ext = os.path.splitext(name)
-    # Loose .txt files are never a legitimate Frappe code artifact.
-    if ext == ".txt":
-        return True
-    # Markdown only when it looks like an agent note/marker (keep real code .md rare).
-    if ext == ".md" and any(k in name for k in _SCRATCH_NAME_KEYWORDS):
-        return True
-    if re.match(r"(?i)(implementation_done|finalize_|ai_feature|ai_progress)", name):
-        return True
-    return False
-
-
-def _strip_agent_scratch_files(repo_root: str) -> list[str]:
-    """Delete newly-created scratch/marker files from the working tree.
-
-    Returns the list of removed repo-relative paths. Only untracked files are
-    considered, so tracked source code is never touched.
-    """
-    ok, untracked = run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_root)
-    if not ok or not (untracked or "").strip():
-        return []
-    removed = []
-    for rel in untracked.splitlines():
-        rel = rel.strip()
-        if not rel or not _is_scratch_file(rel):
-            continue
-        try:
-            os.remove(os.path.join(repo_root, rel))
-            removed.append(rel)
-        except OSError:
-            log_agent_error("Agent Execution: strip scratch file",
-                f"could not remove {rel}\n{frappe.get_traceback()}")
-    return removed
 
 
 def _compute_bench_commands(app_name: str, edits: list) -> list[str]:
@@ -1362,7 +1313,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
     try:
         config = _get_doc_config(request_name)
     except Exception as e:
-        _config_failed(request_name, "Agent Deploy Config Error", e)
+        _config_failed(request_name, "Agent Deploy Config Error", e, status="Awaiting Push Approval")
         return
 
     user = config["user"]
@@ -1377,9 +1328,14 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
         current = get_current_branch(app_name)
         if current != branch_name:
             repo_root = get_repo_root(app_name)
+            problem = other_work_problem(app_name, branch_name, request_name)
+            if problem:
+                _update_status(request_name, user, "Awaiting Push Approval",
+                    f"Nothing was pushed. {problem}", error_log=problem)
+                return
             ok, out = run_git(["checkout", branch_name], cwd=repo_root)
             if not ok:
-                _update_status(request_name, user, "Failed",
+                _update_status(request_name, user, "Awaiting Push Approval",
                     f"Could not checkout branch '{branch_name}': {out}",
                     error_log=f"checkout failed: {out}")
                 return
@@ -1418,10 +1374,10 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                     pass
                 else:
                     status = "Completed" if existing_pr else "Awaiting Push Approval"
-                    _update_status(request_name, user, status, "No changes to push.")
+                    _update_status(request_name, user, status, "No changes to push.", error_log="")
                     return
             else:
-                _update_status(request_name, user, "Failed",
+                _update_status(request_name, user, "Awaiting Push Approval",
                     f"Failed to commit changes: {msg}",
                     error_log=f"commit_changes failed: {msg}")
                 return
@@ -1437,7 +1393,9 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                 config["github_repo_url"], config["github_token"],
             )
             if not ok:
-                _update_status(request_name, user, "Failed",
+                # The commit is kept, so the push can be retried once the
+                # token or remote is fixed: a "Failed" status would refuse it.
+                _update_status(request_name, user, "Awaiting Push Approval",
                     f"Push failed: {msg}", error_log=f"push_branch: {msg}")
                 return
 
@@ -1453,7 +1411,8 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
                 config["base_branch"],
             )
             if not ok:
-                _update_status(request_name, user, "Failed",
+                # Retryable for the same reason as a failed push.
+                _update_status(request_name, user, "Awaiting Push Approval",
                     f"PR creation failed: {msg}", error_log=f"create_pull_request: {msg}")
                 return
 
@@ -1469,7 +1428,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
             summary_parts.append(f"{len(unshipped)} regression test(s) not committed because git ignores them: "
                                  f"{', '.join(unshipped[:5])}")
 
-        extra = {"branch_name": branch_name}
+        extra = {"branch_name": branch_name, "error_log": ""}
         if pr_url:
             extra["pr_url"] = pr_url
         if pr_number:
@@ -1484,7 +1443,7 @@ def run_deploy_phase(request_name: str, do_push: bool = True, do_pr: bool = True
     except Exception as e:
         tb = frappe.get_traceback()
         log_agent_error("Agent Deploy Error", tb)
-        _update_status(request_name, user, "Failed", str(e), error_log=tb)
+        _update_status(request_name, user, "Awaiting Push Approval", str(e), error_log=tb)
 
 
 # Helpers
@@ -1514,19 +1473,6 @@ def _stale_pull_request(doc, config: dict, branch_name: str) -> str:
     else:
         return ""
     return f"The recorded PR ({doc.pr_url}) is {reason}; it will not be reused for '{branch_name}'."
-
-
-def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: str) -> bool:
-    """True if `branch_name` has commits that `base_branch` does not (local only)."""
-    if not (app_name and base_branch and branch_name):
-        return False
-    try:
-        repo_root = get_repo_root(app_name)
-        ok, out = run_git(["rev-list", "--count", f"{base_branch}..{branch_name}"], cwd=repo_root)
-        return ok and out.strip().isdigit() and int(out.strip()) > 0
-    except Exception:
-        log_agent_error("Agent Deploy: rev-list vs base", frappe.get_traceback())
-        return False
 
 
 def _branch_has_commits_vs_base(app_name: str, base_branch: str, branch_name: str) -> bool:

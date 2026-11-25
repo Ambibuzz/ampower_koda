@@ -206,8 +206,9 @@ def plan_node(state: dict) -> dict:
             # Book the check's tokens as side tokens, or the loop's next write overwrites them.
             start = (int(frappe.db.get_value("Agent Request", request_name, "tokens_used") or 0) if request_name
                      else int(state.get("tokens_used") or 0))
+            checker_effort = graph._side_agent_reasoning_effort('plan_check_reasoning_effort', 'medium')
             checker = graph._get_llm(provider=provider, model=model, session_id=request_name,
-                                     reasoning_effort="medium")
+                                     reasoning_effort=checker_effort)
             gaps, total = graph._plan_coverage_gaps(
                 plan, state.get("user_message", ""), llm=checker, provider=provider,
                 budget=graph._plan_budget(provider, state), request_name=request_name, total_tokens=start)

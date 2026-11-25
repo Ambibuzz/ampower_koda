@@ -1,6 +1,7 @@
 """The browser side of check_page, run as its own process (the worker never imports Playwright).
 
-argv: route, steps (JSON), screenshot path, Page JSON path ("" for none), session file, report file.
+argv: route, steps (a JSON list), screenshot path, Page JSON path ("" for none), session file, report file.
+KODA_RENDER_USER: who to sign in as. KODA_RECORD_DIR: where to save a replayable recording.
 Writes the report as JSON to the report file (the caller keeps only a bounded tail of stdout) and prints
 ``KODA_RENDER_REPORT_FILE``; without a report file it prints one ``KODA_RENDER_REPORT {json}`` line. Each step is reported by what it did while the page
 settled, not only by the end state: the server calls it made, what changed on the page and in dialogs,
@@ -17,6 +18,7 @@ import sys
 import time
 import traceback
 import urllib.parse
+from pathlib import Path
 
 MAX_STEPS = 20
 DIFF_LINES = 25
@@ -621,29 +623,59 @@ def body_summary(body, status):
     return json.dumps(data.get("message"), default=str, separators=(",", ":"))[:RESPONSE_CHARS]
 
 
-def sign_in(context, page, base, login, session_file):
-    """Reuse the last check's session: Frappe rate-limits one-time login keys per address."""
-    sid = None
+def site_session(user, session_file):
+    """A session id signed in as `user`: the last check's while the site still has it, otherwise a new one.
+
+    The new one is made here with the calls Frappe's own API tests use, not through a one-time login link:
+    login_via_key allows five sign-ins an hour per address, and every check on the bench signs in from one.
+    """
+    import frappe
+    from frappe.auth import CookieManager, LoginManager
+    from frappe.sessions import get_expired_threshold
+    from frappe.utils import set_request
+
+    saved = None
     try:
-        sid = json.load(open(session_file)).get("sid")
+        with open(session_file) as handle:
+            saved = json.load(handle).get("sid")
     except (OSError, ValueError):
         pass
-    if sid:
-        context.add_cookies([{"name": "sid", "value": sid, "url": base}])
-        probe = context.request.get(base + "/api/method/frappe.auth.get_logged_user")
-        if not (probe.ok and probe.json().get("message") == "Administrator"):
-            sid = None
-            context.clear_cookies()
-    if not sid:
-        signed = page.goto(login, wait_until="domcontentloaded")
-        if signed is not None and signed.status == 429:
-            print("KODA_RENDER_UNAVAILABLE the site rate-limited the sign-in; check again in a minute.", flush=True)
-            sys.exit(4)
-        sid = next((c["value"] for c in context.cookies() if c["name"] == "sid"), None)
-        if sid and sid != "Guest":
-            with open(session_file, "w") as handle:
-                json.dump({"sid": sid}, handle)
-            os.chmod(session_file, 0o600)
+    if saved:
+        # The same test Frappe applies when it resumes a session from the database.
+        sessions = frappe.qb.DocType("Sessions")
+        still_signed_in = (
+            frappe.qb.from_(sessions)
+            .select(sessions.sid)
+            .where(sessions.sid == saved)
+            .where(sessions.user == user)
+            .where(sessions.lastupdate > get_expired_threshold())
+        ).run()
+        if still_signed_in:
+            return saved
+
+    set_request(path="/")
+    frappe.local.cookie_manager = CookieManager()
+    frappe.local.login_manager = LoginManager()
+    # Frappe saves and commits the new session itself (Session.start).
+    frappe.local.login_manager.login_as(user)
+    sid = frappe.session.sid
+    # Created readable by the bench user only: the file signs anyone who has it in as `user`.
+    descriptor = os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump({"sid": sid}, handle)
+    return sid
+
+
+def sign_in(context, base, sid, user, session_file):
+    """Give the browser the session from site_session, and confirm the site takes it as `user`."""
+    context.add_cookies([{"name": "sid", "value": sid, "url": base}])
+    probe = context.request.get(base + "/api/method/frappe.auth.get_logged_user")
+    if not (probe.ok and probe.json().get("message") == user):
+        # Not reused next time: the next check makes a new session.
+        Path(session_file).unlink(missing_ok=True)
+        print(f"KODA_RENDER_UNAVAILABLE the site did not accept the browser's session as {user} "
+              f"(HTTP {probe.status}); check again.", flush=True)
+        sys.exit(4)
 
 
 class Page:
@@ -887,6 +919,42 @@ def first_visible(locator):
     return None
 
 
+def one_line(exc):
+    return " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
+
+
+def route_opens(route, user, report):
+    """Whether the route opens for ``user``, asked of the site before Chromium starts; notes the answer in ``report``.
+
+    A route that is not found or not permitted fails here. If the preflight itself breaks, the browser check
+    still runs and reports what it sees.
+    """
+    import frappe
+    try:
+        from ampower_koda.agent.page_preflight import preflight
+        route_check = preflight(route, user)
+    except Exception as exc:
+        # A failed query leaves a Postgres transaction aborted, and the sign-in after this needs the connection.
+        frappe.db.rollback()
+        report["preflight_skipped"] = one_line(exc)
+        return True
+    if route_check["call_problems"]:
+        report["preflight_calls"] = route_check["call_problems"]
+    if not route_check["ok"]:
+        report["preflight"] = route_check["problem"]
+    return route_check["ok"]
+
+
+def write_unrecorded(record_dir, message):
+    """Why the check was not recorded, in the error.txt the worker reads (recording/bundle.py ERROR_FILE).
+
+    Written here rather than through the recording package, so it still works when that package cannot be imported.
+    """
+    folder = Path(record_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "error.txt").write_text(message, encoding="utf-8")
+
+
 def page_width(page):
     return (page.viewport_size or {}).get("width") or 0
 
@@ -895,6 +963,7 @@ def main():
     route, steps, shot, page_json, session_file = (sys.argv[1], json.loads(sys.argv[2]), sys.argv[3], sys.argv[4],
                                                   sys.argv[5])
     report_file = sys.argv[6] if len(sys.argv) > 6 else ""
+    record_dir = os.environ.get("KODA_RECORD_DIR")
     report = {"route": route, "steps": []}
     # Before anything touches the site: a missing runtime must not leave a Page registered.
     try:
@@ -920,14 +989,21 @@ def main():
                 report["registered"] = page_json
             except Exception as exc:
                 report["registration_error"] = " ".join(str(exc).split())[:300]
-        from frappe.www.login import _generate_temporary_login_link
-        login = _generate_temporary_login_link("Administrator", 2)
-        base = (os.environ.get("KODA_RENDER_BASE_URL") or frappe.utils.get_url()).rstrip("/")
+        user = os.environ.get("KODA_RENDER_USER") or "Administrator"
+        report["user"] = user
+        if route_opens(route, user, report):
+            sid = site_session(user, session_file)
+            base = (os.environ.get("KODA_RENDER_BASE_URL") or frappe.utils.get_url()).rstrip("/")
         frappe.destroy()
     except Exception:
         traceback.print_exc(limit=4)
         print("KODA_RUNNER_ERROR could not sign in to the site", flush=True)
         sys.exit(3)
+    if report.get("preflight"):
+        if record_dir:
+            write_unrecorded(record_dir, "the browser was not started: " + report["preflight"])
+        write_report(report, report_file)
+        return
 
     with sync_playwright() as playwright:
         try:
@@ -944,13 +1020,26 @@ def main():
             context.add_init_script(SMOOTH_JS)
             tab = Page(context, context.new_page())
             try:
-                sign_in(context, tab.page, base, login, session_file)
+                sign_in(context, base, sid, user, session_file)
             except SystemExit:
                 raise
             except Exception as exc:
                 print("KODA_RENDER_UNAVAILABLE the site is not reachable at " + base + " (is the web server "
                       "running?): " + " ".join(str(exc).split())[:200], flush=True)
                 sys.exit(4)
+            # Attached after sign-in, so the sign-in check is not part of the replay. A recorder that cannot
+            # start (rrweb not installed, folder not writable, the recording package missing or broken) leaves
+            # the reason, and the check runs unrecorded. Imported here, not at the top, so a broken recording
+            # package never stops a check that does not record.
+            recording = None
+            if record_dir:
+                try:
+                    from ampower_koda.agent.recording import recorder
+                    recording = recorder.Recorder(record_dir)
+                    recording.attach(context, tab.page)
+                except Exception as exc:
+                    recording = None
+                    write_unrecorded(record_dir, one_line(exc))
             stage = "loading the page"
             try:
                 response = tab.page.goto(base + route, wait_until="load")
@@ -960,9 +1049,15 @@ def main():
                 tab.settle(WATCH_LOAD_MS)
                 report["load"] = motion_lines(tab.evaluate("window.__motion ? window.__motion.stop() : null"),
                                               tab.seen_animations, load=True)
+                if recording:
+                    recording.drain()
                 for index, step in enumerate(steps[:int(os.environ.get("KODA_RENDER_MAX_STEPS", MAX_STEPS))], 1):
                     stage = f"step {index}"
+                    if recording:
+                        recording.step_start(index, step)
                     report["steps"].append(tab.step_report(index, step))
+                    if recording:
+                        recording.step_end(report["steps"][-1])
                 stage = "reading the final page"
                 report["url"] = tab.page.url
                 text = tab.page.locator("body").inner_text()
@@ -980,11 +1075,20 @@ def main():
                 # Whatever was seen before the failure still goes back.
                 report["runner_error"] = f"the check stopped while {stage}: " + " ".join(
                     f"{type(exc).__name__}: {exc}".split())[:300]
+            if recording:
+                try:
+                    recording.finish(route)
+                except Exception as exc:
+                    write_unrecorded(record_dir, one_line(exc))
             report["console"] = tab.console
             report["api_failures"] = [f"{c['status']} {c['method']}: {c['body']}" for c in tab.calls
                                       if (c["status"] or 0) >= 400][:15]
         finally:
             browser.close()
+    write_report(report, report_file)
+
+
+def write_report(report, report_file):
     if report_file:
         with open(report_file, "w", encoding="utf-8") as handle:
             json.dump(report, handle, default=str)
